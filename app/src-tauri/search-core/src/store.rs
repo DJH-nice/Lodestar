@@ -24,7 +24,10 @@ use crate::types::IndexEntry;
 /// 魔数 —— 认文件用。
 const MAGIC: &[u8; 4] = b"SXTX";
 /// 格式版本。改了布局就 +1（读档时版本对不上 → 当作没有存档，重新扫）。
-const VERSION: u32 = 1;
+///
+/// 【v2】加了「子文件数 / 子目录数」两个字段（`childfilecount:` /
+///   `childfoldercount:` 需要它们）。老档直接作废 → 重扫一次。
+const VERSION: u32 = 2;
 
 /// 把索引写到 `path`（原子替换）。
 pub fn save(entries: &[IndexEntry], roots: &[PathBuf], path: &Path) -> std::io::Result<()> {
@@ -56,6 +59,8 @@ pub fn save(entries: &[IndexEntry], roots: &[PathBuf], path: &Path) -> std::io::
         buf.push(flags);
         buf.extend_from_slice(&e.depth.to_le_bytes());
         buf.extend_from_slice(&e.child_count.to_le_bytes());
+        buf.extend_from_slice(&e.child_file_count.to_le_bytes());
+        buf.extend_from_slice(&e.child_folder_count.to_le_bytes());
     }
 
     // 临时文件 + 原子 rename
@@ -109,6 +114,8 @@ fn parse(buf: &[u8]) -> Option<(Vec<IndexEntry>, Vec<PathBuf>)> {
         let flags = r.u8()?;
         let depth = r.u32()?;
         let child_count = r.u32()?;
+        let child_file_count = r.u32()?;
+        let child_folder_count = r.u32()?;
         entries.push(IndexEntry {
             name,
             path,
@@ -121,6 +128,8 @@ fn parse(buf: &[u8]) -> Option<(Vec<IndexEntry>, Vec<PathBuf>)> {
             is_folder: flags & 1 != 0,
             depth,
             child_count,
+            child_file_count,
+            child_folder_count,
         });
     }
     Some((entries, roots))
@@ -183,6 +192,8 @@ mod tests {
                 is_folder: false,
                 depth: 2,
                 child_count: 0,
+                child_file_count: 0,
+                child_folder_count: 0,
                 folded_name: "报告.pdf".into(),
                 folded_path: "/users/me/documents/报告.pdf".into(),
             },
@@ -196,6 +207,8 @@ mod tests {
                 is_folder: true,
                 depth: 2,
                 child_count: 3,
+                child_file_count: 2,
+                child_folder_count: 1,
                 folded_name: "子目录".into(),
                 folded_path: "/users/me/documents/子目录".into(),
             },
@@ -226,6 +239,8 @@ mod tests {
             buf.push(if e.is_folder { 1 } else { 0 });
             buf.extend_from_slice(&e.depth.to_le_bytes());
             buf.extend_from_slice(&e.child_count.to_le_bytes());
+            buf.extend_from_slice(&e.child_file_count.to_le_bytes());
+            buf.extend_from_slice(&e.child_folder_count.to_le_bytes());
         }
 
         let (got_entries, got_roots) = parse(&buf).expect("应该能解析");
@@ -243,6 +258,8 @@ mod tests {
             assert_eq!(a.is_folder, b.is_folder);
             assert_eq!(a.depth, b.depth);
             assert_eq!(a.child_count, b.child_count);
+            assert_eq!(a.child_file_count, b.child_file_count);
+            assert_eq!(a.child_folder_count, b.child_folder_count);
         }
     }
 
@@ -269,6 +286,19 @@ mod tests {
         assert_eq!(got.len(), entries.len());
         assert_eq!(got_roots, roots);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn an_older_archive_version_is_rejected() {
+        // 老档（v1）少两个字段 → 版本对不上 → 当作没有存档 → 重新扫一次。
+        // 【为什么要钉住】静默读半截老档 = 子文件数/子目录数全是 0 →
+        //   `childfilecount:` 会给出一批**看着正常、其实全错**的结果。
+        let mut buf = Vec::from(MAGIC);
+        buf.extend_from_slice(&(VERSION - 1).to_le_bytes());
+        assert!(
+            parse(&buf).is_none(),
+            "旧版本档案必须被拒 —— 否则会读出一份字段缺失的索引"
+        );
     }
 
     #[test]

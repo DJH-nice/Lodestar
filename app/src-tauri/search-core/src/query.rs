@@ -24,7 +24,8 @@
 use std::collections::HashSet;
 
 use crate::fold::{find_folded, fold};
-use crate::syntax;
+use crate::mime;
+use crate::syntax::{self, ModifierKind};
 use crate::types::IndexEntry;
 
 /// 比较运算符。
@@ -90,21 +91,50 @@ pub enum FieldTerm {
     /// `ext:pdf` / `ext:pdf;doc`
     Ext { values: Vec<String> },
     /// `size:>10M`
-    Size { op: CmpOp, bytes: i64 },
+    Size { filter: NumFilter },
     /// `dm:today` / `dm:2026-10-01..2026-10-23`
     Mtime { from: i64, to: i64 },
-    /// `depth:1`
-    Depth { op: CmpOp, value: u32 },
+    /// `depth:1`（`parents:1` 是同一个东西）
+    Depth { filter: NumFilter },
     /// `empty:` —— 空文件或空目录
     Empty,
-    /// `childcount:1`
-    ChildCount { op: CmpOp, value: u32 },
+    /// `childcount:1` —— 子项总数（文件 + 目录）
+    ChildCount { filter: NumFilter },
+    /// `childfilecount:1` —— 子文件数
+    ChildFileCount { filter: NumFilter },
+    /// `childfoldercount:1` —— 子目录数
+    ChildFolderCount { filter: NumFilter },
     /// `parent:/Users/me/Downloads` —— 父目录路径相等
     Parent { needle: String },
-    /// `parents:Documents` —— 任一祖先路径含这一段
-    Parents { needle: String },
-    /// `pic:` / `audio:` / `video:` / `doc:` / `archive:` / `app:` / `contenttype:`
+    /// `contenttype:text` —— 按 MIME 类型
+    ContentType { needle: String },
+    /// `pic:` / `audio:` / `video:` / `doc:` / `archive:` / `app:`
     Group { name: String },
+}
+
+/// 数值条件 —— 单值比较或区间。
+///
+/// 【为什么要有区间】上游的文档里就写着 `childfoldercount:10..20`、
+///   `childfilecount:<=4` —— 用户照抄就不该搜不到。
+#[derive(Debug, Clone, Copy)]
+pub enum NumFilter {
+    /// `=N` `>N` `>=N` `<N` `<=N`
+    Cmp(CmpOp, i64),
+    /// `A..B` —— 闭区间（含两端）
+    Range(i64, i64),
+}
+
+impl NumFilter {
+    fn matches(&self, v: u32) -> bool {
+        self.matches_i64(v as i64)
+    }
+
+    fn matches_i64(&self, v: i64) -> bool {
+        match self {
+            NumFilter::Cmp(op, b) => cmp_i64(v, *op, *b),
+            NumFilter::Range(lo, hi) => v >= *lo && v <= *hi,
+        }
+    }
 }
 
 /// 语法树节点。
@@ -117,6 +147,19 @@ pub enum Node {
     Field(FieldTerm),
     /// 只看文件 / 只看目录
     Kind { folders: bool },
+    /// **什么都不匹配**（未知字段）—— 与上游一致。
+    ///
+    /// 【为什么不是「匹配一切」】
+    ///   未知字段时若匹配一切，用户会看到满屏结果 + 一行警告 →
+    ///   很容易误以为「搜索正常，就是文件多」。
+    ///   0 条 + 明确的警告，才是「你写错了」的正确反馈。
+    Nothing,
+    /// **匹配一切**（查询还没写完时的兜底）。
+    ///
+    /// 【为什么不用「空文本节点」】空文本节点在**高亮**时会命中每个位置
+    ///   （`match_indices("")`）→ 整个文件名被标黄，看着像「全文命中」。
+    ///   这个节点不产生任何高亮区间。
+    Everything,
 }
 
 /// 解析好的查询。
@@ -151,6 +194,8 @@ fn eval(node: &Node, e: &IndexEntry) -> bool {
         Node::Text(t) => match_text(t, e),
         Node::Field(f) => match_field(f, e),
         Node::Kind { folders } => e.is_folder == *folders,
+        Node::Nothing => false,
+        Node::Everything => true,
     }
 }
 
@@ -187,9 +232,9 @@ fn match_field(f: &FieldTerm, e: &IndexEntry) -> bool {
                 values.iter().any(|v| v == &e.extension)
             }
         }
-        FieldTerm::Size { op, bytes } => cmp_i64(e.size, *op, *bytes),
+        FieldTerm::Size { filter } => filter.matches_i64(e.size),
         FieldTerm::Mtime { from, to } => e.mtime >= *from && e.mtime <= *to,
-        FieldTerm::Depth { op, value } => cmp_u32(e.depth, *op, *value),
+        FieldTerm::Depth { filter } => filter.matches(e.depth),
         FieldTerm::Empty => {
             if e.is_folder {
                 e.child_count == 0
@@ -197,18 +242,17 @@ fn match_field(f: &FieldTerm, e: &IndexEntry) -> bool {
                 e.size == 0
             }
         }
-        FieldTerm::ChildCount { op, value } => cmp_u32(e.child_count, *op, *value),
+        FieldTerm::ChildCount { filter } => filter.matches(e.child_count),
+        FieldTerm::ChildFileCount { filter } => filter.matches(e.child_file_count),
+        FieldTerm::ChildFolderCount { filter } => filter.matches(e.child_folder_count),
         FieldTerm::Parent { needle } => fold(&e.dir) == *needle,
-        FieldTerm::Parents { needle } => {
-            // 任一祖先目录的路径含这一段
-            let mut cur = std::path::Path::new(&e.path);
-            while let Some(p) = cur.parent() {
-                if fold(&p.to_string_lossy()).contains(needle.as_str()) {
-                    return true;
-                }
-                cur = p;
-            }
-            false
+        FieldTerm::ContentType { needle } => {
+            // 按 MIME 类型匹配（上游也是拿 content type 串做「包含」匹配）
+            //
+            // 【为什么还认内置的类型组名】`contenttype:pic` 这种「混用两套写法」
+            //   如果只按 MIME 匹配 → 一个都搜不到、而且一声不吭。
+            //   → 顺便也认 `pic` / `doc` / `archive` 这些组名。
+            mime::mime_of(e).contains(needle.as_str()) || group_matches(needle, e)
         }
         FieldTerm::Group { name } => group_matches(name, e),
     }
@@ -224,19 +268,13 @@ fn cmp_i64(a: i64, op: CmpOp, b: i64) -> bool {
     }
 }
 
-fn cmp_u32(a: u32, op: CmpOp, b: u32) -> bool {
-    match op {
-        CmpOp::Eq => a == b,
-        CmpOp::Gt => a > b,
-        CmpOp::Ge => a >= b,
-        CmpOp::Lt => a < b,
-        CmpOp::Le => a <= b,
-    }
-}
-
 /// 扩展名分组（我们自己定的表 —— 不是上游的）。
+///
+/// 【为什么目录也要参与】macOS 上 `.app` 是**目录** ——
+///   扫描器给目录的扩展名是空串，不这样的话 `app:` 一个应用包都匹配不到
+///   （而 .app 恰恰是 macOS 上最主要的「应用」形态）。
 fn group_matches(name: &str, e: &IndexEntry) -> bool {
-    let ext = e.extension.as_str();
+    let ext = effective_extension(e);
     let table: &[&str] = match name {
         "pic" | "image" => &["png", "jpg", "jpeg", "gif", "bmp", "tif", "tiff", "webp", "heic", "heif", "svg", "ico"],
         "audio" => &["mp3", "wav", "aac", "flac", "m4a", "ogg", "aiff", "alac"],
@@ -247,7 +285,22 @@ fn group_matches(name: &str, e: &IndexEntry) -> bool {
         "text" => &["txt", "md", "markdown", "rtf", "csv", "json", "xml", "yaml", "yml", "toml", "log", "html", "htm", "ts", "tsx", "js", "jsx", "rs", "py", "go", "java", "c", "h", "cpp", "hpp", "sh", "swift", "kt"],
         _ => &[],
     };
-    table.contains(&ext)
+    // 大小写不敏感（目录的扩展名是从原名切出来的，没做小写化）
+    table.iter().any(|t| t.eq_ignore_ascii_case(ext))
+}
+
+/// 条目参与分组匹配用的扩展名。
+///
+/// 【规则】文件 → 索引期算好的扩展名；目录 → 名字里最后一个点之后的部分
+///   （`"Foo.app"` → `"app"`；没有点、或点在开头 → 空串）。
+fn effective_extension(e: &IndexEntry) -> &str {
+    if !e.is_folder {
+        return e.extension.as_str();
+    }
+    match e.name.rfind('.') {
+        Some(i) if i > 0 && i + 1 < e.name.len() => &e.name[i + 1..],
+        _ => "",
+    }
 }
 
 // ---------------------------------------------------------------- 词法
@@ -311,13 +364,31 @@ fn lex(input: &str) -> Vec<Tok> {
         }
 
         // 运算符（单字符与双字符）
+        //
+        // 【为什么必须成对识别】运算符表里写着 `<=` / `>=` ——
+        //   只认单个字符的话，`size:<=1K` 会被切成 `<` `=` `1K` 三个 token，
+        //   值直接读不出来 → 用户照抄运算符表里的写法却搜不到（表≠实现）。
         if matches!(c, '<' | '>' | '=' | '!' | '&' | '|') {
             let mut op = String::new();
             op.push(c);
             i += 1;
-            if i < chars.len() && chars[i] == c && matches!(c, '<' | '>' | '=' | '&' | '|') {
-                op.push(c);
-                i += 1;
+            if i < chars.len() {
+                let next = chars[i];
+                let is_pair = matches!(
+                    (c, next),
+                    ('<', '=')
+                        | ('>', '=')
+                        | ('!', '=')
+                        | ('<', '<')
+                        | ('>', '>')
+                        | ('=', '=')
+                        | ('&', '&')
+                        | ('|', '|')
+                );
+                if is_pair {
+                    op.push(next);
+                    i += 1;
+                }
             }
             out.push(Tok::Op(op));
             continue;
@@ -365,6 +436,14 @@ struct Parser {
     warnings: Vec<String>,
     only_files: bool,
     only_folders: bool,
+    /// 当前开着几层括号。
+    ///
+    /// 【为什么需要它】`parse_and` 看到右括号时，分不清它是
+    ///   「闭合本组的那个」还是「多出来的那一个」——
+    ///   前者完全正常（`(a OR b) AND c`），后者是笔误。
+    ///   → 靠深度区分：**在括号里面**（depth > 0）的右括号是本组的闭合符，
+    ///   不该报警告；只有**顶层**落单的右括号才是笔误。
+    group_depth: u32,
 }
 
 impl Parser {
@@ -385,8 +464,14 @@ impl Parser {
             match self.peek() {
                 Some(Tok::Op(op)) if op == "OR" || op == "||" => {
                     self.next();
-                    let right = self.parse_and()?;
-                    left = Node::Or(Box::new(left), Box::new(right));
+                    match self.parse_and() {
+                        Some(right) => left = Node::Or(Box::new(left), Box::new(right)),
+                        None => {
+                            // OR 后面还没写条件 —— 用户还在打字
+                            self.warnings
+                                .push("OR 后面还没有条件（还没写完）".to_string());
+                        }
+                    }
                 }
                 _ => break,
             }
@@ -401,12 +486,46 @@ impl Parser {
             match self.peek() {
                 Some(Tok::Op(op)) if op == "AND" || op == "&&" => {
                     self.next();
-                    let right = self.parse_not()?;
-                    left = Node::And(Box::new(left), Box::new(right));
+                    match self.parse_not() {
+                        Some(right) => left = Node::And(Box::new(left), Box::new(right)),
+                        None => {
+                            // AND 后面还没写条件 —— 用户还在打字。
+                            // 【为什么不能整条失败】已经写好的 left 是有效的
+                            //   （"alpha AND" 应该看到 alpha 的结果），
+                            //   丢掉它 = 用户以为搜不到东西。
+                            self.warnings
+                                .push("AND 后面还没有条件（还没写完）".to_string());
+                        }
+                    }
                 }
                 Some(Tok::Word(_)) | Some(Tok::Quoted(_)) | Some(Tok::LParen) => {
                     let right = self.parse_not()?;
                     left = Node::And(Box::new(left), Box::new(right));
+                }
+                Some(Tok::Op(op)) => {
+                    // 落单的运算符（比如 `size!=1M` 里的 `!=`）——
+                    // 【为什么不能悄悄丢掉】丢掉 = 这一段条件**完全失效**
+                    //   而界面一声不吭 → 用户会以为「搜过了，没有就是没有」。
+                    //   → 明说看不懂。
+                    //
+                    // 【注意】AND / OR 是上一层（parse_and / parse_or）消费的，
+                    //   到这里说明是**组合**写法 —— 不是错误，别报警告。
+                    if !matches!(op.as_str(), "AND" | "&&" | "OR" | "||") {
+                        self.warnings.push(format!("看不懂的运算符：{op}"));
+                    }
+                    break;
+                }
+                Some(Tok::RParen) => {
+                    // 多出来的右括号（`alpha) beta`）—— 后面那段会被丢掉，
+                    // 不说的话用户会以为「alpha 而且 beta」都生效了。
+                    //
+                    // 【注意】**在括号里面**看到的右括号是本组的闭合符
+                    //   （`(a OR b) AND c`）—— 那是正常的，不能报警告。
+                    if self.group_depth == 0 {
+                        self.warnings
+                            .push("括号没配对（多了一个右括号）".to_string());
+                    }
+                    break;
                 }
                 _ => break,
             }
@@ -418,8 +537,15 @@ impl Parser {
         match self.peek() {
             Some(Tok::Op(op)) if op == "NOT" || op == "!" => {
                 self.next();
-                let inner = self.parse_not()?;
-                Some(Node::Not(Box::new(inner)))
+                match self.parse_not() {
+                    Some(inner) => Some(Node::Not(Box::new(inner))),
+                    None => {
+                        // NOT 后面还没写东西 —— 用户还在打字
+                        self.warnings
+                            .push("NOT 后面还没有条件（还没写完）".to_string());
+                        Some(Node::Everything)
+                    }
+                }
             }
             _ => self.parse_primary(),
         }
@@ -428,12 +554,28 @@ impl Parser {
     fn parse_primary(&mut self) -> Option<Node> {
         match self.next() {
             Some(Tok::LParen) => {
-                let inner = self.parse_or()?;
+                // 注意：左括号已经被上面的 `self.next()` 消费掉了 ——
+                //   这里**不能再 next() 一次**，否则会把组里的第一个词吃掉。
+                self.group_depth += 1;
+                let inner = self.parse_or();
                 // 吃掉右括号（没有也不报错 —— 用户打到一半是很常见的）
                 if matches!(self.peek(), Some(Tok::RParen)) {
                     self.next();
+                    self.group_depth -= 1;
+                } else {
+                    // 括号没闭合 —— 提示一句，但**里面已经解析出来的部分照常用**
+                    self.warnings
+                        .push("括号没闭合（还没写完）".to_string());
                 }
-                Some(inner)
+                match inner {
+                    Some(node) => Some(node),
+                    None => {
+                        // 括号里还什么都没有 —— 用户还在打字
+                        self.warnings
+                            .push("括号里还没有内容（还没写完）".to_string());
+                        Some(Node::Everything)
+                    }
+                }
             }
             Some(Tok::Word(w)) => self.parse_word(w),
             Some(Tok::Quoted(q)) => Some(self.make_text(q, false)),
@@ -448,40 +590,87 @@ impl Parser {
         // 字段 / 修饰符后跟冒号？
         if matches!(self.peek(), Some(Tok::Colon)) {
             self.next(); // 吃掉 ':'
+
+            // 修饰符 + **字段**（`file:size:>10M`）——
+            //   修饰符作用在这个字段上，不能把字段名当成「被修饰的词」吃掉
+            //   （上游的写法，也是帮助面板里的例子）。
+            if let Some(kind) = syntax::modifier_kind(&lower) {
+                if self.value_is_field() {
+                    self.apply_query_switch(kind);
+                    return self.parse_not();
+                }
+            }
+
             // 值可能是运算符 + 词，或直接是词/引号
-            let (op, value, quoted) = self.read_value();
+            let Some((op, value, quoted)) = self.read_value() else {
+                // 写法不支持（目前只有 `!=`）→ 什么都不匹配 + 已经有警告
+                return Some(Node::Nothing);
+            };
             return Some(self.make_field_or_modifier(lower, op, value, quoted));
         }
 
         // 裸修饰符
-        if syntax::modifier_supported(&lower) {
-            match lower.as_str() {
-                "file" | "files" => {
-                    self.only_files = true;
+        if let Some(kind) = syntax::modifier_kind(&lower) {
+            match kind {
+                ModifierKind::FilesOnly => {
+                    self.apply_query_switch(kind);
                     return Some(Node::Kind { folders: false });
                 }
-                "folder" | "folders" => {
-                    self.only_folders = true;
+                ModifierKind::FoldersOnly => {
+                    self.apply_query_switch(kind);
                     return Some(Node::Kind { folders: true });
                 }
-                "case" => self.pending.case_sensitive = Some(true),
-                "nocase" => self.pending.case_sensitive = Some(false),
-                "exact" => self.pending.exact = true,
-                "regex" => self.pending.regex = true,
-                "path" => self.pending.target = Some(Target::Path),
-                "nopath" => self.pending.target = Some(Target::Name),
-                _ => {}
+                ModifierKind::NotFilesOnly | ModifierKind::NotFoldersOnly => {
+                    // 取消「只看文件 / 只看目录」—— 上游是 REMOVE_FLAG，
+                    // 我们对应的是「把查询级的开关关掉」。
+                    self.apply_query_switch(kind);
+                }
+                ModifierKind::Case => self.pending.case_sensitive = Some(true),
+                ModifierKind::NoCase => self.pending.case_sensitive = Some(false),
+                ModifierKind::Exact => self.pending.exact = true,
+                ModifierKind::Regex => self.pending.regex = true,
+                ModifierKind::Path => self.pending.target = Some(Target::Path),
+                ModifierKind::NoPath => self.pending.target = Some(Target::Name),
+                ModifierKind::NoRegex => {}
             }
             // 裸修饰符本身不产生节点 —— 它作用于下一个词。
-            // 但如果后面没有词了，它就只是个开关（已经被上面的分支处理）。
-            return self.parse_not();
+            // 后面没有词时（查询就写了「case」）也不能让整个查询解析失败 →
+            // 兜一个「匹配一切」的节点。
+            return self.parse_not().or(Some(Node::Everything));
         }
 
         Some(self.make_text(word, false))
     }
 
+    /// 下一个词是不是「字段名 + 冒号」（`file:size:>10M` 里的 `size:`）。
+    fn value_is_field(&self) -> bool {
+        match (self.toks.get(self.pos), self.toks.get(self.pos + 1)) {
+            (Some(Tok::Word(w)), Some(Tok::Colon)) => {
+                syntax::field_kind(&w.to_lowercase()).is_some()
+            }
+            _ => false,
+        }
+    }
+
+    /// 修饰符里「查询级开关」的那部分（只看文件 / 只看目录）。
+    ///
+    /// 【为什么是查询级】`file:` 在我们这儿是**整个查询**的开关
+    ///   （上游是逐节点的标志）—— 速查卡与手册都按这个语义写的。
+    fn apply_query_switch(&mut self, kind: ModifierKind) {
+        match kind {
+            ModifierKind::FilesOnly => self.only_files = true,
+            ModifierKind::NotFilesOnly => self.only_files = false,
+            ModifierKind::FoldersOnly => self.only_folders = true,
+            ModifierKind::NotFoldersOnly => self.only_folders = false,
+            _ => {}
+        }
+    }
+
     /// 读 `字段:` 后面的值。
-    fn read_value(&mut self) -> (CmpOp, String, bool) {
+    ///
+    /// 【返回值】`None` = 这个写法引擎不支持（调用方给警告 + 什么都不匹配）。
+    ///   目前只有 `!=`（我们没实现「不等于」；用 `NOT` 代替）。
+    fn read_value(&mut self) -> Option<(CmpOp, String, bool)> {
         let mut op = CmpOp::Eq;
         if let Some(Tok::Op(o)) = self.peek().cloned() {
             match o.as_str() {
@@ -506,16 +695,21 @@ impl Parser {
                     self.next();
                 }
                 "!=" => {
-                    op = CmpOp::Eq; // 取反由字段自己处理
+                    // 【为什么不实现】「不等于」对每个字段的语义都不一样
+                    //   （ext 是「不在列表里」，size 是「不等于」，区间怎么排除？）。
+                    //   而运算符表里没有它 → 不宣传就不会有人照抄。
                     self.next();
+                    self.warnings
+                        .push("暂不支持 != 运算符（请用 NOT 代替）".to_string());
+                    return None;
                 }
                 _ => {}
             }
         }
         match self.next() {
-            Some(Tok::Word(w)) => (op, w, false),
-            Some(Tok::Quoted(q)) => (op, q, true),
-            _ => (op, String::new(), false),
+            Some(Tok::Word(w)) => Some((op, w, false)),
+            Some(Tok::Quoted(q)) => Some((op, q, true)),
+            _ => Some((op, String::new(), false)),
         }
     }
 
@@ -527,46 +721,41 @@ impl Parser {
         quoted: bool,
     ) -> Node {
         // 修饰符（带值）
-        if syntax::modifier_supported(&name) {
+        if let Some(kind) = syntax::modifier_kind(&name) {
+            // 「只看文件 / 只看目录」是**查询级开关**（上游也是这个模型）。
+            // `nofileonly:` 的作用就是把这个开关**关掉**（上游是 REMOVE_FLAG）。
+            self.apply_query_switch(kind);
             let mut term = self.make_text(value.clone(), quoted);
             if let Node::Text(t) = &mut term {
-                match name.as_str() {
-                    "exact" => t.exact = true,
-                    "case" => t.case_sensitive = true,
-                    "nocase" => t.case_sensitive = false,
-                    "path" => t.target = Target::Path,
-                    "nopath" => t.target = Target::Name,
-                    "regex" => {
+                match kind {
+                    ModifierKind::Exact => t.exact = true,
+                    ModifierKind::Case => t.case_sensitive = true,
+                    ModifierKind::NoCase => t.case_sensitive = false,
+                    ModifierKind::Path => t.target = Target::Path,
+                    ModifierKind::NoPath => t.target = Target::Name,
+                    ModifierKind::Regex => {
                         if let Pattern::Plain { .. } = &t.pattern {
                             t.pattern = build_regex(&value, false, true);
                         }
                     }
-                    "noregex" => {}
                     _ => {}
-                }
-                // `file:报告` / `folder:Downloads` 还要限定类型
-                if name == "file" || name == "files" {
-                    self.only_files = true;
-                } else if name == "folder" || name == "folders" {
-                    self.only_folders = true;
                 }
             }
             return term;
         }
 
-        // 字段
-        if !syntax::FIELDS.contains(&name.as_str()) {
-            self.warnings.push(format!("未知字段：{name}"));
-            return self.make_text(String::new(), false);
-        }
-        if !syntax::field_supported(&name) {
-            self.warnings.push(format!("字段 {name} 暂未实现"));
-            return self.make_text(String::new(), false);
-        }
+        // 字段 —— 表里没有 = 引擎不认（**不会静默当普通词**）
+        let kind = match syntax::field_kind(&name) {
+            Some(k) => k,
+            None => {
+                self.warnings.push(format!("未知字段：{name}"));
+                return Node::Nothing;
+            }
+        };
 
         let folded_value = fold(&value);
-        let term = match name.as_str() {
-            "ext" => {
+        let term = match kind {
+            syntax::FieldKind::Ext => {
                 let values: Vec<String> = value
                     .split(';')
                     .map(|s| s.trim().to_lowercase())
@@ -574,46 +763,80 @@ impl Parser {
                     .collect();
                 FieldTerm::Ext { values }
             }
-            "size" => match parse_size(&value) {
-                Some(bytes) => FieldTerm::Size { op, bytes },
+            syntax::FieldKind::Size => match parse_size_filter(op, &value) {
+                Some(filter) => FieldTerm::Size { filter },
                 None => {
                     self.warnings.push(format!("看不懂的大小：{value}"));
                     FieldTerm::Size {
-                        op: CmpOp::Lt,
-                        bytes: 0,
+                        filter: NumFilter::Cmp(CmpOp::Lt, 0),
                     }
                 }
             },
-            "dm" | "datemodified" => match parse_date_range(&value) {
+            syntax::FieldKind::Mtime => match parse_date_range(&value) {
                 Some((from, to)) => FieldTerm::Mtime { from, to },
                 None => {
                     self.warnings.push(format!("看不懂的日期：{value}"));
                     FieldTerm::Mtime { from: 0, to: 0 }
                 }
             },
-            "depth" => match value.parse::<u32>() {
-                Ok(v) => FieldTerm::Depth { op, value: v },
-                Err(_) => {
+            syntax::FieldKind::Depth => match parse_num_filter(op, &value) {
+                Some(filter) => FieldTerm::Depth { filter },
+                None => {
                     self.warnings.push(format!("看不懂的深度：{value}"));
-                    FieldTerm::Depth { op, value: 0 }
+                    FieldTerm::Depth {
+                        filter: NumFilter::Cmp(CmpOp::Lt, 0),
+                    }
                 }
             },
-            "empty" => FieldTerm::Empty,
-            "childcount" => match value.parse::<u32>() {
-                Ok(v) => FieldTerm::ChildCount { op, value: v },
-                Err(_) => {
+            syntax::FieldKind::Empty => FieldTerm::Empty,
+            syntax::FieldKind::ChildCount => match parse_num_filter(op, &value) {
+                Some(filter) => FieldTerm::ChildCount { filter },
+                None => {
                     self.warnings.push(format!("看不懂的子项数：{value}"));
-                    FieldTerm::ChildCount { op, value: 0 }
+                    FieldTerm::ChildCount {
+                        filter: NumFilter::Cmp(CmpOp::Lt, 0),
+                    }
                 }
             },
-            "parent" => FieldTerm::Parent { needle: folded_value },
-            "parents" => FieldTerm::Parents { needle: folded_value },
-            "contenttype" => FieldTerm::Group {
-                name: value.to_lowercase(),
+            syntax::FieldKind::ChildFileCount => match parse_num_filter(op, &value) {
+                Some(filter) => FieldTerm::ChildFileCount { filter },
+                None => {
+                    self.warnings.push(format!("看不懂的子文件数：{value}"));
+                    FieldTerm::ChildFileCount {
+                        filter: NumFilter::Cmp(CmpOp::Lt, 0),
+                    }
+                }
             },
-            other => FieldTerm::Group {
-                name: other.to_string(),
+            syntax::FieldKind::ChildFolderCount => match parse_num_filter(op, &value) {
+                Some(filter) => FieldTerm::ChildFolderCount { filter },
+                None => {
+                    self.warnings.push(format!("看不懂的子目录数：{value}"));
+                    FieldTerm::ChildFolderCount {
+                        filter: NumFilter::Cmp(CmpOp::Lt, 0),
+                    }
+                }
             },
+            syntax::FieldKind::Parent => FieldTerm::Parent { needle: folded_value },
+            syntax::FieldKind::ContentType => {
+                if value.trim().is_empty() {
+                    // 上游的空 contenttype 是「匹配一切」，我们也这样，
+                    // 但**给个提示** —— 用户多半是忘了写类型名。
+                    self.warnings
+                        .push("contenttype: 需要一个类型名（比如 contenttype:text）".to_string());
+                }
+                FieldTerm::ContentType { needle: folded_value }
+            }
+            syntax::FieldKind::Group => {
+                if !value.trim().is_empty() {
+                    // 【为什么要警告】冒号后面的值会被**忽略** ——
+                    //   不说的话，用户会以为 `pic:png` 是「png 这类图片」，
+                    //   实际上它等于 `pic:`（所有图片）。
+                    self.warnings.push(format!(
+                        "{name}: 后面不要写值（要按扩展名筛请用 ext:）"
+                    ));
+                }
+                FieldTerm::Group { name: name.clone() }
+            }
         };
         Node::Field(term)
     }
@@ -653,6 +876,26 @@ impl Parser {
             exact: pending.exact,
         })
     }
+}
+
+/// 解析数值条件：`1` `>10` `<=4` `10..20`。
+///
+/// 【为什么支持区间】上游文档里就写着 `childfoldercount:10..20`、
+///   `childfilecount:<=4` —— 用户照抄就不该搜不到。
+fn parse_num_filter(op: CmpOp, value: &str) -> Option<NumFilter> {
+    let t = value.trim();
+    if t.is_empty() {
+        return None;
+    }
+    if let Some((a, b)) = t.split_once("..") {
+        let lo = a.trim().parse::<i64>().ok()?;
+        let hi = b.trim().parse::<i64>().ok()?;
+        if lo > hi {
+            return None;
+        }
+        return Some(NumFilter::Range(lo, hi));
+    }
+    Some(NumFilter::Cmp(op, t.parse::<i64>().ok()?))
 }
 
 /// 把通配符模式转成正则（**整串匹配**）。
@@ -737,8 +980,16 @@ pub fn parse_date_range(s: &str) -> Option<(i64, i64)> {
     }
     // 区间：A..B
     if let Some((a, b)) = t.split_once("..") {
-        let from = parse_date_point(a.trim(), false)?;
-        let to = parse_date_point(b.trim(), true)?;
+        // 【为什么允许一边是空的】`dm:2024..`（2024 年之后）、`dm:..2024`（2024 年之前）
+        //   是手册与速查卡里都写着的写法 —— 空的一边就是「到头」。
+        let from = match a.trim() {
+            "" => i64::MIN,
+            _ => parse_date_point(a.trim(), false)?,
+        };
+        let to = match b.trim() {
+            "" => i64::MAX,
+            _ => parse_date_point(b.trim(), true)?,
+        };
         return Some((from, to));
     }
     // 比较：>DATE / <DATE / >=DATE / <=DATE / =DATE
@@ -771,6 +1022,23 @@ fn parse_date_point(s: &str, end_of_unit: bool) -> Option<i64> {
     }
     let now = now_epoch();
     let (y, m, d) = today_civil(now);
+
+    // 精确到分钟 / 秒：`2026-10-22 12:00`（值里有空格，所以要加引号）
+    //
+    // 【为什么要支持】手册与速查卡都写着「要精确到分钟得加引号：
+    //   dm:"2026-10-22 12:00"」—— 不支持的话就是**文档骗人**。
+    if let Some((date_part, time_part)) = t.split_once(char::is_whitespace) {
+        let date_part = date_part.trim();
+        let time_part = time_part.trim();
+        if !date_part.is_empty() && !time_part.is_empty() {
+            if let Some((offset, precise)) = parse_time_of_day(time_part) {
+                let day_start = parse_date_point(date_part, false)?;
+                // 「到这一分钟/秒的末尾」：只有写的是 HH:MM 才补满 59 秒
+                let tail = if end_of_unit && !precise { 59 } else { 0 };
+                return Some(day_start + offset + tail);
+            }
+        }
+    }
 
     match t {
         "today" => {
@@ -879,6 +1147,53 @@ fn parse_date_point(s: &str, end_of_unit: bool) -> Option<i64> {
     }
 }
 
+/// 解析大小条件：`10M` `>10M` `<=1M` `1M..10M`。
+///
+/// 【为什么区间也要支持】其它数值字段（深度、子项数）都支持区间，
+///   大小却不支持 → 用户写 `size:1M..10M` 会得到一句警告，很费解。
+fn parse_size_filter(op: CmpOp, value: &str) -> Option<NumFilter> {
+    let t = value.trim();
+    if t.is_empty() {
+        return None;
+    }
+    if let Some((a, b)) = t.split_once("..") {
+        let lo = parse_size(a)?;
+        let hi = parse_size(b)?;
+        if lo > hi {
+            return None;
+        }
+        return Some(NumFilter::Range(lo, hi));
+    }
+    Some(NumFilter::Cmp(op, parse_size(t)?))
+}
+
+/// 解析「一天里的时刻」→ `(当天 0 点起的秒数, 是否精确到秒)`。
+///
+/// `12:00` → (43200, false) · `12:00:30` → (43230, true)
+fn parse_time_of_day(s: &str) -> Option<(i64, bool)> {
+    let t = s.trim();
+    let mut parts = t.split(':');
+    let h: i64 = parts.next()?.trim().parse().ok()?;
+    let m: i64 = parts.next()?.trim().parse().ok()?;
+    let sec_part = parts.next();
+    if parts.next().is_some() {
+        return None; // 多于三段 → 不认
+    }
+    if !(0..24).contains(&h) || !(0..60).contains(&m) {
+        return None;
+    }
+    match sec_part {
+        None => Some((h * 3600 + m * 60, false)),
+        Some(sec_s) => {
+            let sec: i64 = sec_s.trim().parse().ok()?;
+            if !(0..60).contains(&sec) {
+                return None;
+            }
+            Some((h * 3600 + m * 60 + sec, true))
+        }
+    }
+}
+
 /// 拆 `3days` → `(3, "days")`。
 fn split_past(rest: &str) -> Option<(i64, &str)> {
     let digits: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
@@ -975,7 +1290,15 @@ pub fn civil_from_days(z: i64) -> (i64, i64, i64) {
 // ---------------------------------------------------------------- 入口
 
 /// 解析一条查询。
-pub fn parse(input: &str) -> Option<Query> {
+///
+/// 【为什么永不失败】
+///   用户**打字过程中**的输入天然是不完整的：`alpha AND`、单独一个 `(`、
+///   单独的 `NOT`…… 以前这些会让整条查询解析失败 → 引擎返回
+///   `Err(SearchFailed)` → 界面上只剩一句英文 "search failed"，
+///   用户既不知道发生了什么，也不知道该怎么改。
+///   → 现在：**缺条件就结束当前分支 + 给一句中文提示**。
+///     解析器永远不会失败，引擎也就不会因为语法问题报错。
+pub fn parse(input: &str) -> Query {
     let toks = lex(input);
     let mut p = Parser {
         toks,
@@ -984,14 +1307,25 @@ pub fn parse(input: &str) -> Option<Query> {
         warnings: Vec::new(),
         only_files: false,
         only_folders: false,
+        group_depth: 0,
     };
-    let root = p.parse_or()?;
-    Some(Query {
+    let root = match p.parse_or() {
+        Some(r) => r,
+        None => {
+            // 一个 term 都解析不出来（只有一个符号 / 空括号之类）
+            if !input.trim().is_empty() {
+                p.warnings
+                    .push("查询还没写完（或写法引擎不认）".to_string());
+            }
+            Node::Everything
+        }
+    };
+    Query {
         root,
         only_files: p.only_files,
         only_folders: p.only_folders,
         warnings: p.warnings,
-    })
+    }
 }
 
 /// 取出命中的区间（相对 name 或 path）。
@@ -1045,7 +1379,7 @@ fn collect_ranges(
                 Target::Path => path_ranges.extend(ranges),
             }
         }
-        Node::Field(_) | Node::Kind { .. } => {}
+        Node::Field(_) | Node::Kind { .. } | Node::Nothing | Node::Everything => {}
     }
 }
 
@@ -1054,8 +1388,9 @@ pub fn used_fields(input: &str) -> HashSet<String> {
     let mut out = HashSet::new();
     for t in lex(input) {
         if let Tok::Word(w) = t {
-            if syntax::FIELDS.contains(&w.to_lowercase().as_str()) {
-                out.insert(w.to_lowercase());
+            let lower = w.to_lowercase();
+            if syntax::field_kind(&lower).is_some() {
+                out.insert(lower);
             }
         }
     }
@@ -1077,13 +1412,24 @@ mod tests {
             is_folder: folder,
             depth: 1,
             child_count: 0,
+            child_file_count: 0,
+            child_folder_count: 0,
             folded_name: fold(name),
             folded_path: fold(&format!("/Users/me/Documents/{name}")),
         }
     }
 
+    /// 一个目录条目（带子项计数）。
+    fn folder_entry(name: &str, files: u32, folders: u32) -> IndexEntry {
+        let mut e = entry(name, "", 0, 0, true);
+        e.child_file_count = files;
+        e.child_folder_count = folders;
+        e.child_count = files + folders;
+        e
+    }
+
     fn matches(query: &str, e: &IndexEntry) -> bool {
-        let q = parse(query).expect("应该能解析");
+        let q = parse(query);
         q.matches(e)
     }
 
@@ -1114,6 +1460,32 @@ mod tests {
         assert!(matches("size:>10M", &big));
         assert!(!matches("size:>10M", &small));
         assert!(matches("size:<1K", &small));
+    }
+
+    #[test]
+    fn size_supports_two_character_operators_and_ranges() {
+        // 【回归】`<=` / `>=` 写在运算符表里（前端也照着显示），
+        //   但词法器以前只把「相同字符」成对识别 → `size:<=5M` 读不出值。
+        let mid = entry("mid.bin", "bin", 5_000_000, 0, false);
+        assert!(matches("size:<=5M", &mid));
+        assert!(!matches("size:<5M", &mid));
+        assert!(matches("size:>=5M", &mid));
+        // 区间（跟深度、子项数保持一致）
+        assert!(matches("size:1M..10M", &mid));
+        assert!(!matches("size:1M..10M", &entry("big.bin", "bin", 20_000_000, 0, false)));
+        assert!(!matches("size:1M..10M", &entry("small.bin", "bin", 500, 0, false)));
+    }
+
+    #[test]
+    fn not_equal_is_rejected_with_a_warning() {
+        // `!=` 不在运算符表里 → 不宣传；写出来了要给明确警告，不能静默。
+        let e = entry("a.txt", "txt", 100, 0, false);
+        let q = parse("size!=1M");
+        assert!(
+            !q.warnings.is_empty(),
+            "!= 要有明确警告（否则这一段条件会悄悄失效）"
+        );
+        assert!(!q.matches(&e), "不支持的写法不该匹配任何东西");
     }
 
     #[test]
@@ -1155,7 +1527,7 @@ mod tests {
 
     #[test]
     fn unknown_field_produces_a_warning() {
-        let q = parse("bogus:x").unwrap();
+        let q = parse("bogus:x");
         assert!(!q.warnings.is_empty());
         assert!(q.warnings[0].contains("bogus"));
     }
@@ -1170,6 +1542,30 @@ mod tests {
     }
 
     #[test]
+    fn a_modifier_can_prefix_a_field() {
+        // 【回归】上游的写法（帮助面板的例子里就有）：`file:size:>20gb`
+        //   修饰符作用在**字段**上，不能把字段名当成「被修饰的词」吃掉。
+        let big = entry("big.bin", "bin", 20_000_000, 0, false);
+        let dir = entry("dir", "", 0, 0, true);
+        let q = parse("file:size:>10M");
+        assert!(q.warnings.is_empty(), "不该有警告：{:?}", q.warnings);
+        assert!(q.only_files, "file: 要打开「只看文件」");
+        assert!(q.matches(&big));
+        assert!(!q.matches(&dir), "目录不该命中（只看文件）");
+    }
+
+    #[test]
+    fn a_modifier_prefixing_a_field_does_not_eat_the_field_name() {
+        // 修饰符后面跟的词**不是**字段时，它仍然是「被修饰的词」
+        let e = entry("ext.txt", "txt", 100, 0, false);
+        assert!(matches("exact:ext.txt", &e));
+        // 修饰符 + 字段 → 字段照常生效
+        let e2 = entry("a.pdf", "pdf", 100, 0, false);
+        assert!(matches("file:ext:pdf", &e2));
+        assert!(!matches("file:ext:pdf", &entry("a.txt", "txt", 100, 0, false)));
+    }
+
+    #[test]
     fn depth_field() {
         let mut e = entry("a.txt", "txt", 100, 0, false);
         e.depth = 1;
@@ -1178,9 +1574,154 @@ mod tests {
     }
 
     #[test]
+    fn parents_is_an_alias_of_depth() {
+        // 【为什么对齐上游】上游的 `parents` 也解析成 depth ——
+        //   帮助面板那一行的说明写的就是「目录深度」。
+        //   我们以前把 `parents:` 做成「祖先路径含这一段」，
+        //   跟面板的说明对不上 → 现在统一成深度。
+        let mut e = entry("a.txt", "txt", 100, 0, false);
+        e.depth = 2;
+        assert!(matches("parents:2", &e));
+        assert!(matches("depth:2", &e));
+        assert!(!matches("parents:3", &e));
+        // 不是数字 → 跟 depth 一样给警告
+        let q = parse("parents:Documents");
+        assert!(!q.warnings.is_empty(), "parents: 传非数字要有警告");
+    }
+
+    #[test]
+    fn child_counts_are_split_by_kind() {
+        let d = folder_entry("dir", 2, 1);
+        // 总数
+        assert!(matches("childcount:3", &d));
+        assert!(!matches("childcount:2", &d));
+        // 子文件数
+        assert!(matches("childfilecount:2", &d));
+        assert!(!matches("childfilecount:1", &d));
+        // 子目录数
+        assert!(matches("childfoldercount:1", &d));
+        assert!(!matches("childfoldercount:2", &d));
+    }
+
+    #[test]
+    fn numeric_fields_accept_ranges_and_comparisons() {
+        let d = folder_entry("dir", 2, 1);
+        // 区间（上游文档里的写法：childfoldercount:10..20）
+        assert!(matches("childfilecount:1..3", &d));
+        assert!(!matches("childfilecount:3..5", &d));
+        // 比较
+        assert!(matches("childfilecount:<=2", &d));
+        assert!(!matches("childfilecount:<2", &d));
+        assert!(matches("childfilecount:>=2", &d));
+        // 区间两端都含
+        assert!(matches("childfilecount:2..2", &d));
+    }
+
+    #[test]
+    fn contenttype_matches_the_mime_type() {
+        let txt = entry("a.txt", "txt", 100, 0, false);
+        let png = entry("b.png", "png", 100, 0, false);
+        let pdf = entry("c.pdf", "pdf", 100, 0, false);
+        // 按 MIME 家族
+        assert!(matches("contenttype:text", &txt));
+        assert!(!matches("contenttype:text", &png));
+        assert!(matches("contenttype:image", &png));
+        // 按具体类型
+        assert!(matches("contenttype:pdf", &pdf));
+        assert!(matches("contenttype:application/pdf", &pdf));
+        assert!(!matches("contenttype:pdf", &txt));
+    }
+
+    #[test]
+    fn contenttype_without_a_value_warns() {
+        let q = parse("contenttype:");
+        assert!(
+            !q.warnings.is_empty(),
+            "空的 contenttype: 要给提示（多半是忘了写类型名）"
+        );
+    }
+
+    #[test]
+    fn contenttype_also_accepts_the_builtin_group_names() {
+        // `contenttype:pic` 是「混用两套写法」——
+        //   只按 MIME 匹配的话一个都搜不到、而且一声不吭。
+        let png = entry("a.png", "png", 100, 0, false);
+        let txt = entry("b.txt", "txt", 100, 0, false);
+        assert!(matches("contenttype:pic", &png));
+        assert!(!matches("contenttype:pic", &txt));
+    }
+
+    #[test]
+    fn group_fields_ignore_the_value_but_warn_about_it() {
+        let png = entry("a.png", "png", 100, 0, false);
+        assert!(matches("pic:", &png));
+        // 带值 → 值被忽略，但**必须给警告**（否则用户以为在筛 png）
+        let q = parse("pic:png");
+        assert!(!q.warnings.is_empty(), "pic:png 必须警告");
+        assert!(q.matches(&png), "pic: 本身仍然生效");
+    }
+
+    #[test]
+    fn app_group_matches_app_bundles_which_are_folders() {
+        // macOS 上 .app 是**目录** —— 扫描器给目录的扩展名是空串，
+        // 不特殊处理的话 `app:` 一个应用包都搜不到。
+        let bundle = entry("Safari.app", "", 0, 0, true);
+        assert!(matches("app:", &bundle));
+        let exe = entry("setup.exe", "exe", 100, 0, false);
+        assert!(matches("app:", &exe));
+        let txt = entry("a.txt", "txt", 100, 0, false);
+        assert!(!matches("app:", &txt));
+    }
+
+    #[test]
+    fn nofileonly_cancels_the_files_only_switch() {
+        // 名字里都带 "a"（查询词就是 "a"）—— 文件与目录都该命中
+        let f = entry("a.txt", "txt", 100, 0, false);
+        let d = entry("a-dir", "", 0, 0, true);
+        // file: 只看文件
+        let q = parse("file:a");
+        assert!(q.only_files);
+        assert!(q.matches(&f) && !q.matches(&d));
+        // nofileonly: 取消这个限制
+        let q = parse("nofileonly:a");
+        assert!(!q.only_files, "nofileonly: 要把「只看文件」关掉");
+        assert!(q.matches(&f) && q.matches(&d));
+    }
+
+    #[test]
+    fn nofolderonly_cancels_the_folders_only_switch() {
+        // 名字里都带 "dir"（查询词就是 "dir"）
+        let f = entry("dir.txt", "txt", 100, 0, false);
+        let d = entry("dir", "", 0, 0, true);
+        let q = parse("nofolderonly:dir");
+        assert!(!q.only_folders);
+        assert!(q.matches(&f) && q.matches(&d));
+    }
+
+    #[test]
+    fn unknown_field_matches_nothing_but_warns() {
+        // 【为什么是「什么都不匹配」而不是「匹配一切」】
+        //   未知字段时给一堆结果 + 一行警告，用户很容易以为「搜索正常」。
+        //   0 条 + 警告 = 明确告诉用户「你写错了」。
+        let e = entry("a.txt", "txt", 100, 0, false);
+        let q = parse("bogus:x");
+        assert!(!q.warnings.is_empty());
+        assert!(!q.matches(&e), "未知字段不该匹配任何东西");
+    }
+
+    #[test]
+    fn a_trailing_bare_modifier_does_not_break_the_query() {
+        // 查询只有一个裸修饰符 → 不能让整个查询解析失败
+        let e = entry("a.txt", "txt", 100, 0, false);
+        let q = parse("case");
+        assert!(q.warnings.is_empty());
+        assert!(q.matches(&e));
+    }
+
+    #[test]
     fn highlight_ranges_point_at_the_original_string() {
         let e = entry("Report.pdf", "pdf", 100, 0, false);
-        let q = parse("report").unwrap();
+        let q = parse("report");
         let (name_ranges, _) = highlight_ranges(&q, &e);
         assert_eq!(name_ranges.len(), 1);
         let (s, t) = name_ranges[0];
@@ -1197,6 +1738,27 @@ mod tests {
         assert!((to - from) >= 22 * 86400);
         let (from, to) = parse_date_range("2026").unwrap();
         assert!(to - from >= 364 * 86400);
+    }
+
+    #[test]
+    fn open_ended_date_ranges_work() {
+        // `dm:2024..`（2024 年之后）/ `dm:..2024`（2024 年之前）
+        let (from, to) = parse_date_range("2024..").unwrap();
+        assert!(from < now_epoch() && to == i64::MAX);
+        let (from, to) = parse_date_range("..2024").unwrap();
+        assert!(from == i64::MIN && to < now_epoch());
+    }
+
+    #[test]
+    fn dates_can_be_precise_to_the_minute() {
+        // `dm:"2026-10-22 12:00"` —— 手册与速查卡都写着这个写法
+        let (from, to) = parse_date_range("2026-10-22 12:00").unwrap();
+        // 单给一个时刻 → 覆盖那一整分钟
+        assert_eq!(to - from, 59, "到那一分钟的末尾");
+        let (from2, to2) = parse_date_range("2026-10-22 12:00..2026-10-22 13:00").unwrap();
+        assert_eq!(from2, from, "区间起点就是那个时刻");
+        assert!(to2 > to, "区间右端是 13:00 那分钟的末尾");
+        assert!((to2 - from2) >= 3600);
     }
 
     #[test]

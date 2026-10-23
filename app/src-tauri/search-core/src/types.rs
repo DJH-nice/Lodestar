@@ -119,6 +119,11 @@ pub enum EngineError {
     InvalidArg,
     NoMemory,
     ScanFailed,
+    /// 搜索失败。
+    ///
+    /// 【为什么现在没人产生它】查询的**语法**问题不再走错误路径 ——
+    ///   解析器永不失败：「还没写完」= 已解析的部分 + 一句中文提示
+    ///   （见 `query::parse`）。真正的内部故障用 `Internal`。
     SearchFailed,
     NotFound,
     Internal(String),
@@ -157,8 +162,12 @@ pub struct IndexEntry {
     pub is_folder: bool,
     /// 索引根目录的深度 = 0，其下每层 +1。
     pub depth: u32,
-    /// 子项数量（目录才有意义）。
+    /// 子项数量（目录才有意义）：文件 + 目录。
     pub child_count: u32,
+    /// 子**文件**数量（目录才有意义）—— `childfilecount:` 字段用。
+    pub child_file_count: u32,
+    /// 子**目录**数量（目录才有意义）—— `childfoldercount:` 字段用。
+    pub child_folder_count: u32,
     /// NFD + 小写之后的文件名。
     pub folded_name: String,
     /// NFD + 小写之后的完整路径。

@@ -25,6 +25,7 @@
 pub mod engine;
 pub mod exclude;
 pub mod fold;
+pub mod mime;
 pub mod query;
 pub mod scan;
 pub mod store;

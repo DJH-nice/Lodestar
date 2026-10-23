@@ -23,6 +23,25 @@ use crate::exclude;
 use crate::fold::fold;
 use crate::types::{EngineError, IndexEntry};
 
+/// 一个目录的子项计数（分文件 / 分目录）。
+///
+/// 【为什么要分开数】
+///   `childcount:`（总数）、`childfilecount:`（子文件数）、
+///   `childfoldercount:`（子目录数）是三个字段 —— 只数总数的话，
+///   后两个就没法实现（总需要重新遍历磁盘）。
+///   → 扫描时顺手分开数，索引期就存好（查询期 O(1)）。
+#[derive(Debug, Clone, Copy, Default)]
+struct ChildCounts {
+    files: u32,
+    folders: u32,
+}
+
+impl ChildCounts {
+    fn total(&self) -> u32 {
+        self.files + self.folders
+    }
+}
+
 /// 扫描线程数。
 ///
 /// 【为什么上限是 4】实测 4 线程就到饱和点（16.6ms），再往上磁盘到顶。
@@ -51,7 +70,7 @@ pub fn scan(roots: &[PathBuf]) -> Result<Vec<IndexEntry>, EngineError> {
     }
 
     let mut entries: Vec<IndexEntry> = Vec::new();
-    let mut child_counts: HashMap<PathBuf, u32> = HashMap::new();
+    let mut child_counts: HashMap<PathBuf, ChildCounts> = HashMap::new();
 
     // ★ 索引根本身**也是一条条目**（depth 0）——
     //   上游也这么做，所以「搜到的是不是那个目录本身」的行为保持一致。
@@ -83,25 +102,26 @@ pub fn scan(roots: &[PathBuf]) -> Result<Vec<IndexEntry>, EngineError> {
             })
             .collect();
 
-        let per_thread_entries: Vec<(Vec<IndexEntry>, HashMap<PathBuf, u32>)> = std::thread::scope(|scope| {
-            let handles: Vec<_> = buckets
-                .into_iter()
-                .map(|mut bucket| {
-                    scope.spawn(move || {
-                        let mut local: Vec<IndexEntry> = Vec::new();
-                        let mut local_counts: HashMap<PathBuf, u32> = HashMap::new();
-                        for queue in bucket.drain(..) {
-                            walk_queue(queue, &mut local, &mut local_counts);
-                        }
-                        (local, local_counts)
+        let per_thread_entries: Vec<(Vec<IndexEntry>, HashMap<PathBuf, ChildCounts>)> =
+            std::thread::scope(|scope| {
+                let handles: Vec<_> = buckets
+                    .into_iter()
+                    .map(|mut bucket| {
+                        scope.spawn(move || {
+                            let mut local: Vec<IndexEntry> = Vec::new();
+                            let mut local_counts: HashMap<PathBuf, ChildCounts> = HashMap::new();
+                            for queue in bucket.drain(..) {
+                                walk_queue(queue, &mut local, &mut local_counts);
+                            }
+                            (local, local_counts)
+                        })
                     })
-                })
-                .collect();
-            handles
-                .into_iter()
-                .map(|h| h.join().expect("扫描线程 panicked"))
-                .collect()
-        });
+                    .collect();
+                handles
+                    .into_iter()
+                    .map(|h| h.join().expect("扫描线程 panicked"))
+                    .collect()
+            });
 
         for (local, local_counts) in per_thread_entries {
             entries.extend(local);
@@ -114,7 +134,13 @@ pub fn scan(roots: &[PathBuf]) -> Result<Vec<IndexEntry>, EngineError> {
     // 回填子项数量
     for e in entries.iter_mut() {
         if e.is_folder {
-            e.child_count = child_counts.get(Path::new(&e.path)).copied().unwrap_or(0);
+            let c = child_counts
+                .get(Path::new(&e.path))
+                .copied()
+                .unwrap_or_default();
+            e.child_count = c.total();
+            e.child_file_count = c.files;
+            e.child_folder_count = c.folders;
         }
     }
 
@@ -127,7 +153,7 @@ pub fn scan(roots: &[PathBuf]) -> Result<Vec<IndexEntry>, EngineError> {
 fn walk_queue(
     mut queue: Vec<(PathBuf, u32)>,
     entries: &mut Vec<IndexEntry>,
-    child_counts: &mut HashMap<PathBuf, u32>,
+    child_counts: &mut HashMap<PathBuf, ChildCounts>,
 ) {
     while let Some((dir, depth)) = queue.pop() {
         let read = match std::fs::read_dir(&dir) {
@@ -165,23 +191,23 @@ fn walk_queue(
 
             let is_dir = meta.is_dir() && !meta.file_type().is_symlink();
 
-            // 子项计数挂在这个目录自己身上
-            *child_counts.entry(dir.clone()).or_insert(0) += 1;
+            // 命中排除规则 → 这一项压根不进索引，**也不算子项**
+            // （先判断再计数：省掉「加了又减」这种来回改）
+            //
+            // ★ 目录级剪枝：命中排除规则的目录**不递归进去**
+            //   —— 里面的文件从没被访问过（这是性能命脉，见 exclude.rs）。
+            if exclude::is_excluded_dir_name(&name) {
+                continue;
+            }
 
+            // 子项计数挂在这个目录自己身上（分文件 / 分目录）
+            let counts = child_counts.entry(dir.clone()).or_default();
             if is_dir {
-                // ★ 目录级剪枝：命中排除规则就**不递归进去**
-                if exclude::is_excluded_dir_name(&name) {
-                    // 剪掉的目录不算子项（它压根没进索引）
-                    *child_counts.entry(dir.clone()).or_insert(0) -= 1;
-                    continue;
-                }
+                counts.folders += 1;
                 entries.push(make_entry(&path, &dir, depth + 1, true));
                 queue.push((path, depth + 1));
             } else {
-                if exclude::is_excluded_dir_name(&name) {
-                    *child_counts.entry(dir.clone()).or_insert(0) -= 1;
-                    continue;
-                }
+                counts.files += 1;
                 entries.push(make_entry(&path, &dir, depth + 1, false));
             }
         }
@@ -228,6 +254,8 @@ fn make_entry(path: &Path, dir: &Path, depth: u32, is_folder: bool) -> IndexEntr
         is_folder,
         depth,
         child_count: 0,
+        child_file_count: 0,
+        child_folder_count: 0,
     }
 }
 
@@ -307,6 +335,19 @@ mod tests {
         let root = entries.iter().find(|e| e.name == root_name).unwrap();
         // 根下有：alpha.txt / beta.RS / sub / .hidden(隐藏,不算) / node_modules(剪掉,不算)
         assert_eq!(root.child_count, 3, "被剪掉的目录不该计入子项数");
+        // 分开数：文件 2 个（alpha.txt / beta.RS），目录 1 个（sub）
+        assert_eq!(root.child_file_count, 2, "子文件数不对");
+        assert_eq!(root.child_folder_count, 1, "子目录数不对");
+        assert_eq!(
+            root.child_file_count + root.child_folder_count,
+            root.child_count,
+            "总数必须等于「文件 + 目录」"
+        );
+
+        let sub = entries.iter().find(|e| e.name == "sub").unwrap();
+        assert_eq!(sub.child_count, 1, "sub 下只有 gamma.log");
+        assert_eq!(sub.child_file_count, 1);
+        assert_eq!(sub.child_folder_count, 0);
 
         let _ = std::fs::remove_dir_all(&dir);
     }

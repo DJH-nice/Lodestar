@@ -154,7 +154,9 @@ impl Engine {
             });
         }
 
-        let q = query::parse(&req.query).ok_or(EngineError::SearchFailed)?;
+        // 解析 —— **不会失败**：查询还没写完时解析器给的是「已解析的部分 + 一句提示」
+        //   （见 query::parse 的说明）。所以这里没有「语法错误」这条错误路径。
+        let q = query::parse(&req.query);
 
         // 匹配
         let entries = self.entries.borrow();
@@ -274,23 +276,22 @@ impl Engine {
         for id in page_items {
             let e = &entries[*id as usize];
             let mut out = e.to_entry();
-            if let Some(q) = &parsed {
-                let (name_ranges, path_ranges) = query::highlight_ranges(q, e);
-                out.highlights = name_ranges
-                    .iter()
-                    .map(|(s, t)| Highlight {
-                        start: *s as u32,
-                        length: (*t - *s) as u32,
-                    })
-                    .collect();
-                out.path_highlights = path_ranges
-                    .iter()
-                    .map(|(s, t)| Highlight {
-                        start: *s as u32,
-                        length: (*t - *s) as u32,
-                    })
-                    .collect();
-            }
+            let q = &parsed;
+            let (name_ranges, path_ranges) = query::highlight_ranges(q, e);
+            out.highlights = name_ranges
+                .iter()
+                .map(|(s, t)| Highlight {
+                    start: *s as u32,
+                    length: (*t - *s) as u32,
+                })
+                .collect();
+            out.path_highlights = path_ranges
+                .iter()
+                .map(|(s, t)| Highlight {
+                    start: *s as u32,
+                    length: (*t - *s) as u32,
+                })
+                .collect();
             out_entries.push(out);
         }
 
@@ -323,6 +324,18 @@ impl Engine {
         exclude::exclude_rules()
     }
 
+    /// 全部索引条目的一份**拷贝**。
+    ///
+    /// 【谁在用】落盘。`store::save` 要的是 `&[IndexEntry]`，
+    ///   而条目归引擎的 `RefCell` 所有 —— 借出去会撞上运行期借用检查，
+    ///   所以这里给一份快照（拷贝）。
+    ///
+    /// 【代价】8,535 条约 3MB 的拷贝 ≈ 0.2ms —— 只在落盘路径上付这个钱，
+    ///   不在搜索路径上（搜索直接借用，不拷贝）。
+    pub fn all_entries(&self) -> Vec<IndexEntry> {
+        self.entries.borrow().clone()
+    }
+
     /// 这条路径**会不会被排除规则挡掉**（watcher 用它过滤事件）。
     pub fn path_is_excluded(path: &Path) -> bool {
         exclude::path_is_excluded(path)
@@ -334,10 +347,10 @@ impl Engine {
     ///   别混用分隔符。上层 `syntax_tables` 命令按逗号切，
     ///   前端测试读的 `app/shared/syntax-tables.json` 也是按这个格式对账。
     pub fn syntax_modifiers() -> String {
-        syntax::MODIFIERS.join(",")
+        syntax::modifier_names().join(",")
     }
     pub fn syntax_fields() -> String {
-        syntax::FIELDS.join(",")
+        syntax::field_names().join(",")
     }
     pub fn syntax_operators() -> String {
         syntax::OPERATORS.join(",")
