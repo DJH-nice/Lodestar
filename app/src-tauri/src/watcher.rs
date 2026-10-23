@@ -1859,6 +1859,54 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// 被排除的路径**不该**进增量更新 —— 一个都不该。
+    ///
+    /// 【为什么这条要钉死】验收标准：「排除目录里的变化不触发任何索引更新」。
+    ///   `~/Library` 有 26.4 万条目、构建产物目录动辄几万个 ——
+    ///   它们**一个字节都不进索引**，变化了也不该让引擎去 stat 它们。
+    #[test]
+    fn excluded_paths_never_reach_the_incremental_update() {
+        let cache = ExcludedDirCache::new();
+        let mk = |p: &str| {
+            notify::Event::new(notify::EventKind::Create(notify::event::CreateKind::File))
+                .add_path(PathBuf::from(p))
+        };
+
+        // 排除规则里的目录名（node_modules / target / Library …）
+        for excluded in [
+            "/Users/someone/app/node_modules/pkg/index.js",
+            "/Users/someone/app/src-tauri/target/debug/deps/libfoo.dylib",
+            "/Users/someone/Library/WebKit/com.sextant.macos/x.db",
+            "/Users/someone/.minimax/v2/sessions/a/messages.jsonl",
+        ] {
+            assert!(
+                indexable_paths(&mk(excluded), &cache).is_empty(),
+                "「{excluded}」被排除了，不该进增量更新"
+            );
+        }
+
+        // 正常路径 → 要放行
+        let ok = indexable_paths(&mk("/Users/someone/Downloads/报告.md"), &cache);
+        assert_eq!(ok.len(), 1, "正常路径必须放行 —— 否则索引永远不更新");
+    }
+
+    /// 一次事件里**混着**排除路径与正常路径时，只放行正常的那几个。
+    ///
+    /// 【为什么重要】FSEvents 一次会带上一串路径。
+    ///   旧判据是「只要有一个能索引，整批就算数」——
+    ///   那会把**不该索引的路径**也塞进增量更新 → 白做功。
+    #[test]
+    fn only_the_indexable_paths_of_a_mixed_event_are_kept() {
+        let cache = ExcludedDirCache::new();
+        let ev = notify::Event::new(notify::EventKind::Create(notify::event::CreateKind::File))
+            .add_path(PathBuf::from("/Users/someone/Library/x.db"))
+            .add_path(PathBuf::from("/Users/someone/Downloads/keep.md"))
+            .add_path(PathBuf::from("/Users/someone/app/node_modules/y.js"));
+        let kept = indexable_paths(&ev, &cache);
+        assert_eq!(kept.len(), 1, "只该留下那一个正常路径");
+        assert!(kept[0].ends_with("keep.md"));
+    }
+
     // ── 事件名 ──
 
     /// 事件名要钉死 —— Rust 发、前端收，两边不一致就「事件发了但没人听」。

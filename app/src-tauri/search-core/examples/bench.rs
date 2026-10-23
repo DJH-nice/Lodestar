@@ -42,7 +42,9 @@ fn main() {
         .join("Library/Application Support/com.sextant.macos/index.bin");
 
     println!("=== 1. 读档（冷启动的关键）===");
-    if store.exists() {
+    if !store.exists() {
+        println!("  （还没有索引档：{store:?}）");
+    } else {
         // 读三遍取最小 —— 第一次可能受磁盘缓存影响
         let mut best = f64::MAX;
         let mut count = 0;
@@ -57,14 +59,18 @@ fn main() {
                     count = entries.len();
                 }
                 None => {
-                    println!("  ✗ 读档失败");
+                    // 【为什么可能读不出来】索引档有**格式版本**：
+                    //   版本对不上（别的版本写过的档）→ 读档失败 → 退回全量扫描。
+                    //   这是**设计如此**，不是错误。
+                    println!("  ✗ 读档失败（版本对不上？→ 会退回全量扫描，这是安全的）");
+                    best = 0.0;
                     break;
                 }
             }
         }
-        println!("  读档 {count} 项：{best:.1} ms");
-    } else {
-        println!("  （还没有索引档：{store:?}）");
+        if best > 0.0 {
+            println!("  读档 {count} 项：{best:.1} ms");
+        }
     }
 
     println!("\n=== 2. 全量扫描（读档的对照组）===");
@@ -126,6 +132,29 @@ fn main() {
         }
     }
     println!("  落盘 {indexed} 项：{best:.1} ms（临时文件 + fsync + rename）");
+
+    // 读回刚写的这一份 → **冷启动的读档耗时**（自己写的档，版本一定对得上）
+    let mut best_load = f64::MAX;
+    for _ in 0..3 {
+        let t = Instant::now();
+        match search_core::store::load(&probe_store) {
+            Some((e, _)) => {
+                let d = ms_since(t);
+                if d < best_load {
+                    best_load = d;
+                }
+                std::hint::black_box(e.len());
+            }
+            None => {
+                println!("  ✗ 读档失败");
+                best_load = 0.0;
+                break;
+            }
+        }
+    }
+    if best_load > 0.0 {
+        println!("  读回 {indexed} 项：{best_load:.1} ms（**冷启动的关键**）");
+    }
 
     // 拆开看：落盘是「序列化（CPU）」+「写盘（I/O）」两段。
     // 哪一段贵，决定了它能不能放在增量更新的关键路径上。
