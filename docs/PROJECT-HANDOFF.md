@@ -245,11 +245,28 @@ sextant/                          ← 新仓库（git 已初始化，1 次提交
 - 打包验证：`.app` ≤12M、`otool -L` 无外部 dylib
 - 加 CI（GitHub Actions：cargo test + vitest + 打包自检）
 
-**与 M2 合并时要补一处**（M2 给 `IndexEntry` 加了 `child_file_count` /
-`child_folder_count` 两个字段）：`search-core/src/incremental.rs` 的
-`ChildDelta` 要**一并维护那两个计数**，否则增量出来的索引与全量重扫对不上。
-**护栏会当场抓到它**：`search-core/tests/incremental.rs` 里
-「增量之后的索引与全量重扫等价」那条断言会变红 ✓
+**与 M2 合并时的三步（已实测验证）**
+> 背景：M2 给 `IndexEntry` 加了 `child_file_count` / `child_folder_count`
+> 两个字段（`childfilecount:` / `childfoldercount:` 用）。
+> M3 的增量更新只维护了 `child_count` → 合并后那两个计数会**漂移**。
+>
+> **① 解决 2 处冲突**（实测：`git merge-tree` 干跑的结果）
+>   - `search-core/src/lib.rs`：两行都留（`pub mod incremental;` + `pub mod mime;`）
+>   - `search-core/src/engine.rs`：留 M3 的 `apply_changes` 那一块
+>   （`scan.rs` 与 `store.rs` **自动合并**，不用管）
+>
+> **② 让增量更新维护那两个新计数**（`search-core/src/incremental.rs`，约 8 行）
+>   - `ChildDelta` 加 `files` / `folders` 两个字段
+>   - `bump()` 多收一个 `is_folder` 参数
+>   - 应用增量时多写两行：
+>     `e.child_file_count = ...; e.child_folder_count = ...;`
+>
+> **③ 把护栏的快照也扩到那两个字段**
+>   （`search-core/tests/incremental.rs` 的 `Snapshot` 类型 + 取值处，2 行）
+>   → **不扩的话漂移不会被抓到** —— 实测：扩之前 19 条全绿，
+>     扩之后 **8 条变红**（`child_folder_count` 对不上）✓
+>
+> 三步做完，合并后的 `cargo test -p search-core` **19 条全绿**（已实测）。
 
 **另有两件小事**：
 - `CreditsPanel.vue` 里还写着上游 FSearch 与 GPL 的说明 → 要重写
