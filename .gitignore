@@ -1,5 +1,8 @@
 # 依赖
-node_modules/
+# 【为什么不带尾斜杠】`node_modules/` 只匹配**目录**，
+#   匹配不到**符号链接**（隔离工作区里 node_modules 常是个链接）→
+#   链接会被提交进版本库。
+node_modules
 
 # 构建产物
 app/dist/

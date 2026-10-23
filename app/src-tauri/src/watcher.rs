@@ -8,27 +8,51 @@
 //! 【整体结构】
 //! ```text
 //!   FSEvents ──► notify 回调（notify 自己的线程）
-//!                 └─ 只做一件事：置「脏了」+ 记时间戳（**一次**原子写）
-//!                        │  【不碰引擎、不碰 IndexState、不拿别的锁】
+//!                 └─ 只做两件事：
+//!                    ① 把「**哪些路径**变了」放进脏路径集合
+//!                    ② 置「脏了」+ 记时间戳（**一次**原子写）
+//!                       【不碰引擎、不碰 IndexState、不拿别的锁】
 //!                        ▼
-//!   对账线程（每 1 秒一轮）
+//!   对账线程（每 200ms 一轮）
 //!     ├─ 读 IndexState::paths()（= 当前活着的引擎索引了哪些目录）
 //!     │    与「已监听的列表」对比 → 不一致就重配（先取消旧的、再加新的）
-//!     └─ 「有变化待处理」且**六道闸**都过了 → 触发自动重扫
-//!            └─ do_rescan（与「刷新」按钮**同一条路**）
+//!     └─ 「有变化待处理」且**六道闸**都过了 → 触发一次**增量更新**
+//!            └─ do_apply_changes → 引擎只碰「真的变了」的那几个路径
 //!                  └─ 提交状态 + emit("index-auto-refreshed") → 前端重搜
 //! ```
+//!
+//! 【M3：从「全量重扫」改成「增量更新」】
+//!   以前收到文件变化 → **把整棵子树重新扫一遍**（`$HOME` 量级 300ms+），
+//!   而且会把排在后面的搜索全堵住（搜索与重扫共用同一个 worker 线程）。
+//!   现在收到文件变化 → **只碰真的变了的那几个路径**（实测 0.05ms）。
+//!
+//!   **为什么能做到**：FSEvents 给的是**每个文件**的事件
+//!   （不是「某个目录变了」这件事），所以单个文件的变化可以精确到那一条 ——
+//!   不用碰它的任何邻居。实测见 `search-core/src/incremental.rs`
+//!   与 `search-core/examples/bench.rs` 的第 6 节。
+//!
+//! 【兜底：FSEvents 说「有事件被丢掉了」】
+//!   FSEvents 的事件队列满了会**丢事件**（这时它发一个
+//!   「必须重扫子目录」的信号，notify 翻译成 `Flag::Rescan` 事件）。
+//!   增量更新**依赖事件不丢** —— 丢了索引就永远对不上
+//!   → 收到这个信号就老老实实**全量重扫**一次。
 //!
 //! 【六道闸 —— 按**真实求值顺序**】（纯函数 → 可测）
 //!   ① **扫描在飞** → 这一轮跳过，**不清脏标志**（不丢事件）
 //!   ② **强制补扫** → 唤醒时立刻扫，**压过空闲**（见下面「为什么 force 要赢」）
 //!   ③ **应用空闲** → 这一轮不重扫，但**保留脏标志**（空闲期间的变化不丢）
 //!   ④ **已被覆盖** → 这次变化已经被某趟**已完成**的扫描收进索引了 → 不用再扫
-//!   ⑤ **静默期** 800ms → 把一次保存的多个事件合并成一次重扫
-//!   ⑥ **最小间隔** 5s → 防「持续小改动」把引擎刷爆
+//!   ⑤ **静默期** 200ms → 把一次保存的多个事件合并成**一次**更新
+//!   ⑥ **最小间隔** 400ms → 防「持续小改动」把引擎刷爆
 //!
 //!   ①②③ 在 [`decide_rescan`] 里，④⑤⑥ 在 [`decide_auto_rescan`] 里；
 //!   另有「没变化 / 开关关着」两个出口也在 [`decide_auto_rescan`] 里。
+//!
+//!   【为什么这三道时间闸在 M3 之后变短了】
+//!   它们当初是为了**省 CPU**（全量重扫 300ms+，宁可等久一点）。
+//!   现在更新是**毫秒级**的，它们的作用变成了「**别把前端刷爆**」
+//!   （每次更新都要给前端发一个事件，`app.emit` ≈ 7ms CPU）——
+//!   于是「改一个文件 → 1 秒内可见」成为可能（实测端到端 407ms）。
 //!
 //! 【为什么「强制补扫」要压过「应用空闲」】
 //!   watcher 读「空闲」和读「补扫请求」是**两个不同时刻**（两次独立的读），
@@ -44,7 +68,7 @@
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -54,38 +78,52 @@ use tauri::{AppHandle, Emitter, Manager, Runtime};
 
 use crate::index_state::IndexState;
 
-/// 【静默期】事件发生后 **800ms** 内没有新事件，才触发重扫。
+/// 【静默期】事件发生后 **200ms** 内没有新事件，才触发更新。
 ///
-/// 【为什么是 800ms】
-///   一次「保存」在 FSEvents 看来是**好几个**事件：
-///   建临时文件 → 写内容 → rename 成目标名。三个事件之间只隔几毫秒。
-///   静默期必须**大于**这一串事件的间隔，否则**一次保存会触发 2~3 次重扫**
-///   （`$HOME` 量级每次 2 秒 —— 用户保存一次文件就烧掉 6 秒 CPU）。
-///   800ms 是「几毫秒的连发」与「人的两次操作之间」之间的宽裕中值：
-///   比它小 → 一次保存扫好几次；比它大 → 用户要等更久才看到索引跟上。
-pub const QUIET_PERIOD: Duration = Duration::from_millis(800);
+/// 【为什么从 800ms 改成 200ms】
+///   原来是 800ms，因为一次更新要**重扫整棵树**（`$HOME` 量级 300ms+）——
+///   扫早一点就是白烧 CPU，所以宁可等久一点。
+///   现在更新是**增量**的（实测毫秒级，见 `search-core/src/incremental.rs`）——
+///   「等久一点」换来的不再是省 CPU，而是**用户等更久才看到结果**。
+///   → 200ms 足够把「一次保存」的那串事件（建临时文件 → 写内容 → rename，
+///   它们之间只隔几毫秒）合成**一次**更新，又不至于让界面慢半拍。
+///
+/// 【验收口径】「改一个文件 → 索引可见 ≤ 1 秒」：
+///   静默期 200ms + 最小间隔 400ms + 对账周期 200ms ≈ 800ms ✓
+pub const QUIET_PERIOD: Duration = Duration::from_millis(200);
 
-/// 【最小间隔】两次**自动重扫的开始**之间至少 **5s**。
+/// 【最小间隔】两次**自动更新的开始**之间至少 **400ms**。
 ///
-/// 【为什么是 5s】
-///   `$HOME` 量级的重扫实测 ≈**50 毫秒**（8119 项；全量扫描约 300 毫秒）。
-///   不设这道闸的话，「持续小改动」（编辑器的自动保存、`git checkout`、
-///   下载文件夹）会把引擎**一直刷爆** —— 每 5 秒扫一次是能接受的极限。
+/// 【为什么从 5s 改成 400ms】
+///   原来是 5s，因为一次更新是**全量重扫**（`$HOME` 量级 300ms+）——
+///   「持续小改动」（编辑器的自动保存、`git checkout`、下载文件夹）
+///   会把引擎一直刷爆，所以宁可 5 秒才更新一次。
+///   现在更新是**增量**的（毫秒级）→ 这道闸的作用从「省 CPU」
+///   变成了「**别把前端刷爆**」：
+///   每次更新都要给前端发一个事件（`app.emit` ≈ 7ms CPU，见 AGENTS.md 硬约束 5），
+///   所以还是要有间隔，但 400ms 足够跟得上「1 秒内可见」的要求。
 ///
 /// 【这道闸量的是「开始 → 开始」】
 ///   计时器记的是**开始**时刻（不是结束时刻），
-///   所以两次自动重扫的**开始**之间至少隔 5s —— 不是「5s 再加一次扫描时长」。
+///   所以两次自动更新的**开始**之间至少隔 400ms —— 不是「400ms 再加一次耗时」。
 ///   （这句以前写错了，见复审 Minor-4。）
 ///
 /// 【不要拿全局的「最近一次已完成的扫描」来代替它】——
 ///   那是**另一个语义**（覆盖判断用，见 [`COVER_GRACE`]），两者别混。
-pub const MIN_INTERVAL: Duration = Duration::from_secs(5);
+pub const MIN_INTERVAL: Duration = Duration::from_millis(400);
 
 /// 【对账周期】watcher 每隔多久读一次「当前活着的引擎索引了哪些目录」。
 ///
-/// 【为什么是 1s】换索引目录（reindex）之后要尽快开始监听新目录；
-///   1 秒足够快，用户察觉不到；而每秒读一次状态几乎不要钱。
-pub const RECONCILE_INTERVAL: Duration = Duration::from_secs(1);
+/// 【为什么从 1s 改成 200ms】
+///   这个循环同时是**更新的触发器**（每轮判一次那几道闸）。
+///   周期 1s 时，「改文件 → 索引可见」的下限就是 1s ——
+///
+///   跟「1 秒内可见」的要求正面冲突。
+///   → 200ms 让整条链路的预算变成
+///   「静默期 200ms + 最小间隔 400ms + 对账周期 200ms ≈ 800ms」✓
+///   换索引目录（reindex）后要尽快开始监听新目录 —— 200ms 更快 ✓
+///   而每轮读一次状态几乎不要钱（一个锁 + 一次小比较）。
+pub const RECONCILE_INTERVAL: Duration = Duration::from_millis(200);
 
 /// 【覆盖宽限】扫描完成之后，这段时间内被观察到的事件**也算「已被覆盖」**。
 ///
@@ -634,6 +672,21 @@ struct Signals {
     state: AtomicU64,
     /// 基准时刻 —— 毫秒数要相对它换算成 `Instant`。
     base: Instant,
+    /// **变化过的路径**（去重后）—— 增量更新要的就是这个。
+    ///
+    /// 【为什么需要一把锁】打包字只能装「脏标志 + 时刻 + 序号」这种定长信息；
+    ///   路径集合是变长的，只能放锁后面。
+    ///   这把锁**只属于 watcher 自己**（回调线程 ↔ 对账线程）——
+    ///   不碰引擎的锁、不碰 `IndexState` 的锁 → 没有锁序问题 ✓
+    paths: Mutex<HashSet<PathBuf>>,
+    /// FSEvents 说「**有事件被丢掉了**」→ 必须**全量重扫**兜底。
+    ///
+    /// 【为什么需要这个兜底】FSEvents 的事件队列满了会**丢事件**，
+    ///   这时它会发一个「必须重扫子目录」的信号（notify 把它翻译成
+    ///   `Flag::Rescan` 事件）。我们按路径做的增量更新**依赖事件不丢**——
+    ///   丢了就意味着索引与磁盘对不上，而且**永远对不上**（那个文件不会再变）。
+    ///   → 收到这个信号就老老实实全量重扫一次。
+    need_full_rescan: AtomicBool,
 }
 
 impl Signals {
@@ -642,7 +695,34 @@ impl Signals {
             // 初始值 = 「不脏 + 序号 0 + 还没发生过事件」
             state: AtomicU64::new(NO_EVENT_MS),
             base: Instant::now(),
+            paths: Mutex::new(HashSet::new()),
+            need_full_rescan: AtomicBool::new(false),
         }
+    }
+
+    /// 记一个**变化过的路径**（只在 notify 的回调线程里调）。
+    ///
+    /// 【为什么用 `HashSet`】同一个文件的变化往往连着来好几个事件
+    ///   （create → write → rename）。去重之后，
+    ///   「一次保存」只占**一个**路径 → 增量更新只做一件事 ✓
+    fn mark_path(&self, p: PathBuf) {
+        self.paths.lock().unwrap().insert(p);
+    }
+
+    /// **取走**这一批变化过的路径（并清空）。
+    fn take_paths(&self) -> Vec<PathBuf> {
+        let mut g = self.paths.lock().unwrap();
+        g.drain().collect()
+    }
+
+    /// 记下「有事件被丢掉了」→ 下一轮必须**全量重扫**。
+    fn set_need_full_rescan(&self) {
+        self.need_full_rescan.store(true, Ordering::Release);
+    }
+
+    /// 取走「有事件被丢掉了」这个标志（**取走即清**）。
+    fn take_need_full_rescan(&self) -> bool {
+        self.need_full_rescan.swap(false, Ordering::AcqRel)
     }
 
     /// 记一次事件（**只在 notify 的回调线程里调**）。
@@ -890,6 +970,25 @@ impl ExcludedDirCache {
     }
 }
 
+/// 这个事件里，**哪些路径是引擎会索引的**？
+///
+/// 【为什么抽成函数】生产回调与**端到端测试**必须用**同一份**判据 ——
+///   抄一份就会漂移（改了回调忘了改测试 → 测试量的不是生产行为）。
+///
+/// 【判据】① 不是噪声事件（`.DS_Store` 之类）；
+///   ② 逐个路径问排除规则（**连祖先一起查**）——
+///   被排除的路径**一个字节都不会进索引**，它们的变化不该触发任何更新。
+fn indexable_paths(ev: &notify::Event, cache: &ExcludedDirCache) -> Vec<PathBuf> {
+    if is_noise_event(ev) {
+        return Vec::new();
+    }
+    ev.paths
+        .iter()
+        .filter(|p| !cache.is_excluded(p))
+        .cloned()
+        .collect()
+}
+
 /// **最上层的**那个被排除的祖先（自己也算祖先）。
 ///
 /// 【为什么要「最上层」】缓存的收益全在**覆盖面**：
@@ -949,6 +1048,17 @@ pub fn spawn_watcher<R: Runtime>(app: &AppHandle<R>) {
     let watcher = notify::recommended_watcher(
         move |res: notify::Result<notify::Event>| match res {
             Ok(ev) => {
+                // 【兜底 —— 排在所有过滤之前】
+                //   FSEvents 的事件队列满了会**丢事件**，这时它会发一个
+                //   「必须重扫子目录」的信号（notify 翻译成 `Flag::Rescan`）。
+                //   我们按路径做的增量更新**依赖事件不丢** ——
+                //   丢了就意味着索引永远对不上。
+                //   → 记下来，下一轮老老实实全量重扫一次。
+                if ev.need_rescan() {
+                    cb_signals.set_need_full_rescan();
+                    crate::logging::log_line("[watch] FSEvents 说有事件被丢掉 → 下一轮全量重扫");
+                    return;
+                }
                 // 【先滤噪声】—— `.DS_Store` 这类 macOS 私有缓存文件
                 //   的变化**不该**换来一次全量重扫（见 `is_noise_event` 的说明）。
                 //   【滤在置脏之前】—— 噪声**根本不进入**去抖逻辑，
@@ -986,8 +1096,15 @@ pub fn spawn_watcher<R: Runtime>(app: &AppHandle<R>) {
                 //   引擎是整目录扫的，漏掉任何一个都可能让索引过期。
                 // 【走缓存】—— 语义与直接问引擎**完全一致**（缓存里只存
                 //   引擎确认排除的目录），但重复路径不用再连祖先查一遍。
-                let indexable = ev.paths.iter().any(|p| !cb_cache.is_excluded(p));
-                if !indexable {
+                //
+                //   【判据】这次要处理的是**路径**，所以判据必须是**逐个路径**的：
+                //   一个事件里可能既有该索引的路径、也有不该索引的路径
+                //   （FSEvents 一次会带上一串路径）——
+                //   整批「有一个能索引就算数」的旧判据会把**不该索引的路径**
+                //   也塞进增量更新 → 白做功（甚至让引擎去 stat 上万条排除项）。
+                //   → 只把**确实会被索引**的路径收进来。
+                let indexable = indexable_paths(&ev, &cb_cache);
+                if indexable.is_empty() {
                     let n = cb_excluded.fetch_add(1, Ordering::Relaxed) + 1;
                     if n % 100 == 1 {
                         crate::logging::log_line(&format!(
@@ -996,6 +1113,12 @@ pub fn spawn_watcher<R: Runtime>(app: &AppHandle<R>) {
                         ));
                     }
                     return;
+                }
+                // 【收进「脏路径」集合】—— 这就是增量更新的输入。
+                //
+                //   去重在集合里做（同一个文件的多个事件只占一个路径）。
+                for p in indexable {
+                    cb_signals.mark_path(p);
                 }
                 // 【这一批事件只打一行】——
                 //   一次保存会产生好几个事件（create / write / rename），
@@ -1108,12 +1231,21 @@ fn reconcile_loop<R: Runtime>(
         //   以前只活在这个 match 分支里 —— 删掉任何一行，测试仍然全绿。
         //   现在它们是 `rescan_action` 的返回值 → **可断言**。
         let action = rescan_action(outcome);
-        // 【执行动作】—— 返回「该不该执行这次重扫」。
-        //   注意：**清脏发生在这里**，也就是在重扫【之前】（理由见下面）。
+        // 【执行动作】—— 返回「该不该执行这次更新」。
+        //   注意：**清脏发生在这里**，也就是在更新【之前】（理由见下面）。
         let rescan = apply_rescan_action(action, &signals, &life);
         if !rescan {
+            // 【为什么这里也要把「脏路径」清掉】
+            //   脏标志被清 = 这批变化被判成了「已被覆盖」或「开关关着」——
+            //   也就是说**它们不会再被处理了**。
+            //   → 路径也必须一起清掉，否则集合会**越积越多**（内存泄漏），
+            //   而且那些路径早就过期了。
+            if action.clear_dirty {
+                signals.take_paths();
+                signals.take_need_full_rescan();
+            }
             // 【日志】只有「开关关着」这一种要打 ——
-            //   `Paused`（空闲）每秒都会走到这里，别的分支也打的话会把日志刷爆。
+            //   `Paused`（空闲）每轮都会走到这里，别的分支也打的话会把日志刷爆。
             if matches!(outcome.decision, RescanDecision::Disabled) {
                 crate::logging::log_line("[watch] 自动刷新已关闭，跳过");
             }
@@ -1129,23 +1261,65 @@ fn reconcile_loop<R: Runtime>(
         //   反过来（扫完再清脏）→ 这期间来的事件被一起清掉 → 永远扫不到。
         //
         //   【为什么用原子 RMW 而不是 load + store(false)】—— 见 `Signals::take_dirty`。
+        // ── 取走这一批变化 ──
+        //
+        //   【为什么在这里取，而不是更新之前】
+        //   取走之后再来的事件会**重新**进集合 → 下一轮再处理 → **不丢事件** ✓
+        //   （与「清脏要在更新之前」是同一条道理）。
+        let paths = signals.take_paths();
+        let need_full = signals.take_need_full_rescan();
+        if !need_full && paths.is_empty() {
+            // 没有具体路径可处理 → 这一轮无事可做（跳过更新，也不发事件）
+            continue;
+        }
+
         last_auto_scan_at = Some(now);
 
         let count = auto_rescans.fetch_add(1, Ordering::Relaxed) + 1;
         let t0 = Instant::now();
-        match auto_rescan(&app) {
+        // 【两种更新方式】
+        //   · 正常 → **增量**：只碰真的变了的那几个路径（毫秒级）
+        //   · FSEvents 丢了事件 → **全量重扫**兜底
+        //     （增量更新依赖「事件没丢」—— 丢了索引就永远对不上）
+        let outcome_result = if need_full {
+            auto_rescan(&app)
+        } else {
+            auto_update(&app, paths)
+        };
+        match outcome_result {
             Ok(indexed) => {
                 crate::logging::log_line(&format!(
-                    "[watch] 自动重扫 #{count} 完成：{indexed} 项，耗时 {:?}",
+                    "[watch] 自动更新 #{count} 完成：{indexed} 项，{} 个路径，耗时 {:?}",
+                    if need_full { "全量重扫" } else { "增量" },
                     t0.elapsed()
                 ));
             }
             Err(e) => {
-                eprintln!("[sextant] 自动重扫失败: {e}");
-                crate::logging::log_line(&format!("[watch] 自动重扫 #{count} 失败: {e}"));
+                eprintln!("[sextant] 自动更新失败: {e}");
+                crate::logging::log_line(&format!("[watch] 自动更新 #{count} 失败: {e}"));
             }
         }
     }
+}
+
+/// 跑一次**增量更新** —— 把这一批变化就地反映进索引。
+///
+/// 【与「自动重扫」的区别】
+///   自动重扫 = 把整棵树重新扫一遍（`$HOME` 量级 300ms+，且堵住后面的搜索）。
+///   增量更新 = 只碰**真的变了**的那几个路径（毫秒级）。
+///   → 状态更新、事件通知这两件事**完全一致**（同一段代码），
+///     变的只有「引擎内部做的是哪件事」。
+fn auto_update<R: Runtime>(app: &AppHandle<R>, paths: Vec<PathBuf>) -> Result<u32, String> {
+    let state = app.state::<IndexState>();
+    let changes = search_core::incremental::ChangeSet { paths };
+    // 【取引擎放在闭包里】—— 理由与 `auto_rescan` 完全一样（代次守卫的次序）。
+    let indexed = crate::commands::do_apply_changes(
+        state.inner(),
+        || crate::commands::take_searcher(app.state::<Mutex<Option<Arc<Searcher>>>>().inner()),
+        changes,
+    )?;
+    notify_frontend(&app);
+    Ok(indexed)
 }
 
 /// 跑一次自动重扫 —— **走的是和「刷新」按钮同一条路**（`commands::do_rescan`）。
@@ -1168,6 +1342,16 @@ fn auto_rescan<R: Runtime>(app: &AppHandle<R>) -> Result<u32, String> {
         crate::commands::take_searcher(app.state::<Mutex<Option<Arc<Searcher>>>>().inner())
     })?;
     // 【通知前端】结果表重搜 + 状态栏更新。
+    notify_frontend(&app);
+    Ok(indexed)
+}
+
+/// 通知前端「索引变了，结果表重搜一次 + 状态栏更新」。
+///
+/// 【为什么抽成共用的一段】增量更新与全量重扫**对前端完全一样**
+///   （同一个事件、同一个载荷）—— 区别只在引擎内部做的是哪件事。
+///   → 前端的契约只有**一份**，不会漂。
+fn notify_frontend<R: Runtime>(app: &AppHandle<R>) {
     //   载荷是**当前的索引状态** —— 前端拿它直接更新状态栏，
     //   不用再等下一次轮询（轮询是 800ms 一轮）。
     let mut snapshot = app.state::<IndexState>().snapshot();
@@ -1175,11 +1359,10 @@ fn auto_rescan<R: Runtime>(app: &AppHandle<R>) -> Result<u32, String> {
     //   所以不能留 `snapshot()` 给的占位值。
     snapshot.visible = crate::lifecycle::window_visible(&app);
     if let Err(e) = app.emit(AUTO_REFRESH_EVENT, snapshot) {
-        // 【重扫本身是成功的】—— 只是事件发不出去（运行时已经停了）。
-        eprintln!("[sextant] 自动重扫完成，但通知前端失败: {e}");
-        crate::logging::log_line(&format!("[watch] 自动重扫完成，但事件发不出去: {e}"));
+        // 【更新本身是成功的】—— 只是事件发不出去（运行时已经停了）。
+        eprintln!("[sextant] 自动更新完成，但通知前端失败: {e}");
+        crate::logging::log_line(&format!("[watch] 自动更新完成，但事件发不出去: {e}"));
     }
-    Ok(indexed)
 }
 
 #[cfg(test)]
@@ -1228,11 +1411,13 @@ mod tests {
     fn within_the_quiet_period_does_not_scan() {
         let now = t0();
         let mut inp = inputs_at(now);
-        inp.last_event_at = Some(now - Duration::from_millis(799));
+        // 【为什么用常量】钉的是**边界**（静默期差 1ms），
+        //   不是某个写死的毫秒数 —— 改了常量，这条测试仍然守着边界。
+        inp.last_event_at = Some(now - (QUIET_PERIOD - Duration::from_millis(1)));
         assert_eq!(
             decide_auto_rescan(&inp, || true),
             RescanDecision::Wait,
-            "事件刚发生不到 800ms，不该扫"
+            "事件刚发生不到静默期，不该扫"
         );
     }
 
@@ -1241,11 +1426,11 @@ mod tests {
     fn after_the_quiet_period_scans() {
         let now = t0();
         let mut inp = inputs_at(now);
-        inp.last_event_at = Some(now - Duration::from_millis(800));
+        inp.last_event_at = Some(now - QUIET_PERIOD);
         assert_eq!(
             decide_auto_rescan(&inp, || true),
             RescanDecision::Rescan,
-            "事件发生满 800ms 静默期就该扫"
+            "事件发生满静默期就该扫"
         );
     }
 
@@ -1281,11 +1466,11 @@ mod tests {
     fn within_the_min_interval_does_not_scan() {
         let now = t0();
         let mut inp = inputs_at(now);
-        inp.last_auto_scan_at = Some(now - Duration::from_millis(4999));
+        inp.last_auto_scan_at = Some(now - (MIN_INTERVAL - Duration::from_millis(1)));
         assert_eq!(
             decide_auto_rescan(&inp, || true),
             RescanDecision::Wait,
-            "距上次自动重扫不到 5s，不该扫"
+            "距上次自动更新不到最小间隔，不该扫"
         );
     }
 
@@ -1294,11 +1479,11 @@ mod tests {
     fn after_the_min_interval_scans() {
         let now = t0();
         let mut inp = inputs_at(now);
-        inp.last_auto_scan_at = Some(now - Duration::from_secs(5));
+        inp.last_auto_scan_at = Some(now - MIN_INTERVAL);
         assert_eq!(
             decide_auto_rescan(&inp, || true),
             RescanDecision::Rescan,
-            "距上次自动重扫满 5s 就该扫"
+            "距上次自动更新满最小间隔就该扫"
         );
     }
 
@@ -1448,16 +1633,23 @@ mod tests {
 
     // ── 「一秒内连建 5 个文件 → 只扫一次」的去抖语义 ──
 
-    /// 5 个文件在 1 秒内陆续落地 → **只该触发一次**重扫。
+    /// 5 个文件在 1 秒内陆续落地 → **只该触发一次**更新。
     ///
     /// 【怎么算的】
     ///   每个事件都把「最近一次事件时刻」往后推 → 静默期在**最后一个**事件
-    ///   之后重新开始算 → 期间不会扫。等安静满 800ms（= 第 1600ms）才扫那一次；
-    ///   之后最小间隔（5s）又把后续的扫描挡掉 —— 这 3 秒里不会再有第二次。
+    ///   之后重新开始算 → 期间不会扫。等安静满静默期才扫那一次。
+    ///   扫完**脏标志就被清掉**（生产里由 `apply_rescan_action` 清）→
+    ///   后面那几轮没有待处理的变化 → 不会再扫。
     ///
-    /// 【为什么在这里模拟「扫完之后记下时刻」】
+    /// 【为什么要模拟「扫完清脏」】
+    ///   这一版以前把 `dirty` 写成「**只要发生过事件就永远为真**」——
+    ///   那不是生产的样子：脏标志是「有变化等着被收进索引」的记号，
+    ///   扫描消费掉它就会清掉。不模拟这一步的话，
+    ///   这条测试实际上是在测「最小间隔有多长」，而不是「批量会不会被拆开」。
+    ///
+    /// 【为什么要模拟「扫完之后记下时刻」】
     ///   对账线程扫完会把 `last_auto_scan_at` 更新成那一刻 ——
-    ///   测试里不照做的话，最小间隔那道闸就形同虚设（会算出 2 次）。
+    ///   测试里不照做的话，最小间隔那道闸就形同虚设。
     #[test]
     fn five_files_within_one_second_trigger_one_scan() {
         let base = t0();
@@ -1465,6 +1657,8 @@ mod tests {
         let event_times_ms = [0u64, 200, 400, 600, 800];
         let mut scans = 0;
         let mut last_auto_scan_at: Option<Instant> = None;
+        // 【脏标志】= 有变化还没被收进索引。扫描消费掉它 → 清掉。
+        let mut dirty = false;
         // 每 100ms 看一次「此刻该不该扫」，总共 3 秒
         for tick in 0..30u64 {
             let now = base + Duration::from_millis(tick * 100);
@@ -1475,8 +1669,12 @@ mod tests {
                 .filter(|ms| **ms <= elapsed)
                 .map(|ms| now - Duration::from_millis(elapsed - *ms))
                 .max();
+            // 新事件到了 → 置脏（生产里由回调线程做）
+            if event_times_ms.iter().any(|ms| *ms == elapsed) {
+                dirty = true;
+            }
             let inp = RescanInputs {
-                dirty: last_event_at.is_some(),
+                dirty,
                 last_event_at,
                 now,
                 last_auto_scan_at,
@@ -1487,12 +1685,178 @@ mod tests {
             if decide_auto_rescan(&inp, || true) == RescanDecision::Rescan {
                 scans += 1;
                 last_auto_scan_at = Some(now);
+                dirty = false; // 扫描消费掉了这批变化 → 清脏（生产里的行为）
             }
         }
         assert_eq!(
             scans, 1,
-            "一秒内连建 5 个文件应该只扫一次，实际扫了 {scans} 次"
+            "一秒内连建 5 个文件应该只更新一次，实际更新了 {scans} 次"
         );
+    }
+
+    // ── 脏路径集合（增量更新的**输入**）──
+
+    /// 记路径 → **去重**；取走 → **清空**。
+    ///
+    /// 【为什么要去重】一次「保存」在 FSEvents 看来是好几个事件
+    ///   （create → write → rename），全指向**同一个路径**。
+    ///   不去重的话，增量更新会对同一个文件做三遍事。
+    #[test]
+    fn the_dirty_path_set_dedupes_and_drains() {
+        let s = Signals::new();
+        s.mark_path(PathBuf::from("/tmp/a.txt"));
+        s.mark_path(PathBuf::from("/tmp/a.txt"));
+        s.mark_path(PathBuf::from("/tmp/b.txt"));
+        let paths = s.take_paths();
+        assert_eq!(paths.len(), 2, "同一个路径只该占一个");
+        assert!(
+            s.take_paths().is_empty(),
+            "取走之后要清空 —— 否则集合会越积越多"
+        );
+    }
+
+    /// FSEvents 说「有事件被丢掉了」→ 记下来 → **取走即清**。
+    ///
+    /// 【为什么要有这个兜底】增量更新依赖「事件没丢」——
+    ///   丢了就意味着索引永远对不上，所以那一轮必须退回全量重扫。
+    #[test]
+    fn the_full_rescan_fallback_flag_is_taken_once() {
+        let s = Signals::new();
+        assert!(!s.take_need_full_rescan(), "一开始不该有");
+        s.set_need_full_rescan();
+        assert!(s.take_need_full_rescan(), "记下之后要能读到");
+        assert!(!s.take_need_full_rescan(), "取走即清");
+    }
+
+    // ── 端到端：文件变了 → 索引能搜到，**要多久** ──
+
+    /// 端到端延迟护栏 —— 「改一个文件 → 索引里能搜到」必须 **< 1 秒**。
+    ///
+    /// 【这条测试量的是**整条真实链路**】
+    ///   真 FSEvents 监听 → 事件过滤 → 脏路径集合 → 那几道闸
+    ///   → 取路径 → 增量更新 → 引擎能搜到。
+    ///   用的全是**生产同一份**的常量与判据函数
+    ///   （[`RECONCILE_INTERVAL`] / [`QUIET_PERIOD`] / [`MIN_INTERVAL`] /
+    ///   [`decide_rescan`] / [`indexable_paths`]）——
+    ///   所以它量到的就是用户能感觉到的那一下。
+    ///
+    /// 【为什么这条要存在】
+    ///   「增量更新本身 < 5ms」只说了**引擎内部**的耗时；
+    ///   用户感觉到的是**端到端**（含事件投递与去抖等待）。
+    ///   这两个数会**各自漂移** —— 所以要把端到端也钉住。
+    #[test]
+    fn the_end_to_end_latency_stays_under_one_second() {
+        use search_core::incremental::ChangeSet;
+        use search_core::types::{ListKind, SearchRequest, SortField, SortOrder};
+
+        // ① 临时目录 + 索引它的引擎
+        //
+        //   【为什么不用 `std::env::temp_dir()`】
+        //   macOS 的 per-user 临时目录在 `/var/folders/...`，
+        //   它的**真实路径**是 `/private/var/folders/...` ——
+        //   而 `/private/var` 是**排除规则**里的一条（macOS 的系统临时区）。
+        //   → 用它做测试目录的话，事件会被排除规则挡掉（测不到东西）。
+        //   `/tmp` 的真实路径是 `/private/tmp`，**不在**排除前缀里 ✓
+        let dir = PathBuf::from("/tmp").join(format!("sextant-e2e-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let (engine, _) = search_core::Engine::new(&[dir.as_path()]).unwrap();
+
+        // ② 真 FSEvents 监听（生产同款回调逻辑）
+        let signals = Arc::new(Signals::new());
+        let cache = Arc::new(ExcludedDirCache::new());
+        let cb_signals = Arc::clone(&signals);
+        let cb_cache = Arc::clone(&cache);
+        let mut watcher = notify::recommended_watcher(
+            move |res: notify::Result<notify::Event>| {
+                if let Ok(ev) = res {
+                    let indexable = indexable_paths(&ev, &cb_cache);
+                    if !indexable.is_empty() {
+                        for p in indexable {
+                            cb_signals.mark_path(p);
+                        }
+                        // 【别忘了置脏标志】—— 生产回调也是**两件事都做**：
+                        //   `mark_path` 记「**哪些路径**变了」，
+                        //   `mark` 记「有变化了」（脏标志 + 时刻 + 序号）。
+                        //   那几道闸看的是**脏标志**，增量更新用的是**路径集合** ——
+                        //   少任何一半，这条链路都不通。
+                        cb_signals.mark();
+                    }
+                }
+            },
+        )
+        .unwrap();
+        watcher
+            .watch(&dir, notify::RecursiveMode::Recursive)
+            .unwrap();
+        // 等 FSEvents 把流建起来（否则第一个事件可能丢）
+        std::thread::sleep(Duration::from_millis(300));
+
+        // ③ 写一个文件 —— 记下时刻
+        let started = Instant::now();
+        std::fs::write(dir.join("e2e-probe.txt"), "x").unwrap();
+
+        // ④ 照着**生产对账循环**的步骤跑：每轮判一次那几道闸，过了就更新
+        let mut last_auto_scan_at: Option<Instant> = None;
+        let mut applied = false;
+        let deadline = started + Duration::from_secs(10);
+        while Instant::now() < deadline {
+            std::thread::sleep(RECONCILE_INTERVAL);
+            let now = Instant::now();
+            let (dirty, last_event_at) = signals.snapshot();
+            let inp = RescanInputs {
+                dirty,
+                last_event_at,
+                now,
+                last_auto_scan_at,
+                // 【没有已完成的扫描】→ 什么都还没被覆盖
+                last_scan_completed_at: None,
+                scan_in_flight: false,
+            };
+            // 空闲=false、强制=false —— 生产里只有唤醒时才是 force
+            let outcome = decide_rescan(&inp, false, false, || true);
+            let action = rescan_action(outcome);
+            if !action.rescan {
+                if action.clear_dirty {
+                    signals.take_paths();
+                }
+                continue;
+            }
+            last_auto_scan_at = Some(now);
+            let paths = signals.take_paths();
+            if paths.is_empty() {
+                continue;
+            }
+            engine
+                .apply_changes(&ChangeSet { paths })
+                .expect("增量更新不该失败");
+            applied = true;
+            break;
+        }
+        assert!(applied, "5 秒内没有触发任何一次更新");
+
+        // ⑤ 引擎里能搜到它了
+        let req = SearchRequest {
+            query: "e2e-probe".to_string(),
+            sort: SortField::Name,
+            order: SortOrder::Asc,
+            kind: ListKind::All,
+            page: 0,
+            page_size: 50,
+        };
+        let res = engine.search(&req).expect("搜索失败");
+        assert_eq!(res.total_entries, 1, "新文件应该已经在索引里");
+
+        let elapsed = started.elapsed();
+        println!(
+            "  端到端延迟（改文件 → 索引可见）：{elapsed:?}",
+        );
+        assert!(
+            elapsed < Duration::from_secs(1),
+            "端到端延迟 {elapsed:?} 超过 1 秒（验收标准 #1）"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     // ── 事件名 ──

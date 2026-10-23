@@ -372,6 +372,12 @@ impl IndexState {
         (inner.scan_count > 0, inner.last_scan_completed_at)
     }
 
+    /// 最近一次**已完成的扫描**的时刻（测试 / 诊断用）。
+    #[cfg(test)]
+    pub fn last_scan_completed_at(&self) -> Option<Instant> {
+        self.inner.lock().unwrap().last_scan_completed_at
+    }
+
     /// 记下「这一趟扫描成功了，完成于此刻」。
     ///
     /// 【只在成功时调】失败的扫描没更新索引 → 覆盖不了任何变化。
@@ -443,6 +449,40 @@ where
             let msg = join_err.to_string();
             state.fail(token, msg.clone());
             Err(msg)
+        }
+    }
+}
+
+/// 同步版的「增量更新」包装 —— **刻意不记「这一趟扫完了」**。
+///
+/// 【为什么必须有这个「不一样的版本」】
+///   [`run_scan_blocking`] 成功后会调 `note_scan_completed()` ——
+///   watcher 靠它判断「这次文件变化是不是已经被某趟扫描覆盖了」
+///   （那道「覆盖」闸的**全部意义**就是：用户点一次刷新后，
+///   watcher 不要为**同一批**变化再扫一整遍）。
+///
+///   但**增量更新只覆盖它处理的那几个路径**，不是整棵树 ——
+///
+///   拿它当「全量扫描」记进去 → 之后的文件变化会被误判成
+///   「已经被覆盖」→ **被跳过** → 索引悄悄过期、用户搜不到新文件。
+///   → **绝不能混用**：增量更新走这个函数，全量重扫走 `run_scan_blocking`。
+///
+/// 【其余行为与 `run_scan_blocking` 完全一致】
+///   `scanning` 标志的 begin / 收尾（失败也要记错、也要放回标志）。
+pub fn run_incremental_blocking<R, F>(state: &IndexState, f: F) -> Result<R, String>
+where
+    F: FnOnce() -> Result<R, String>,
+{
+    let token = state.begin();
+    match f() {
+        Ok(v) => {
+            state.end_scan(token);
+            // 【刻意**不**调 `note_scan_completed()`】—— 见上面的说明。
+            Ok(v)
+        }
+        Err(e) => {
+            state.fail(token, e.clone());
+            Err(e)
         }
     }
 }
@@ -777,6 +817,42 @@ mod tests {
         let snap = state.snapshot();
         assert!(!snap.scanning);
         assert!(snap.error.is_none(), "成功之后不该还留着上一次的错误");
+    }
+
+    // ── 增量更新**不能**被记成「一趟全量扫描」 ──
+
+    /// 增量更新之后，「最近一次已完成的扫描」必须**仍然是空的**。
+    ///
+    /// 【为什么这条要钉死】
+    ///   watcher 的「覆盖」闸靠这个时刻判断
+    ///   「这次文件变化是不是已经被某趟扫描覆盖了」。
+    ///   **增量更新只覆盖它处理的那几个路径**，不是整棵树 ——
+    ///   把它记成「全量扫描」→ 之后的文件变化会被误判成「已覆盖」
+    ///   → **被跳过** → 索引悄悄过期、用户搜不到新文件。
+    ///   这类 bug **不会报错**，只会让功能「偶尔不好使」——
+    ///   所以必须有一道护栏盯着。
+    #[test]
+    fn an_incremental_update_does_not_count_as_a_completed_scan() {
+        let state = IndexState::new();
+        assert!(state.last_scan_completed_at().is_none(), "一开始就该是空的");
+        run_incremental_blocking(&state, || -> Result<u32, String> { Ok(7u32) }).unwrap();
+        assert!(
+            state.last_scan_completed_at().is_none(),
+            "增量更新**不能**被记成「一趟全量扫描」—— \
+             否则 watcher 的「覆盖」闸会跳过之后的文件变化"
+        );
+    }
+
+    /// 对照组：全量重扫**确实**要记「已完成」——
+    /// 少了它，用户点一次「刷新」之后 watcher 会为同一批变化再扫一整遍。
+    #[test]
+    fn a_full_rescan_does_count_as_a_completed_scan() {
+        let state = IndexState::new();
+        run_scan_blocking(&state, || -> Result<u32, String> { Ok(7u32) }).unwrap();
+        assert!(
+            state.last_scan_completed_at().is_some(),
+            "全量重扫必须记下完成时刻（覆盖闸靠它）"
+        );
     }
 
     // ── 「最近一次已完成的扫描」的时刻（Important-1 的地基） ──

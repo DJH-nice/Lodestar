@@ -188,8 +188,28 @@ fn walk_queue(
     }
 }
 
+/// 一个条目的「大小 + 修改时间」—— **索引期算好，查询期直接读**。
+///
+/// 【为什么要单独抽出来】扫描器与增量更新器都要算这两个值，
+///   必须**算得一模一样**（差一秒 mtime，索引就与磁盘对不上）。
+///   → 只有这一份实现。
+pub(crate) fn size_and_mtime(meta: &std::fs::Metadata) -> (i64, i64) {
+    let mtime = meta
+        .modified()
+        .ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    (meta.len() as i64, mtime)
+}
+
 /// 造一条索引条目。
-fn make_entry(path: &Path, dir: &Path, depth: u32, is_folder: bool) -> IndexEntry {
+///
+/// 【为什么是 `pub(crate)`】增量更新器要**造同样的条目** ——
+///   两边各造一份的话，字段一漂移（「忘了折叠路径」之类），
+///   增量出来的索引就与全量扫出来的对不上。
+///   → 只有这一份实现。
+pub(crate) fn make_entry(path: &Path, dir: &Path, depth: u32, is_folder: bool) -> IndexEntry {
     let name = path
         .file_name()
         .map(|s| s.to_string_lossy().into_owned())
@@ -198,15 +218,7 @@ fn make_entry(path: &Path, dir: &Path, depth: u32, is_folder: bool) -> IndexEntr
     let dir_s = dir.to_string_lossy().into_owned();
 
     let (size, mtime) = match std::fs::symlink_metadata(path) {
-        Ok(m) => {
-            let mtime = m
-                .modified()
-                .ok()
-                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-                .map(|d| d.as_secs() as i64)
-                .unwrap_or(0);
-            (m.len() as i64, mtime)
-        }
+        Ok(m) => size_and_mtime(&m),
         Err(_) => (0, 0),
     };
 

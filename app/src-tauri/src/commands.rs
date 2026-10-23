@@ -215,6 +215,48 @@ where
     Ok(indexed)
 }
 
+/// 把一批变化**增量地**应用到索引 —— 与「刷新」按钮**不同**的一条路。
+///
+/// 【为什么不复用 `do_rescan`】
+///   重扫是**全量**的（`$HOME` 量级实测 300ms+），而且会把排在后面的搜索全堵住。
+///   增量是**局部的**（毫秒级）—— 这正是 M3 要做的事。
+///   但两者必须保证同一件事：**状态更新一致、引擎操作串行、失败处理一致**
+///   → 所以借用同一套「**代次守卫**」骨架（快照代次 → 取引擎 → 做 → 按代次提交）。
+///
+/// 【与 `do_rescan` 的两处不同】
+///   ① 走 [`index_state::run_incremental_blocking`] 而不是 `run_scan_blocking`
+///      —— 增量更新**不能**被记成「一趟全量扫描」
+///      （那会让之后的文件变化被误判成「已覆盖」而跳过）。
+///   ② 失败时**不清**索引（增量更新失败 = 什么都没改）。
+pub fn do_apply_changes<F>(
+    state: &IndexState,
+    take_engine: F,
+    changes: search_core::incremental::ChangeSet,
+) -> Result<u32, String>
+where
+    F: FnOnce() -> Result<Arc<Searcher>, String>,
+{
+    // ① 【一次锁内读出「代次 + 路径」】—— 理由与 `do_rescan` 完全一样：
+    //    两者必须来自**同一时刻**，否则会出现「旧引擎的结果写进新引擎的状态」。
+    let (gen, paths) = state.engine_snapshot();
+    // ② 取引擎（生产：从槽位里取；测试：可以在这里制造交错）
+    let engine = take_engine()?;
+    // ③ 做增量更新
+    let indexed = crate::index_state::run_incremental_blocking(state, || {
+        engine
+            .apply_changes(changes)
+            .map(|r| r.indexed)
+            .map_err(|e| e.to_string())
+    })?;
+    // ④ 用**开始时**的代次提交
+    if !state.commit_if_current(gen, paths, indexed) {
+        // 期间换了引擎 —— 这次更新动的是**旧引擎**，
+        // 它的结果描述的是旧路径 / 旧计数，不能写进代表新引擎的状态。
+        crate::logging::log_line("[incremental] 期间索引目录已更换，丢弃本次更新结果");
+    }
+    Ok(indexed)
+}
+
 /// 重新扫描索引（标题栏的「刷新」）。
 ///
 /// 【为什么现在会更新状态】
