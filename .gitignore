@@ -11,3 +11,6 @@ index.bin
 
 # macOS
 .DS_Store
+
+# AI agent 的隔离工作区（superpowers:using-git-worktrees）
+.worktrees/
