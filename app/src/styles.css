@@ -1,0 +1,1855 @@
+/* ============================================================
+   FSearch macOS —— 深色主题
+   样式来源：prototype/index.html（v0.1 原型），
+   按阶段逐块移植：Task 5 搜索框 → Task 6 结果表 → Task 7 状态栏/预览卡
+                → Task 8 标题栏
+   ============================================================ */
+
+/* ============================================================
+   设计令牌 —— macOS 系统深色色板 + 专业工具风密度
+   ============================================================ */
+:root {
+  --bg-app: #0b0d12;
+  --bg-chrome: #10131a;
+  --bg-surface: #161a23;
+  --bg-row-hover: #1c2130;
+  --bg-row-sel: #173358;
+  --bg-elevated: #1b1f2a;
+  --bg-input: #0e1117;
+
+  --border-sub: #1b202b;
+  --border: #282f3e;
+  --border-str: #39415480;
+
+  --fg: #e8ecf4;
+  --fg-2: #9aa3b8;
+  --fg-3: #7c8699;
+
+  --accent: #0a84ff;
+  --accent-2: #409cff;
+  --accent-bg: rgba(10, 132, 255, 0.16);
+  --accent-line: rgba(10, 132, 255, 0.45);
+
+  --match: #ffd466;
+  --match-bg: rgba(255, 212, 102, 0.14);
+  --success: #32d74b;
+  --warn: #ffd60a;
+  --danger: #ff453a;
+  --folder: #64b5f6;
+
+  --r-sm: 5px;
+  --r-md: 7px;
+  --r-lg: 10px;
+  --c1: minmax(150px, 1.5fr);
+  --c2: minmax(120px, 1fr);
+  --c3: minmax(64px, 90px);
+  --c4: minmax(64px, 92px);
+  --c5: minmax(92px, 132px);
+  --row-h: 28px;
+  --bar-h: 38px;
+  --status-h: 26px;
+
+  --font: -apple-system, BlinkMacSystemFont, "SF Pro Text", "Helvetica Neue",
+    "PingFang SC", "Microsoft YaHei", sans-serif;
+  --mono: "SF Mono", ui-monospace, "JetBrains Mono", Menlo, Consolas, monospace;
+  --ease: cubic-bezier(0.32, 0.72, 0, 1);
+
+  /* ---- 层级令牌 ----
+     【为什么令牌化】散落的 20/40/110/120 是魔法数字：
+       改一次层级要翻遍全表，而且很容易改出「模态比浮层低」这种反直觉的次序。
+     【层次的语义】从下到上：
+       --z-titlebar 标题栏
+       --z-popover  小浮层（详情预览卡）
+       --z-menu     小浮层（右键菜单，最后一层）
+       --z-modal    模态层（抽屉 + 遮罩）
+     【关键不变式】**模态层必须高于任何浮层** ——
+       模态是「盖住一切」的层；浮层是「飘在内容上」的小东西。
+       模态一旦比浮层低，就会出现「抽屉开着、预览卡却浮在上面」。
+     【为什么不给 .panel-drawer 单独一个令牌】它是 .panel-drawer-backdrop 的
+       子元素，在同一个层叠上下文里 —— 父级已经定层级，子级再定一次是多余的；
+       给子元素加 z-index 反而会【新建】一个层叠上下文，制造新问题。 */
+  --z-titlebar: 10;
+  --z-popover: 20;
+  --z-menu: 30;
+  --z-modal: 40;
+}
+
+* {
+  box-sizing: border-box;
+  margin: 0;
+  padding: 0;
+}
+
+html,
+body {
+  height: 100%;
+}
+
+body {
+  /* 透明：让窗口的 NSVisualEffectView（毛玻璃）透出来。
+     内容区与状态栏各自有不透明底色，不受影响。 */
+  background: transparent;
+  color: var(--fg);
+  font-family: var(--font);
+  font-size: 13px;
+  line-height: 1.5;
+  -webkit-font-smoothing: antialiased;
+  overflow: hidden;
+}
+
+button {
+  font: inherit;
+  color: inherit;
+  background: none;
+  border: none;
+  cursor: pointer;
+}
+
+input {
+  font: inherit;
+  color: inherit;
+  background: none;
+  border: none;
+  outline: none;
+}
+
+::selection {
+  background: var(--accent-line);
+}
+
+:focus-visible {
+  outline: 2px solid var(--accent-2);
+  outline-offset: 1px;
+}
+
+.mono {
+  font-family: var(--mono);
+}
+
+.tnum {
+  font-variant-numeric: tabular-nums;
+}
+
+/* 滚动条 —— 细，暗，与工具风一致 */
+::-webkit-scrollbar {
+  width: 11px;
+  height: 11px;
+}
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+::-webkit-scrollbar-thumb {
+  background: #2c3344;
+  border: 3px solid transparent;
+  background-clip: content-box;
+  border-radius: 99px;
+}
+::-webkit-scrollbar-thumb:hover {
+  background: #3d465c;
+  background-clip: content-box;
+}
+::-webkit-scrollbar-corner {
+  background: transparent;
+}
+
+/* ============================================================
+   应用骨架
+   ============================================================ */
+.app {
+  height: 100vh;
+  display: grid;
+  grid-template-rows: auto 1fr auto;
+  overflow: hidden;
+  background: transparent;
+  /* 抽屉要 position:absolute 定位 —— 祖先必须有定位上下文 */
+  position: relative;
+}
+
+.titlebar {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  /* 左侧留出交通灯的位置（macOS 约 78pt） */
+  height: 52px;
+  padding: 0 16px 0 78px;
+  /* 毛玻璃区域要透明，让 NSVisualEffectView 透出来 */
+  background: transparent;
+  /* 【不要写 -webkit-app-region: drag】—— 那是 Electron 的老写法，
+     Tauri v2 完全不读它。拖拽靠模板上的 data-tauri-drag-region="deep"
+     （裸属性只对元素自身生效，子元素要拖必须用 "deep"）。
+     留着这行无害但会误导人 —— 以为在配拖拽，其实毫无作用。 */
+  user-select: none;
+  position: relative;
+  z-index: var(--z-titlebar);
+}
+
+/* 左侧留出交通灯的位置（macOS 约 78pt） */
+.tb-spacer {
+  flex: none;
+  width: 62px;
+}
+
+/* 搜索框：占满剩余空间，但不超过 620pt */
+.titlebar .field-wrap {
+  flex: 1 1 auto;
+  max-width: 620px;
+  min-width: 0;
+}
+
+/* 刷新按钮贴右边 */
+.tb-refresh {
+  margin-left: auto;
+}
+
+.main {
+  display: grid;
+  grid-template-rows: auto 1fr;
+  min-height: 0;
+  overflow: hidden;
+}
+
+/* ============================================================
+   结果区（虚拟滚动）
+   ============================================================ */
+.result-wrap {
+  position: relative;
+  min-height: 0;
+  overflow: hidden;
+  background: var(--bg-app);
+  display: grid;
+  grid-template-rows: auto 1fr;
+}
+
+/* 表头与表体用同一套列宽定义，否则列会错位。
+   表头在滚动容器【之外】—— 所以右侧要多留一个滚动条的宽度，
+   否则表头的最后一列会比表体宽 11px。 */
+.rt-head,
+.rt-row {
+  display: grid;
+  grid-template-columns:
+    20px minmax(160px, 1.5fr) minmax(140px, 1fr)
+    84px 132px;
+  align-items: center;
+}
+
+.rt-head {
+  height: 27px;
+  padding: 0 18px 0 18px;
+  padding-right: 29px; /* 18 + 滚动条 11px */
+  background: var(--bg-chrome);
+  border-bottom: 1px solid var(--border-sub);
+  font-size: 11px;
+  color: var(--fg-3);
+  font-weight: 500;
+  user-select: none;
+}
+
+.rt-th {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  padding: 0 8px;
+  height: 100%;
+  border-radius: 3px;
+  transition: color 0.14s, background 0.14s;
+  cursor: pointer;
+  user-select: none;
+  text-align: left;
+  white-space: nowrap;
+}
+
+.rt-th:hover {
+  color: var(--fg-2);
+  background: #171b25;
+}
+
+.rt-th-name {
+  grid-column: 1 / span 2;
+}
+.rt-th-dir {
+  grid-column: 3;
+  cursor: default;
+}
+.rt-th-size {
+  grid-column: 4;
+  justify-content: flex-end;
+}
+.rt-th-time {
+  grid-column: 5;
+  justify-content: flex-end;
+}
+
+.rt-arrow {
+  font-size: 10px;
+  color: var(--accent-2);
+}
+
+.rt-viewport {
+  position: relative;
+  overflow-y: auto;
+  overflow-x: hidden;
+  outline: none;
+  min-height: 0;
+}
+
+.rt-canvas {
+  position: relative;
+  width: 100%;
+}
+
+.rt-row {
+  position: absolute;
+  left: 0;
+  right: 0;
+  height: 28px;
+  padding: 0 18px;
+  cursor: default;
+  border-bottom: 1px solid rgba(255, 255, 255, 0.022);
+}
+
+.rt-row:hover {
+  background: var(--bg-row-hover);
+}
+
+.rt-row.is-selected {
+  background: var(--bg-row-sel);
+}
+
+.rt-row.is-selected::before {
+  content: "";
+  position: absolute;
+  left: 0;
+  top: 0;
+  bottom: 0;
+  width: 2px;
+  background: var(--accent);
+}
+
+.rt-ic {
+  width: 15px;
+  height: 15px;
+  flex: none;
+  color: var(--fg-3);
+}
+
+/* 【内层 <svg> 必须自己定尺寸】
+   上面那条 .rt-ic 定的是**外层 <span>**（它是 grid item，20px 那列，所以 15×15 生效）。
+   而 <svg> 自己既没有 width/height 属性、styles.css 里也没有任何别的 svg 规则
+   → 它退回 SVG 的**默认替换元素尺寸 300×150**
+   → 一个巨大的文件/文件夹图标盖住整个结果列表（Phase 3 验收抓到的真 bug）。
+   100% = 跟着外层 15×15 走；display:block 去掉 inline 基线的空隙。 */
+.rt-ic svg {
+  width: 100%;
+  height: 100%;
+  display: block;
+}
+
+.rt-ic.folder {
+  color: var(--folder);
+}
+
+.rt-name {
+  font-size: 13px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  display: block;
+  min-width: 0;
+}
+
+.rt-name .is-hit {
+  background: var(--match-bg);
+  color: var(--match);
+  border-radius: 2px;
+  padding: 0 1px;
+  font-weight: 600;
+}
+
+/* 位置列：容器 RTL 让溢出裁在开头（露出靠近文件名的尾部）；
+   路径开头的 "/" 由下面那段 ::before 注入的 LRM 锚回正确的一侧
+   （模板里没有内层元素 —— 靠的是注入标记，不是「内层强制 LTR」） */
+.rt-dir {
+  font-family: var(--mono);
+  font-size: 11.5px;
+  color: var(--fg-3);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  direction: rtl;
+  text-align: left;
+  min-width: 0;
+  padding: 0 8px;
+}
+
+/* 路径开头的 "/" 在 direction:rtl 下会被 bidi 的中性字符重排挪到【末尾】
+   （实测：/Users/a/b 显示成 Users/a/b/）——
+   注入一个 LRM（U+200E，左到右标记）把它锚回正确的一侧。
+   【不能用 unicode-bidi:plaintext 代替】那会把「从开头截断」变成
+   「从末尾截断」，文件名反而看不见了（实测过）。 */
+.rt-dir::before {
+  content: "\200E";
+}
+
+.rt-size,
+.rt-time {
+  font-size: 12px;
+  color: var(--fg-2);
+  text-align: right;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+  overflow: hidden;
+  padding: 0 8px;
+}
+
+.rt-time {
+  color: var(--fg-3);
+}
+
+/* 分组分隔行 */
+.rt-row.is-separator {
+  background: var(--bg-surface);
+  border-bottom: 1px solid var(--border-sub);
+  border-top: 1px solid var(--border-sub);
+}
+
+.rt-sep-label {
+  grid-column: 1 / -1;
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--fg-2);
+  letter-spacing: 0.3px;
+}
+
+/* 还没加载回来的页：画骨架行，避免大片空白 */
+.rt-row.is-skeleton {
+  background: transparent;
+}
+
+.rt-skeleton-bar {
+  grid-column: 1 / span 2;
+  height: 10px;
+  border-radius: 3px;
+  background: linear-gradient(
+    90deg,
+    #151a24 0%,
+    #1d2432 50%,
+    #151a24 100%
+  );
+  background-size: 200% 100%;
+  animation: shimmer 1.2s linear infinite;
+}
+
+@keyframes shimmer {
+  to {
+    background-position: -200% 0;
+  }
+}
+
+.rt-empty {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 10px;
+  color: var(--fg-3);
+  text-align: center;
+  padding: 40px;
+  height: 100%;
+}
+
+/* ============================================================
+   状态栏 / 预览卡 / 标题栏按钮
+   ============================================================ */
+.statusbar {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  padding: 0 14px;
+  height: 26px;
+  background: var(--bg-chrome);
+  border-top: 1px solid var(--border-sub);
+  font-size: 11px;
+  color: var(--fg-3);
+}
+
+.sb-left {
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.sb-right {
+  margin-left: auto;
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  white-space: nowrap;
+  flex: none;
+}
+
+/* 索引出错的提示 —— 【必须让用户看见原因】。
+   以前 index_status.error 有值但界面上什么都不显示，
+   用户只看到「已索引 0 项」，不知道是哪条路径坏了。 */
+.sb-error {
+  color: var(--danger);
+  max-width: 46vw;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.tb-refresh {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  height: 26px;
+  padding: 0 10px;
+  border-radius: var(--r-sm);
+  color: var(--fg-2);
+  font-size: 12px;
+  transition: background 0.14s, color 0.14s;
+  flex: none;
+}
+
+.tb-refresh:hover {
+  /* hover 面 —— 跟 .dir-del:hover / .help-kw:hover 用同一个令牌。
+   * （原来的 #1e2431 跟 --bg-row-hover（#1c2130）不是同一个颜色，
+   *   差 2~3 个色阶，看不出来；这里换令牌是为了不再有第二处真相。） */
+  background: var(--bg-row-hover);
+  color: var(--fg);
+}
+
+/* 标题栏按钮的「已开启」态 —— 目前只有收藏按钮用：
+   当前查询已经收藏了（再点一次是移除）。
+   配色取自 :root 的令牌，不写死颜色。 */
+.tb-refresh.is-on {
+  background: var(--accent-bg);
+  color: var(--accent-2);
+}
+
+/* 禁用的标题栏按钮 —— 目前只有收藏按钮用：
+   搜索框是空的时候没什么可收藏的，按钮就该是灰的、点不动。 */
+.tb-refresh:disabled {
+  opacity: 0.4;
+  cursor: default;
+}
+
+/* 预览卡 */
+.preview-card {
+  position: fixed;
+  z-index: var(--z-popover);
+  width: 320px;
+  background: var(--bg-elevated);
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  box-shadow: 0 24px 60px rgba(0, 0, 0, 0.6);
+  overflow: hidden;
+  animation: pop 0.14s var(--ease);
+}
+
+@keyframes pop {
+  from {
+    opacity: 0;
+    transform: translateY(-8px) scale(0.985);
+  }
+  to {
+    opacity: 1;
+    transform: none;
+  }
+}
+
+.pc-close {
+  position: absolute;
+  top: 8px;
+  right: 8px;
+  width: 20px;
+  height: 20px;
+  border-radius: 50%;
+  color: var(--fg-3);
+  font-size: 15px;
+  line-height: 1;
+  transition: background 0.14s, color 0.14s;
+}
+
+.pc-close:hover {
+  background: #252c3a;
+  color: var(--fg);
+}
+
+.pc-name {
+  font-size: 13.5px;
+  font-weight: 600;
+  color: var(--fg);
+  word-break: break-all;
+  line-height: 1.35;
+  padding: 14px 16px 0;
+  padding-right: 34px;
+}
+
+.pc-dir {
+  font-family: var(--mono);
+  font-size: 10.5px;
+  color: var(--fg-3);
+  margin-top: 4px;
+  padding: 0 16px;
+  word-break: break-all;
+  line-height: 1.5;
+}
+
+.pc-meta {
+  display: grid;
+  grid-template-columns: auto 1fr;
+  gap: 7px 14px;
+  padding: 12px 16px 14px;
+  font-size: 11.5px;
+}
+
+.pc-meta dt {
+  color: var(--fg-3);
+}
+
+.pc-meta dd {
+  color: var(--fg-2);
+  font-variant-numeric: tabular-nums;
+  text-align: right;
+  word-break: break-all;
+}
+
+.pc-actions {
+  display: flex;
+  gap: 6px;
+  padding: 10px 14px;
+  border-top: 1px solid var(--border-sub);
+  background: #171b24;
+}
+
+.pc-actions button {
+  flex: 1;
+  height: 26px;
+  border-radius: var(--r-sm);
+  background: var(--accent);
+  color: #fff;
+  font-size: 12px;
+  transition: filter 0.14s;
+}
+
+.pc-actions button + button {
+  /* 【保留硬编码 —— 现有的令牌里没有对应的】
+   * 这里要的是【静止态的抬升面】。
+   * 这条按钮所在的 footer 条，自己的底色是 .pc-actions 的硬编码 #171b24；
+   * 而 --bg-elevated（#1b1f2a）是【外层】.preview-card 的底色 ——
+   * 拿来当按钮底色，按钮会和 footer 条糊在一起、失去层次；
+   * --bg-surface 是【凹陷】面，--bg-row-hover 是 hover 专用的令牌，
+   * 都不对应这个静止态的抬升面。
+   * 与其套一个语义不对的令牌让颜色悄悄变掉，不如把硬编码留着并说明。 */
+  background: #1e2431;
+  color: var(--fg-2);
+}
+
+.pc-actions button:hover {
+  filter: brightness(1.15);
+}
+
+/* 收藏失败提示 —— 夹在内容与按钮条之间 */
+.pc-error {
+  padding: 8px 14px 0;
+  font-size: 11px;
+  line-height: 1.4;
+  color: var(--danger);
+  word-break: break-all;
+}
+
+/* ============================================================
+   右键菜单
+   跟 .preview-card 同一套语汇（圆角 / 边框 / 阴影），
+   配色一律取 :root 里的令牌，别写死颜色。
+   ============================================================ */
+.ctx-menu {
+  position: fixed;
+  /* 比 .preview-card 高一层 —— 两层浮层不会同时开，但保险 */
+  z-index: var(--z-menu);
+  width: 200px;
+  padding: 4px 0;
+  background: var(--bg-elevated);
+  border: 1px solid var(--border);
+  border-radius: var(--r-md);
+  box-shadow: 0 24px 60px rgba(0, 0, 0, 0.6);
+  overflow: hidden;
+  animation: pop 0.14s var(--ease);
+}
+
+.ctx-item {
+  display: block;
+  width: 100%;
+  padding: 6px 12px;
+  text-align: left;
+  font-size: 12px;
+  color: var(--fg);
+  transition: background 0.14s, color 0.14s;
+}
+
+.ctx-item:hover {
+  background: var(--bg-row-hover);
+  color: var(--accent-2);
+}
+
+/* 分隔线 */
+.ctx-sep {
+  height: 1px;
+  margin: 4px 0;
+  background: var(--border-sub);
+}
+
+/* 写入失败的原因 —— 菜单底部一行红字
+   max-height：超长的错误文本自己滚动，不要把菜单撑高
+   （菜单一高，贴边时就会被挤出窗口底边）。 */
+.ctx-error {
+  padding: 6px 12px 4px;
+  margin-top: 2px;
+  border-top: 1px solid var(--border-sub);
+  font-size: 11px;
+  line-height: 1.4;
+  color: var(--danger);
+  word-break: break-all;
+  max-height: 76px;
+  overflow-y: auto;
+}
+
+/* ============================================================
+   搜索框
+   ============================================================ */
+.field-wrap {
+  position: relative;
+}
+
+.field {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  height: 40px;
+  padding: 0 12px;
+  background: var(--bg-input);
+  border: 1px solid var(--border);
+  border-radius: var(--r-lg);
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.03);
+  transition: border-color 0.16s var(--ease), box-shadow 0.16s var(--ease);
+}
+
+.field:focus-within {
+  border-color: var(--accent);
+  box-shadow: 0 0 0 3px var(--accent-bg);
+}
+
+.field-ico {
+  width: 17px;
+  height: 17px;
+  color: var(--fg-3);
+  flex: none;
+  transition: color 0.16s var(--ease);
+}
+
+.field:focus-within .field-ico {
+  color: var(--accent-2);
+}
+
+/* 语法高亮覆盖层：<pre> 在下，透明 input 在上，字体度量必须完全一致 */
+.field-stack {
+  position: relative;
+  flex: 1;
+  min-width: 0;
+  height: 100%;
+  display: flex;
+  align-items: center;
+}
+
+.hl,
+.field-input {
+  font-family: var(--mono);
+  font-size: 13.5px;
+  line-height: 20px;
+  letter-spacing: 0;
+  padding: 10px 0;
+  white-space: pre-wrap;
+  word-break: break-all;
+}
+
+.hl {
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+  color: var(--fg);
+  overflow: hidden;
+}
+
+.field-input {
+  position: relative;
+  width: 100%;
+  height: 100%;
+  color: transparent;
+  caret-color: var(--accent-2);
+}
+
+.field-input::placeholder {
+  color: var(--fg-3);
+}
+
+.field-input:focus-visible,
+.field:focus-within .field-input {
+  outline: none;
+}
+
+/* token 配色 —— 对应 tokenizer.ts 的 TokenKind。
+   原型里叫 tok-key/tok-op/tok-str/tok-path/tok-not，
+   这里按新的 kind 命名重映射，配色保持一致。 */
+.hl .tok-plain {
+  color: var(--fg);
+}
+.hl .tok-modifier {
+  color: var(--accent-2);
+}
+.hl .tok-field {
+  color: var(--accent-2);
+}
+.hl .tok-operator {
+  color: #ff9f6b;
+}
+.hl .tok-string {
+  color: var(--success);
+}
+.hl .tok-path {
+  color: #7fd1c0;
+}
+.hl .tok-not {
+  color: var(--danger);
+  font-weight: 600;
+}
+
+/* 组合态（中文输入法）：高亮层被隐藏，输入框文字要自己变回可见，
+   否则用户组合期连自己打的拼音都看不见。 */
+.field.is-composing .field-input {
+  color: var(--fg);
+}
+
+/* 加载指示 —— 一个小圆环 */
+.spinner {
+  width: 13px;
+  height: 13px;
+  flex: none;
+  border-radius: 50%;
+  border: 1.5px solid var(--border);
+  border-top-color: var(--accent-2);
+  animation: spin 0.7s linear infinite;
+}
+
+@keyframes spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+/* ---- 顶部下拉抽屉（帮助 / 书签 / 设置三个面板共用）----
+   搜索框在标题栏里，所以抽屉从标题栏【下方】滑下来。 */
+
+.panel-drawer-backdrop {
+  position: absolute;
+  inset: 0;
+  /* 不用纯黑 —— 会把毛玻璃压死 */
+  background: rgba(0, 0, 0, 0.28);
+  backdrop-filter: blur(3px);
+  z-index: var(--z-modal);
+  display: flex;
+  justify-content: center;
+  align-items: flex-start;
+}
+
+.panel-drawer {
+  /* 标题栏高 52px（见 .titlebar 的 height），留 8px 缝 */
+  margin-top: 60px;
+  width: min(720px, calc(100% - 48px));
+  max-height: calc(100% - 84px);
+  display: flex;
+  flex-direction: column;
+  /* 半透明但够实 —— 底下的毛玻璃会透过来，文字要看得清 */
+  background: rgba(22, 26, 35, 0.97);
+  border: 1px solid var(--border);
+  /* 只有下圆角 —— 上面贴着标题栏，像从上面长出来的 */
+  border-radius: 0 0 var(--r-lg) var(--r-lg);
+  box-shadow: 0 20px 52px rgba(0, 0, 0, 0.55);
+  overflow: hidden;
+  animation: panel-drop 0.16s var(--ease);
+}
+
+@keyframes panel-drop {
+  from {
+    opacity: 0;
+    transform: translateY(-10px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+/* 抽屉内部：头部固定 + 内容滚动 */
+.panel-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 12px 16px;
+  border-bottom: 1px solid var(--border-sub);
+  flex: none;
+}
+
+.panel-head h2 {
+  margin: 0;
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--fg);
+}
+
+.panel-close {
+  background: none;
+  border: none;
+  color: var(--fg);
+  font-size: 18px;
+  line-height: 1;
+  cursor: pointer;
+  padding: 2px 6px;
+  border-radius: var(--r-sm);
+  opacity: 0.6;
+}
+
+.panel-close:hover:not(:disabled) {
+  background: var(--bg-elevated);
+  opacity: 1;
+}
+
+/* 重建期间整个面板是锁住的 —— 禁用的按钮要看得出来 */
+.panel-close:disabled,
+.dir-del:disabled {
+  opacity: 0.35;
+  cursor: default;
+}
+
+.panel-body {
+  overflow-y: auto;
+  padding: 14px 16px;
+  flex: 1;
+}
+
+.panel-foot {
+  display: flex;
+  gap: 8px;
+  justify-content: flex-end;
+  padding: 12px 16px;
+  border-top: 1px solid var(--border-sub);
+  flex: none;
+}
+
+/* ---- 设置面板（索引目录）----
+   抽屉本身（.panel-*）是三个面板共用的；这里是设置面板【自己的】内容样式。
+   配色一律取上面 :root 里的令牌，别写死颜色。 */
+
+.set-block + .set-block {
+  margin-top: 18px;
+  padding-top: 16px;
+  border-top: 1px solid var(--border-sub);
+}
+
+.set-block h3 {
+  margin: 0 0 4px;
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--fg);
+}
+
+.set-hint {
+  margin: 0 0 10px;
+  font-size: 11.5px;
+  line-height: 1.55;
+  color: var(--fg-3);
+}
+
+/* 目录 / 规则两个列表 */
+.dir-list,
+.rule-list {
+  list-style: none;
+  margin: 0 0 12px;
+  padding: 0;
+}
+
+/* 每个已选目录一张小卡片 —— :not(.dir-empty) 是因为空态那行不是卡片 */
+.dir-list li:not(.dir-empty) {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  height: 30px;
+  padding: 0 4px 0 10px;
+  margin-bottom: 4px;
+  background: var(--bg-surface);
+  border: 1px solid var(--border-sub);
+  border-radius: var(--r-sm);
+}
+
+.dir-path {
+  flex: 1;
+  min-width: 0;
+  font-family: var(--mono);
+  font-size: 11.5px;
+  color: var(--fg);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  /* 长路径从【开头】截断 —— 跟结果表的 .rt-dir 一个套路，
+     目录名在结尾，比开头更值得看见。 */
+  direction: rtl;
+  text-align: left;
+}
+
+/* 路径开头的 "/" 在 direction:rtl 下会被 bidi 的中性字符重排挪到【末尾】
+   （实测：/Users/a/b 显示成 Users/a/b/）——
+   注入一个 LRM（U+200E，左到右标记）把它锚回正确的一侧。
+   【不能用 unicode-bidi:plaintext 代替】那会把「从开头截断」变成
+   「从末尾截断」，文件名反而看不见了（实测过）。 */
+.dir-path::before {
+  content: "\200E";
+}
+
+.dir-del {
+  flex: none;
+  font-size: 11px;
+  color: var(--fg-3);
+  padding: 3px 8px;
+  border-radius: var(--r-sm);
+  transition: background 0.14s, color 0.14s;
+}
+
+.dir-del:hover:not(:disabled) {
+  background: var(--bg-row-hover);
+  color: var(--danger);
+}
+
+.dir-empty {
+  font-size: 11.5px;
+  color: var(--fg-3);
+  padding: 2px 2px 8px;
+}
+
+/* 排除规则：每行一条（shim 的 fs_exclude_rules 是【每行一条】，不是逗号分隔） */
+.rule-list li {
+  position: relative;
+  padding-left: 12px;
+  font-family: var(--mono);
+  font-size: 11.5px;
+  line-height: 1.75;
+  color: var(--fg-2);
+  word-break: break-all;
+}
+
+.rule-list li::before {
+  content: "·";
+  position: absolute;
+  left: 2px;
+  color: var(--fg-3);
+}
+
+/* 按钮 —— 抽屉页脚与正文里共用 */
+.set-btn {
+  height: 28px;
+  padding: 0 14px;
+  border-radius: var(--r-sm);
+  background: var(--bg-elevated);
+  border: 1px solid var(--border);
+  color: var(--fg-2);
+  font-size: 12px;
+  transition: background 0.14s, color 0.14s, filter 0.14s;
+}
+
+.set-btn:hover:not(:disabled) {
+  /* hover 面 —— 跟 .dir-del:hover 用同一个令牌。 */
+  background: var(--bg-row-hover);
+  color: var(--fg);
+}
+
+.set-btn-primary {
+  background: var(--accent);
+  border-color: var(--accent);
+  color: #fff;
+}
+
+.set-btn-primary:hover:not(:disabled) {
+  background: var(--accent);
+  color: #fff;
+  filter: brightness(1.12);
+}
+
+.set-btn:disabled {
+  opacity: 0.5;
+  cursor: default;
+  filter: none;
+}
+
+/* 「文件变化时自动刷新索引」的开关 —— 一行：左边文字，右边开关。
+   配色一律取 :root 里的令牌，别写死颜色。 */
+
+.set-row {
+  display: flex;
+  align-items: flex-start;
+  gap: 12px;
+  margin: 14px 0 0;
+}
+
+.set-row-text {
+  flex: 1;
+  min-width: 0;
+}
+
+.set-row-label {
+  display: block;
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--fg);
+}
+
+/* 这一行的说明文字 —— 复用 .set-hint，只是把外边距收掉。 */
+.set-row .set-hint {
+  margin: 2px 0 0;
+}
+
+.set-switch {
+  flex: none;
+  position: relative;
+  width: 34px;
+  height: 20px;
+  padding: 0;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  background: var(--bg-input);
+  cursor: pointer;
+  transition: background 0.16s var(--ease), border-color 0.16s var(--ease);
+}
+
+/* 开着的状态 —— 用强调色当底。 */
+.set-switch[aria-checked="true"] {
+  background: var(--accent);
+  border-color: var(--accent-line);
+}
+
+.set-switch:disabled {
+  opacity: 0.5;
+  cursor: default;
+}
+
+.set-switch-knob {
+  position: absolute;
+  top: 2px;
+  left: 2px;
+  width: 14px;
+  height: 14px;
+  border-radius: 50%;
+  background: var(--fg-2);
+  transition: transform 0.16s var(--ease), background 0.16s var(--ease);
+}
+
+/* 开着的时候把圆点推到右边 —— 位置差 = 34 - 14 - 2*2 = 16。 */
+.set-switch[aria-checked="true"] .set-switch-knob {
+  transform: translateX(14px);
+  background: var(--fg);
+}
+
+.set-error {
+  margin: 12px 0 0;
+  padding: 8px 10px;
+  border-radius: var(--r-sm);
+  /* 危险色的半透明底 / 描边。
+   * 【渐进增强】兜底写在前面、@supports 块写在后面 ——
+   * 老 WebKit（Safari 16.2 之前 / macOS 13.1 之前）不认 color-mix()，
+   * 会整块丢掉 @supports 里的声明，保留下面这两行兜底：
+   * 错误框仍有底色和描边，不会退化成「一段裸文字」（文字仍在，仍可读，
+   * 但没有框很难看）。
+   * 兜底里的 rgba(255, 69, 58, …) 是 --danger（#ff453a）的【字面值】——
+   * 是同一真相的【降级写法】，不是第二处真相源（跟 @supports 里的
+   * color-mix 结果逐像素相同）。 */
+  background: rgba(255, 69, 58, 0.12);
+  border: 1px solid rgba(255, 69, 58, 0.35);
+  color: #ff8a80;
+  font-size: 11.5px;
+  word-break: break-all;
+}
+
+/* 新 WebKit：改用令牌混合 —— 令牌改色时这里跟着改。 */
+@supports (background: color-mix(in srgb, red 10%, transparent)) {
+  .set-error {
+    background: color-mix(in srgb, var(--danger) 12%, transparent);
+    border-color: color-mix(in srgb, var(--danger) 35%, transparent);
+  }
+}
+
+/* ---- 帮助面板（查询语法）----
+   抽屉本身（.panel-*）是三个面板共用的；这里是帮助面板【自己的】内容样式。
+   配色一律取上面 :root 里的令牌，别写死颜色。 */
+
+.help-group + .help-group {
+  margin-top: 18px;
+  padding-top: 16px;
+  border-top: 1px solid var(--border-sub);
+}
+
+.help-group h3 {
+  margin: 0 0 8px;
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--fg);
+}
+
+.help-table {
+  width: 100%;
+  border-collapse: collapse;
+  /* 固定布局 —— 表格里各列文字长短差很多，
+     让浏览器自己算列宽会忽宽忽窄。 */
+  table-layout: fixed;
+  font-size: 11.5px;
+}
+
+.help-table th {
+  text-align: left;
+  font-weight: 500;
+  font-size: 10.5px;
+  color: var(--fg-3);
+  padding: 3px 8px 5px;
+  border-bottom: 1px solid var(--border);
+  user-select: none;
+}
+
+/* 关键字列宽一点（"childfilecount:<num>" 这种长 token）。
+   【关键字列不一定是第 0 列】运算符组的第 0 列只是名字
+   （AND / OR / NOT / Grouping），真正的关键字在第 1 列「写法」——
+   所以列宽要按组分别指定，不能一律 first-child。 */
+.help-table-functions th:nth-child(1),
+.help-table-modifiers th:nth-child(1) {
+  width: 30%;
+}
+
+/* 运算符组：第 0 列是名字（窄），第 1 列才是关键字（"space, AND, &&"） */
+.help-table-operators th:nth-child(1) {
+  width: 16%;
+}
+.help-table-operators th:nth-child(2) {
+  width: 26%;
+}
+
+/* 通配符组：第 0 列只有 "*" / "?" 两个字符 */
+.help-table-wildcards th:nth-child(1) {
+  width: 12%;
+}
+
+/* 转义组：第 0 列是写法（`Double quotes ""` / `Backslash \`），
+   比通配符那一列宽不少 */
+.help-table-escaping th:nth-child(1) {
+  width: 18%;
+}
+
+.help-table td {
+  padding: 5px 8px;
+  border-bottom: 1px solid var(--border-sub);
+  color: var(--fg-2);
+  vertical-align: top;
+  /* 长 token 不许把表格撑破 */
+  word-break: break-word;
+}
+
+.help-table tbody tr:last-child td {
+  border-bottom: none;
+}
+
+/* 关键字 —— 可点，点了把关键字填进搜索框 */
+.help-kw {
+  font-family: var(--mono);
+  font-size: 11.5px;
+  line-height: 1.5;
+  color: var(--accent-2);
+  text-align: left;
+  padding: 1px 5px;
+  margin: -1px 0;
+  border-radius: var(--r-sm);
+  border: 1px solid transparent;
+  transition: background 0.14s, color 0.14s, border-color 0.14s;
+  word-break: break-word;
+}
+
+.help-kw:hover {
+  background: var(--accent-bg);
+  border-color: var(--accent-line);
+  color: var(--accent);
+}
+
+/* 引擎不支持的项 —— 灰掉。
+   还是能点：填进去以后 shim 会给出「未知字段」的提示，比默默没反应强。 */
+.help-table td.is-unsupported {
+  color: var(--fg-3);
+}
+
+.help-table td.is-unsupported .help-kw {
+  color: var(--fg-3);
+}
+
+.help-table td.is-unsupported .help-kw:hover {
+  background: var(--bg-row-hover);
+  border-color: var(--border);
+  color: var(--fg-2);
+}
+
+.help-foot-hint {
+  margin-right: auto;
+  align-self: center;
+  font-size: 11.5px;
+  color: var(--fg-3);
+}
+
+/* 面板里的提示条 —— 夹在标题与正文之间，永远看得见
+   （正文是滚动容器，写在正文里会被滚走）。
+   底色跟抽屉一致（--bg-surface 就是抽屉那层 rgba 的不透明版）。 */
+.help-warn {
+  margin: 0;
+  padding: 8px 16px;
+  background: var(--bg-surface);
+  border-bottom: 1px solid var(--border-sub);
+  color: var(--warn);
+  font-size: 11.5px;
+  line-height: 1.5;
+  flex: none;
+}
+
+/* ============================================================
+   书签面板（最近搜索 / 查询书签 / 路径书签）
+   抽屉本身（.panel-*）是三个面板共用的；这里是书签面板【自己的】内容样式。
+   配色一律取上面 :root 里的令牌，别写死颜色。
+   ============================================================ */
+
+.bm-list {
+  list-style: none;
+  margin: 0 0 12px;
+  padding: 0;
+}
+
+/* 每条一行 —— 小卡片，跟设置面板的 .dir-list 同一个套路 */
+.bm-list li {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-height: 30px;
+  padding: 0 4px 0 10px;
+  margin-bottom: 4px;
+  background: var(--bg-surface);
+  border: 1px solid var(--border-sub);
+  border-radius: var(--r-sm);
+}
+
+/* 条目本身 —— 整行可点（点一下重搜 / 在访达里定位） */
+.bm-item {
+  flex: 1;
+  min-width: 0;
+  padding: 5px 0;
+  text-align: left;
+  font-size: 12px;
+  color: var(--fg);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  border-radius: var(--r-sm);
+  transition: background 0.14s, color 0.14s;
+}
+
+.bm-item:hover {
+  background: var(--bg-row-hover);
+  color: var(--accent-2);
+}
+
+/* 路径书签 —— 等宽字体，长路径从【开头】截断
+   （跟 .dir-path 一个套路：路径结尾的文件名比开头更值得看见）。 */
+.bm-path {
+  font-family: var(--mono);
+  font-size: 11.5px;
+  color: var(--fg-2);
+  direction: rtl;
+  text-align: left;
+}
+
+/* 路径开头的 "/" 在 direction:rtl 下会被 bidi 的中性字符重排挪到【末尾】
+   （实测：/Users/a/b 显示成 Users/a/b/）——
+   注入一个 LRM（U+200E，左到右标记）把它锚回正确的一侧。
+   【不能用 unicode-bidi:plaintext 代替】那会把「从开头截断」变成
+   「从末尾截断」，文件名反而看不见了（实测过）。 */
+.bm-path::before {
+  content: "\200E";
+}
+
+/* 删除按钮 */
+.bm-del {
+  flex: none;
+  width: 22px;
+  height: 22px;
+  border-radius: var(--r-sm);
+  color: var(--fg-3);
+  font-size: 14px;
+  line-height: 1;
+  transition: background 0.14s, color 0.14s;
+}
+
+.bm-del:hover {
+  background: var(--bg-row-hover);
+  color: var(--danger);
+}
+
+/* ============================================================
+   使用手册面板（菜单栏「帮助 → 完整手册」）
+   ============================================================
+
+   【为什么样式写在这里，不写在组件的 <style> 里】
+   手册正文是 **v-html** 渲染的 —— v-html 塞进去的元素
+   **不受 <style scoped> 影响**（scoped 靠给元素加 data-v-xxx 属性实现，
+   而 v-html 里的元素没有这个属性）。
+   所以这段必须是**非 scoped** 的 —— styles.css 正是项目的全局非 scoped 样式表。
+   （组件里的 <style> 一律是 scoped 的，本项目没有例外。）
+
+   【配色】一律取 :root 里已有的令牌 —— 不引入新变量、不写死颜色。
+   选择器一律以 .ug- 前缀开头 —— 这是全局样式表，别把别的面板的样式带偏。 */
+
+/* 手册比别的面板宽 —— 里面全是表格。 */
+.panel-drawer-wide {
+  width: min(900px, calc(100% - 32px));
+}
+
+/* 正文 */
+.ug-body {
+  font-size: 12.5px;
+  line-height: 1.65;
+  color: var(--fg);
+  /* 手册里的表格有横向溢出 —— 允许整块横向滚，别把布局撑破 */
+  overflow-x: auto;
+}
+
+.ug-body > *:first-child {
+  margin-top: 0;
+}
+
+.ug-body h1 {
+  font-size: 16px;
+  font-weight: 600;
+  color: var(--fg);
+  margin: 0 0 12px;
+}
+
+.ug-body h2 {
+  font-size: 14px;
+  font-weight: 600;
+  color: var(--fg);
+  margin: 22px 0 8px;
+  padding-bottom: 5px;
+  border-bottom: 1px solid var(--border-sub);
+}
+
+.ug-body h3 {
+  font-size: 12.5px;
+  font-weight: 600;
+  color: var(--fg-2);
+  margin: 16px 0 6px;
+}
+
+.ug-body p {
+  margin: 0 0 9px;
+}
+
+.ug-body ul,
+.ug-body ol {
+  margin: 0 0 9px;
+  padding-left: 20px;
+}
+
+.ug-body li {
+  margin: 0 0 3px;
+}
+
+.ug-body a {
+  color: var(--accent-2);
+  text-decoration: none;
+}
+
+.ug-body a:hover {
+  text-decoration: underline;
+}
+
+.ug-body strong {
+  color: var(--fg);
+  font-weight: 600;
+}
+
+.ug-body blockquote {
+  margin: 0 0 10px;
+  padding: 8px 12px;
+  border-left: 3px solid var(--accent-line);
+  background: var(--accent-bg);
+  color: var(--fg-2);
+  border-radius: 0 var(--r-sm) var(--r-sm) 0;
+}
+
+.ug-body blockquote p:last-child {
+  margin-bottom: 0;
+}
+
+/* 行内代码 */
+.ug-body code {
+  font-family: var(--mono);
+  font-size: 11.5px;
+  padding: 1px 4px;
+  border-radius: var(--r-sm);
+  background: var(--bg-surface);
+  color: var(--accent-2);
+}
+
+/* 代码块 */
+.ug-body pre {
+  margin: 0 0 10px;
+  padding: 10px 12px;
+  background: var(--bg-input);
+  border: 1px solid var(--border-sub);
+  border-radius: var(--r-sm);
+  overflow-x: auto;
+}
+
+.ug-body pre code {
+  padding: 0;
+  background: none;
+  color: var(--fg-2);
+  font-size: 11.5px;
+  line-height: 1.55;
+  white-space: pre;
+}
+
+/* 表格 */
+.ug-body table {
+  width: 100%;
+  margin: 0 0 12px;
+  border-collapse: collapse;
+  font-size: 11.5px;
+  display: block;
+  overflow-x: auto;
+}
+
+.ug-body th,
+.ug-body td {
+  border: 1px solid var(--border-sub);
+  padding: 5px 8px;
+  text-align: left;
+  vertical-align: top;
+}
+
+.ug-body th {
+  background: var(--bg-surface);
+  color: var(--fg-2);
+  font-weight: 600;
+  white-space: nowrap;
+}
+
+.ug-body td {
+  color: var(--fg-2);
+}
+
+.ug-body td code {
+  white-space: nowrap;
+}
+
+.ug-body hr {
+  border: none;
+  border-top: 1px solid var(--border-sub);
+  margin: 18px 0;
+}
+
+/* 快捷键录制按钮组 —— 两个按钮并排 */
+.shortcut-recorder {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+  flex-shrink: 0;
+}
+
+/* ============================================================
+   帮助中心（速查 / 完整语法表 / 完整手册 三页共用一个抽屉）
+   抽屉本身（.panel-*）跟其它面板同构；这里是帮助中心**自己的**内容样式。
+   配色一律取上面 :root 里的令牌，别写死颜色。
+   ============================================================ */
+
+/* ---- 页签 ---- */
+
+.hc-tabs {
+  display: flex;
+  gap: 4px;
+  padding: 8px 16px 0;
+  border-bottom: 1px solid var(--border-sub);
+  flex: none;
+}
+
+.hc-tab {
+  font-size: 12px;
+  font-weight: 500;
+  color: var(--fg-3);
+  padding: 5px 10px 7px;
+  border: 1px solid transparent;
+  border-bottom: none;
+  border-radius: var(--r-sm) var(--r-sm) 0 0;
+  transition: color 0.14s, background 0.14s;
+}
+
+.hc-tab:hover {
+  color: var(--fg-2);
+  background: var(--bg-row-hover);
+}
+
+.hc-tab.is-on {
+  color: var(--fg);
+  background: var(--bg-surface);
+  border-color: var(--border);
+  /* 页签与正文连成一片（正文那侧是同色的抽屉底） */
+  margin-bottom: -1px;
+  padding-bottom: 8px;
+}
+
+/* 正文区：速查那页有搜索框，顶部留白要小一点 */
+.hc-body {
+  padding: 12px 16px 16px;
+}
+
+/* ---- 速查卡 ---- */
+
+.cheat {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.cheat-search-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-bottom: 12px;
+}
+
+.cheat-search {
+  flex: 1;
+  font-family: var(--font);
+  font-size: 12.5px;
+  color: var(--fg);
+  background: var(--bg-input);
+  border: 1px solid var(--border);
+  border-radius: var(--r-md);
+  padding: 6px 10px;
+  outline: none;
+}
+
+.cheat-search:focus {
+  border-color: var(--accent-line);
+  box-shadow: 0 0 0 2px var(--accent-bg);
+}
+
+.cheat-search::placeholder {
+  color: var(--fg-3);
+}
+
+.cheat-count {
+  font-size: 11.5px;
+  color: var(--fg-3);
+  white-space: nowrap;
+}
+
+.cheat-empty {
+  font-size: 12.5px;
+  line-height: 1.7;
+  color: var(--fg-2);
+  padding: 24px 0;
+  text-align: center;
+}
+
+.cheat-group + .cheat-group {
+  margin-top: 18px;
+  padding-top: 14px;
+  border-top: 1px solid var(--border-sub);
+}
+
+.cheat-group h3 {
+  margin: 0 0 6px;
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--fg);
+}
+
+.cheat-hint {
+  margin: 0 0 8px;
+  font-size: 11.5px;
+  line-height: 1.6;
+  color: var(--fg-3);
+}
+
+.cheat-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+}
+
+.cheat-item {
+  padding: 7px 8px;
+  border-radius: var(--r-md);
+}
+
+.cheat-item:hover {
+  background: var(--bg-row-hover);
+}
+
+.cheat-head {
+  display: flex;
+  align-items: baseline;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+
+.cheat-intent {
+  font-size: 12.5px;
+  color: var(--fg);
+  /* 意图与写法之间留点呼吸 —— 写法是等宽字体，视觉上更「重」 */
+  min-width: 12em;
+}
+
+/* 写法 —— 可点，点了整条填进搜索框 */
+.cheat-query {
+  font-family: var(--mono);
+  font-size: 11.5px;
+  line-height: 1.5;
+  color: var(--accent-2);
+  text-align: left;
+  padding: 1px 6px;
+  border-radius: var(--r-sm);
+  border: 1px solid var(--border);
+  background: var(--bg-input);
+  transition: background 0.14s, color 0.14s, border-color 0.14s;
+  word-break: break-word;
+}
+
+.cheat-query:hover {
+  background: var(--accent-bg);
+  border-color: var(--accent-line);
+  color: var(--accent);
+}
+
+.cheat-wrong {
+  margin: 4px 0 0;
+  font-size: 11.5px;
+  color: var(--fg-3);
+  display: flex;
+  align-items: baseline;
+  gap: 6px;
+  flex-wrap: wrap;
+}
+
+.cheat-wrong-tag {
+  color: var(--danger);
+}
+
+.cheat-wrong code {
+  font-family: var(--mono);
+  font-size: 11px;
+  color: var(--fg-3);
+  text-decoration: line-through;
+  word-break: break-word;
+}
+
+.cheat-note {
+  margin: 4px 0 0;
+  font-size: 11.5px;
+  line-height: 1.6;
+  color: var(--fg-2);
+}
+
+/* 语法表页的提示条 —— 粘在正文顶上（正文是滚动容器）
+   【为什么不写 z-index】本项目的层级只有 4 个令牌，
+   护栏（app/src-tauri/tests/z_index.rs）规定 z-index **只能**引用它们 ——
+   sticky 元素本身是定位元素，会画在普通流内容之上，不用再压一层。 */
+.help-warn-sticky {
+  position: sticky;
+  top: 0;
+  border-radius: var(--r-sm);
+  border: 1px solid var(--border);
+  margin-bottom: 10px;
+}
+
+/* ---- 致谢与许可面板 ---- */
+
+.credits-body {
+  font-size: 12.5px;
+  line-height: 1.7;
+  color: var(--fg-2);
+}
+
+.credits-body h3 {
+  margin: 16px 0 6px;
+  font-size: 12.5px;
+  font-weight: 600;
+  color: var(--fg);
+}
+
+.credits-body > h3:first-child {
+  margin-top: 0;
+}
+
+.credits-body p {
+  margin: 0 0 9px;
+}
+
+.credits-body ul {
+  margin: 0 0 9px;
+  padding-left: 20px;
+}
+
+.credits-body li {
+  margin: 0 0 4px;
+}
+
+.credits-body strong {
+  color: var(--fg);
+  font-weight: 600;
+}
+
+.credits-body a {
+  color: var(--accent-2);
+  text-decoration: none;
+  word-break: break-all;
+}
+
+.credits-body a:hover {
+  text-decoration: underline;
+}
+
+.credits-body code {
+  font-family: var(--mono);
+  font-size: 11.5px;
+  padding: 1px 5px;
+  border-radius: var(--r-sm);
+  background: var(--bg-elevated);
+  color: var(--fg);
+}
+
+.credits-sub {
+  color: var(--fg-3);
+}
+
+.credits-mono {
+  font-family: var(--mono);
+  font-size: 11.5px;
+}
+
+/* 补充说明 —— 比正文更次要（缩进 + 更淡） */
+.credits-note {
+  padding: 8px 11px;
+  border-left: 2px solid var(--border);
+  border-radius: 0 var(--r-sm) var(--r-sm) 0;
+  background: var(--bg-surface);
+  color: var(--fg-3);
+  font-size: 12px;
+}

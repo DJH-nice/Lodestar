@@ -1,0 +1,95 @@
+# workspace 根：search-core 是独立 crate（不依赖 Tauri，可单独测试）。
+# 成员路径相对【本文件】解析 —— search-core/ 与 src/ 同级。
+[workspace]
+members = ["search-core"]
+resolver = "2"
+
+[package]
+name = "sextant-app"
+version = "0.1.0"
+description = "Sextant for macOS"
+edition = "2021"
+# 【为什么是 1.90】`tauri-plugin-autostart 2.7.0` 声明 `rust-version = "1.90"`
+#   （还用了 edition 2024）—— 依赖的 MSRV 就是本 crate 的 MSRV。
+#   这个依赖是本任务引进来的（开机自启），所以这条下限也是本任务的责任。
+rust-version = "1.90"
+
+[lib]
+name = "sextant_app_lib"
+# 【为什么没有 "staticlib"】staticlib 是给「C/C++ 宿主链接 Rust 代码」用的。
+# 本项目没有这种宿主 —— Rust 二进制自包含。
+# 留着 staticlib 只会让 cargo 多产出一份几百 MB 的 .a，纯浪费磁盘，
+# 且没有任何地方链接它。
+crate-type = ["cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = ["macos-private-api", "tray-icon", "image-png"] }
+tauri-plugin-opener = "2"
+tauri-plugin-store = "2"
+tauri-plugin-dialog = "2"
+# 【全局快捷键】—— 在任何 app 里按 ⌥⌘Space 就能唤起 FSearch。
+# 插件的 Rust 侧 API（`app.global_shortcut()`）不需要前端 capability ——
+# 注册逻辑全在 Rust 侧（见 src/shortcut.rs）。
+tauri-plugin-global-shortcut = "2"
+# 【开机自启】—— 登录后自动在后台驻留。
+# 用 **LaunchAgent**（`~/Library/LaunchAgents` 下的 plist）——
+# macOS 13+ 上它比「登录项」干净（不往系统设置里塞一条用户看得见的条目）。
+# 插件的 Rust 侧 API（`app.autolaunch()`）不需要前端 capability ——
+# 开关逻辑全在 Rust 侧（见 src/commands.rs 的 `set_launch_at_login`）。
+tauri-plugin-autostart = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# 【自研搜索引擎内核】不依赖 Tauri，可单独 `cargo test -p search-core`。
+search-core = { path = "search-core" }
+notify = "8.2.0"
+
+[dev-dependencies]
+# `tauri::test` 模块（mock runtime + 真实 IPC 调用）需要这个 feature。
+# 【只影响测试构建】—— dev-dependencies 的 feature 不会进普通 `cargo build`。
+tauri = { version = "2", features = ["test"] }
+serde_json = "1"
+
+[profile.dev]
+# 【为什么关掉完整 debug info】dev profile 默认 debug = 2(完整 DWARF)，
+# 依赖库的 rlib 里会塞进完整的类型/局部变量信息 —— 几百个依赖加起来就是 1G+ 纯调试符号。
+# "line-tables-only" 只保留行号表和函数名：
+#   ✅ panic 回溯仍有可读的函数名+行号
+#   ✅ IDE 断点仍能按行命中
+#   ❌ 看不了局部变量值（要调这个就临时改回 debug = 2）
+# 体积能砍掉一半以上，对一个「写前端为主」的 Tauri 项目，调试收益远小于磁盘收益。
+debug = "line-tables-only"
+
+# 菜单护栏测试（app/src-tauri/tests/menu.rs）。
+#
+# 【为什么 harness = false】
+# muda（macOS 上的菜单实现）要求**菜单项必须在进程的主线程上创建**
+# （MainThreadMarker::new() —— 不是主线程就 panic）。
+# 而 cargo 的测试 harness 把每个 #[test] 放在【工作线程】上跑 ——
+# 在那里建菜单会直接 panic：
+#     `muda::PlatformMenuItem` can only be created on the main thread
+# 所以这个目标自己写 main()（那才是进程的主线程）。
+# 断言失败 → 退出码非 0 → cargo 把这条测试报成失败。
+#
+# 【声明与文件必须一起在】
+#   目标声明在、文件没了 → cargo 在**解析目标**阶段就报
+#   `can't find integration-test 'menu' at path ...`，
+#   于是**整个包一个测试都跑不了**（连 --lib 之外的任何 cargo test 都失败）。
+#   commit 80eecb8「只留核心代码」删掉 tests/ 却忘了删声明，留下了这个坑；
+#   commit 1e4cdc3 把声明也删了，坑是填上了，但**护栏也跟着没了**。
+#   → 现在 tests/ 下的 5 个护栏已从 git 历史恢复，声明一并回来。
+#   （另外 4 个 syntax_tables / user_guide / watch_contract / z_index 用默认
+#     harness，cargo 会自动发现 tests/ 目录，**不需要**在这里声明。）
+[[test]]
+name = "menu"
+path = "tests/menu.rs"
+harness = false
+
+[profile.release]
+codegen-units = 1
+lto = true
+opt-level = "s"
+panic = "abort"
+strip = true

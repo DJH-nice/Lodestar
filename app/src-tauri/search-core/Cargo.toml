@@ -1,0 +1,29 @@
+[package]
+name = "search-core"
+version = "0.1.0"
+description = "Sextant 的自研搜索引擎内核（纯 Rust，不依赖 Tauri）"
+edition = "2021"
+rust-version = "1.90"
+
+# 【为什么这个 crate 不依赖 Tauri】
+#   它是纯逻辑层：扫描、索引、查询、排序、分页。
+#   依赖 Tauri 就没有单独 `cargo test -p search-core` 的意义了，
+#   而「引擎能独立测」是本项目最重要的一道护栏。
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# Unicode 归一化（NFD）—— 用来让「é」与「e + 组合符」互相匹配。
+# 【为什么不用 ICU】上游用 ICU 是因为 C 语言里没有 Unicode 归一化的标准库；
+#   Rust 有纯 Rust 的实现 → 不需要那 34MB 的 ICU 数据文件。
+unicode-normalization = "0.1"
+# 正则 —— 线性时间引擎，**没有灾难性回溯**。
+# 【为什么不用 PCRE2】Rust 的 regex 保证 O(n)，PCRE2 是回溯引擎，
+#   病态输入能把 CPU 吃满。这里是用户能直接输入的查询串，必须防这一手。
+regex = "1"
+# 本地时区 —— 「今天改过的文件」要按**本地时间**算。
+# 【为什么需要它】Rust 的稳定版 std 没有时区 API（`local_offset` 还没稳定），
+#   而 macOS 的 `tm_gmtoff` 能直接给出偏移量。
+libc = "0.2"
+
+[dev-dependencies]
+serde_json = "1"

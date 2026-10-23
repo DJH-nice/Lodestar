@@ -1,0 +1,241 @@
+{
+  "version": 1,
+  "note": "Sextant macOS 的「搜索语法速查卡」。每条 query 都用真实引擎实跑验证过（2026-10-22）。改这个文件前请先看 app/src-tauri/fsearch-core/tests/cheatsheet_queries.rs —— 里面的测试会拿每条 query 去问引擎，语法写错会直接红。",
+  "groups": [
+    {
+      "key": "daily",
+      "title": "最常用的几条",
+      "hint": "搜索框里直接打字就能搜。下面每条写法都能点一下，直接填进搜索框。",
+      "items": [
+        {
+          "intent": "按名字找东西",
+          "query": "报告",
+          "note": "直接打字就行 —— 默认只搜文件名，而且不分大小写（搜「报告」也能搜到「Report.pdf」）。"
+        },
+        {
+          "intent": "按文件后缀（类型）找",
+          "query": "ext:pdf",
+          "note": "按扩展名找。要多个就用分号隔开：ext:pdf;doc;xlsx。扩展名不分大小写。"
+        },
+        {
+          "intent": "找大文件",
+          "query": "size:>10M",
+          "note": "大于 10 MB。单位是十进制（1M = 1 000 000），不能写 1MiB —— 那样一条都搜不到。"
+        },
+        {
+          "intent": "在某个目录里找",
+          "query": "path:Documents",
+          "note": "完整路径里含这一段就算命中，不限位置：/Users/me/Documents 和 /Volumes/Data/Documents 都会搜出来。"
+        },
+        {
+          "intent": "今天改过的文件",
+          "query": "dm:today",
+          "note": "按「最后修改时间」筛。dm: 就是 last modified 的意思。"
+        },
+        {
+          "intent": "最近三天改过的文件",
+          "query": "dm:past3days",
+          "note": "过去 3 天，含今天。数字和单位之间「不能有空格」（dm:past3days 对，dm:\"past 3 days\" 无效）。"
+        }
+      ]
+    },
+    {
+      "key": "kind",
+      "title": "只想要文件 / 只想要文件夹",
+      "items": [
+        {
+          "intent": "只要文件（不要文件夹）",
+          "query": "file:报告",
+          "note": "file: / files: 都可以。只在文件里找。"
+        },
+        {
+          "intent": "只要文件夹",
+          "query": "folder:Downloads",
+          "note": "folder: / folders: 都可以。"
+        },
+        {
+          "intent": "某一类文件（图片 / 文档 / 视频…）",
+          "query": "pic:",
+          "note": "内置的一组扩展名简称：app: archive: audio: doc: pic: video:。冒号后面「不要写值」，写了会被当成另一个条件。"
+        },
+        {
+          "intent": "按系统类型（文本 / 图片…）",
+          "query": "contenttype:text",
+          "note": "按 MIME 类型筛，比如 text、image、video。"
+        }
+      ]
+    },
+    {
+      "key": "time",
+      "title": "按时间找",
+      "items": [
+        {
+          "intent": "某一天改过的",
+          "query": "dm:2026-10-01",
+          "note": "写具体日期。dm:2026-10 也可以（那一个月）。要精确到分钟得加引号：dm:\"2026-10-22 12:00\"。"
+        },
+        {
+          "intent": "某段时间改过的",
+          "query": "dm:2026-10-01..2026-10-23",
+          "note": "区间。「右端那一天是算进去的」（写到 10-23 就包含 10-23 整天）。"
+        },
+        {
+          "intent": "某一年改过的",
+          "query": "dm:2026",
+          "note": "只写年份就是那一整年。"
+        },
+        {
+          "intent": "某个时间点之后改过的",
+          "query": "dm:>2026-01-01",
+          "note": "也支持 < <= >= .. 这些比较符号。"
+        },
+        {
+          "intent": "上个月改过的",
+          "query": "dm:lastmonth",
+          "note": "last = 上一个「完整」的月（1 号到月末）。"
+        },
+        {
+          "intent": "过去一个月改过的",
+          "query": "dm:pastmonth",
+          "note": "past = 从一个月前「到今天」这一段。跟 last 的区别就在这。"
+        },
+        {
+          "intent": "今年改过的",
+          "query": "dm:thisyear",
+          "note": "this = 今年年初到今天。"
+        },
+        {
+          "intent": "最近的那个星期一改过的",
+          "query": "dm:mon",
+          "note": "星期：mon tue wed thu fri sat sun（sunday 用 sun）。月份同理：dm:jan、dm:january。"
+        }
+      ]
+    },
+    {
+      "key": "where",
+      "title": "按位置和目录结构找",
+      "items": [
+        {
+          "intent": "某个目录的直属内容",
+          "query": "parent:/Users/me/Downloads",
+          "note": "parent: 只认「直属」父目录，不往下递归。要路径请写绝对路径。"
+        },
+        {
+          "intent": "最外层 / 下一层",
+          "query": "depth:1",
+          "note": "depth:0 是索引根目录本身，depth:1 是根的下一层，depth:2 再下一层。"
+        },
+        {
+          "intent": "空文件夹",
+          "query": "empty:",
+          "note": "什么都没有的目录。"
+        },
+        {
+          "intent": "某个目录里有几个东西",
+          "query": "childcount:1",
+          "note": "子项总数（文件+目录）。只要子文件用 childfilecount:，只要子目录用 childfoldercount:。"
+        }
+      ]
+    },
+    {
+      "key": "combine",
+      "title": "多个条件一起用",
+      "items": [
+        {
+          "intent": "两个条件都要满足",
+          "query": "alpha AND beta",
+          "note": "也可以直接用空格：alpha beta（空格就是「而且」）。"
+        },
+        {
+          "intent": "满足其中之一就行",
+          "query": "alpha OR beta",
+          "note": "也可以写 alpha || beta。"
+        },
+        {
+          "intent": "排除某一类",
+          "query": "NOT ext:png",
+          "note": "也可以写 !ext:png。NOT 只作用于「紧跟的那一个」条件。"
+        },
+        {
+          "intent": "组合起来用（带括号）",
+          "query": "(alpha OR beta) AND txt",
+          "note": "括号用来分组，逻辑上就是「(A 或 B) 而且 C」。"
+        }
+      ]
+    },
+    {
+      "key": "exact",
+      "title": "更精确一点",
+      "items": [
+        {
+          "intent": "名字要完全一样",
+          "query": "exact:alpha.txt",
+          "note": "不是子串匹配 —— 名字里多一个字都搜不到。"
+        },
+        {
+          "intent": "区分大小写",
+          "query": "case:ALPHA",
+          "note": "默认不区分大小写，写了 case: 之后才区分。"
+        },
+        {
+          "intent": "用正则搜",
+          "query": "regex:\"^gam\"",
+          "note": "没有 /.../ 这种写法，整个正则用双引号包起来最省事。特殊字符要转义，比如 \\.pdf$。"
+        },
+        {
+          "intent": "名字里带空格",
+          "query": "\"my file.txt\"",
+          "note": "双引号里的内容当成一整块，空格不拆词。"
+        },
+        {
+          "intent": "列出全部文件",
+          "query": "*",
+          "note": "空搜索框是 0 条；想看全部就用 *。? 代表正好一个字符，比如 ?.txt。"
+        }
+      ]
+    },
+    {
+      "key": "pitfalls",
+      "title": "容易踩的坑（这几个写错不会报错，但结果是错的）",
+      "hint": "下面每条的「错误写法」都写在这里了 —— 引擎不会报错，只会安静地给你一个错的答案。",
+      "items": [
+        {
+          "intent": "AND / OR / NOT 必须大写",
+          "query": "NOT ext:png",
+          "wrong": "not ext:png",
+          "note": "引擎是逐字符比对的。小写的 not 不会报错，但会被当成「搜名字里含 not 的文件」。"
+        },
+        {
+          "intent": "size 用十进制，不能写 MiB",
+          "query": "size:>10M",
+          "wrong": "size:>10MiB",
+          "note": "1M = 1 000 000（不是 1024×1024）。写 MiB 一条都搜不到，也不报错。"
+        },
+        {
+          "intent": "日期常量中间不能有空格",
+          "query": "dm:past3days",
+          "wrong": "dm:\"past 3 days\"",
+          "note": "引擎按空白切词，带空格的写法解析不出来 —— 结果永远是 0 条。"
+        },
+        {
+          "intent": "路径不认 ~，要写绝对路径",
+          "query": "path:/Users/me/Documents",
+          "wrong": "path:~/Documents",
+          "note": "引擎不做 ~ 展开，path:~ 永远是 0 条。"
+        },
+        {
+          "intent": "引号要闭合",
+          "query": "\"my file.txt\" ext:pdf",
+          "wrong": "\"my file ext:pdf",
+          "note": "引号没闭合时，后面的条件会被整段吞成一个词，条件「完全失效」而且一声不吭。"
+        },
+        {
+          "intent": "想搜路径就得写 path:",
+          "query": "path:Downloads",
+          "wrong": "Downloads",
+          "note": "不加 path: 只搜「文件名」，不搜路径 —— 名字里没「Downloads」的文件就找不到。"
+        }
+      ]
+    }
+  ]
+}

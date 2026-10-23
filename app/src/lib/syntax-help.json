@@ -1,0 +1,147 @@
+{
+  "functions": [
+    [
+      "childcount:<num>",
+      "Search for all folders which have <num> children",
+      "childcount:1 finds all folders which only contain one file or folder"
+    ],
+    [
+      "childfilecount:<num>",
+      "Search for all folders which have <num> files as children",
+      "childfilecount:<=4 finds all folders which contain 4 files or less and any number of folders"
+    ],
+    [
+      "childfoldercount:<num>",
+      "Search for all folders which have <num> folders as children",
+      "childfoldercount:10..20 finds all folders which contain 10 to 20 folders and any number of files"
+    ],
+    [
+      "contenttype:<string>",
+      "Match the content type of files and folders. The content type is the mime type of a file Note: Determining the content type of a file is an expensive operation and can take a long time. It's therefor advised to first narrow down the potential results (e.g. path:/mnt/backup/documents contenttype:pdf)",
+      "contenttype:text finds all text files, like text/plain or text/css"
+    ],
+    [
+      "datemodified:<date>, dm:<date>",
+      "Search for all files and folders which have been modified at",
+      "dm:2020 finds all files and folders which have been modified in 2020"
+    ],
+    [
+      "depth:<num>, parents:<num>",
+      "Search for all files and folders with the specified folder depth",
+      "depth:0 finds the root folders"
+    ],
+    [
+      "empty:",
+      "Search for all folders which are empty",
+      ""
+    ],
+    [
+      "ext:<semicolon-seperated-list>",
+      "Search for files with the specified extensions",
+      "ext:jpg;png;gif"
+    ],
+    [
+      "parent:<path>",
+      "Search for all files and folders which are stored in the folder specified by <path>",
+      "parent:/home/user"
+    ],
+    [
+      "size:<size>",
+      "Search for all files and folders with the size specified by <size>",
+      "size:1Mb, file:size:>20gb, file:size:0"
+    ]
+  ],
+  "modifiers": [
+    [
+      "case:",
+      "Match case",
+      "case:Test finds TestDocument.odt, but not testdocument.odt"
+    ],
+    [
+      "nocase:",
+      "Ignore case",
+      "nocase:test finds TestDocument.odt and testdocument.odt"
+    ],
+    [
+      "exact:",
+      "Exact match",
+      "exact:test finds Test and test, but not testdocument.odt"
+    ],
+    [
+      "file:, files:",
+      "Match files only",
+      "file:test finds a file named test.odt, but won't find the folder testfolder"
+    ],
+    [
+      "folder:, folders:",
+      "Match folders only",
+      "file:test finds a file named test.odt, but won't find the folder testfolder"
+    ],
+    [
+      "path:",
+      "Match the full path",
+      "path:home finds a folder named home, and all its children"
+    ],
+    [
+      "nopath:",
+      "Match only the file/folder name",
+      ""
+    ],
+    [
+      "regex:",
+      "Enable regular expression Note: All reserved characters used by the FSearch search syntax (e.g. (, ), \\) need to be escaped properly when they're used in the regular expression. This can be achieved by surrounding the whole expression with double quotes \".",
+      "file:regex:\".+\\.pdf$\" finds all files which have the pdf extension"
+    ],
+    [
+      "noregex:",
+      "Disable regular expression",
+      ""
+    ]
+  ],
+  "operators": [
+    [
+      "AND",
+      "space, AND, &&",
+      "Combines two search terms. Only results that match both search terms are returned."
+    ],
+    [
+      "OR",
+      "OR, ||",
+      "Combines two search terms. Results that match one or both search terms are returned."
+    ],
+    [
+      "NOT",
+      "NOT, !",
+      "Negates the following search term."
+    ],
+    [
+      "Grouping",
+      "(, )",
+      "Search terms can be surrounded by parentheses to group them together."
+    ]
+  ],
+  "wildcards": [
+    [
+      "*",
+      "Matches zero or more characters",
+      "*.pdf finds document.pdf, but also .pdf"
+    ],
+    [
+      "?",
+      "Matches exactly one character",
+      "k?ng finds king, kong, kung, k1ng, etc."
+    ]
+  ],
+  "escaping": [
+    [
+      "Double quotes \"\"",
+      "Everything in between \"\" is treated literally (like spaces)",
+      "\"/home/user/my folder\" *.pdf → /home/user/my folder and *.pdf"
+    ],
+    [
+      "Backslash \\",
+      "Escapes the following character (like space or \")",
+      "/home/user/my\\ folder \\\"quote\\\".txt → /home/user/my folder and \"quote\".txt"
+    ]
+  ]
+}

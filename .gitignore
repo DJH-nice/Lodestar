@@ -1,0 +1,13 @@
+# 依赖
+node_modules/
+
+# 构建产物
+app/dist/
+app/src-tauri/target/
+
+# 索引档（运行时生成，不进版本库）
+*.bin
+index.bin
+
+# macOS
+.DS_Store
