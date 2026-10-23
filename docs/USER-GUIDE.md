@@ -1,6 +1,6 @@
 # Sextant 使用手册
 
-这是 Linux 上那个 FSearch 文件搜索器的 macOS 原生版（Apple Silicon），产品名 **Sextant**。
+这是一个 **macOS / Apple Silicon 原生的文件搜索器**，产品名 **Sextant**。
 
 **这份手册是写给三个月后的自己看的**：忘了某个功能点在哪、忘了搜索语法怎么写，
 回来翻这一份就能解决。应用里也能看它 —— 顶部菜单栏 **帮助 → 完整手册**。
@@ -665,7 +665,7 @@ Sextant 可以在后台常驻 —— 关掉窗口它**不会退出**，随时能
 ## 已知限制
 
 - **索引不是实时的，是「自动跟上」**。文件变了会自动重扫（默认开），
-  但要等 0.8 秒的防抖，而且重扫是**全量**的（上游引擎只有全量重扫，没有增量）。
+  但要等 0.8 秒的防抖，而且重扫是**全量**的（增量更新正在做，见下）。
 - **索引 `$HOME` 且有别的程序在持续写文件时，自动刷新会明显吃 CPU**
   （最多每 5 秒一次全量重扫）—— 这种场景建议关掉开关，或者把索引目录改小。
 - **`.DS_Store` 这类元数据变化也会触发一次全量重扫**（macOS 自己往目录里写
@@ -686,20 +686,22 @@ Sextant 可以在后台常驻 —— 关掉窗口它**不会退出**，随时能
 ## 给开发者
 
 这个应用是 **Tauri v2（Rust）+ Vue 3 + TypeScript + Vite** 写的，
-搜索引擎是**上游 FSearch 0.3.2 的引擎子集**，通过 `shim/` 那层 C FFI 调用。
-**上游源码一个字都没改**（`src/` 目录与原始 tarball 逐字节一致）。
+**搜索引擎内核是完全自研的**（`app/src-tauri/search-core/`，纯 Rust）——
+并行扫描、索引存储、查询语法、排序分页全部是本项目自己的实现。
 
 想继续看代码，从这几个文件进：
 
 | 想看什么 | 去哪 |
 |---|---|
 | 怎么构建、怎么跑、怎么打包 | `app/README.md` |
-| 引擎的 FFI 契约（**唯一真相**） | `shim/fsearch_shim.h` |
+| 搜索引擎内核（**从这儿进**） | `app/src-tauri/search-core/src/` |
+| 查询语法怎么解析的 | `app/src-tauri/search-core/src/query.rs` |
+| 索引怎么扫的、怎么存的 | `.../scan.rs` 与 `.../store.rs` |
 | Rust 命令层 | `app/src-tauri/src/commands.rs` |
 | 前端入口与全局快捷键 | `app/src/App.vue` |
 | 查询串的着色 | `app/src/lib/tokenizer.ts` |
 | 引擎的真实语法表（JSON） | `app/shared/syntax-tables.json` |
-| 这个项目的硬约束（上游一个字都不许改） | `AGENTS.md` |
+| 这个项目的硬约束 | `AGENTS.md` |
 
 **这份手册里的语法表不是手抄的** —— 它由 `app/scripts/gen-syntax-help.py`
 从引擎的语法表生成，落到 `app/shared/syntax-tables.json`，

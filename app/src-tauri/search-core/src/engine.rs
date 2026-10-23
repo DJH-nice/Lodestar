@@ -8,6 +8,7 @@
 //!   前端 `app/src/lib/paging.ts` 就是按这个公式插分隔行的 ——
 //!   公式一变，界面上的分隔线就会错位。
 
+use std::cell::RefCell;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
@@ -22,15 +23,28 @@ use crate::types::{
 };
 
 /// 引擎。
+///
+/// 【为什么用 `RefCell` 而不是裸指针改字段】
+///   `search()` 要把「本次搜索的视图」存回引擎（翻页靠它），
+///   而它拿到的是 `&self`（共享引用）。
+///   用 `*mut` 裸指针去改共享引用背后的字段是 **UB**：
+///   优化器认为 `self.view` 在函数期间没被改过 → 把 `None` 缓存进寄存器
+///   → 后面 `self.view.as_ref()` 读到的是缓存值 → panic。
+///   （实测踩过：debug 构建看不出来，**release 构建直接 panic**。）
+///   `RefCell` 是正确的内部可变性：借用检查在运行期做，语义清晰。
+///
+/// 【为什么单线程用它没有性能问题】
+///   引擎只被搜索线程一个线程持有（见 `worker.rs`），
+///   不存在并发访问 → `RefCell` 的借用标记几乎零成本。
 pub struct Engine {
     /// 全部索引条目。
-    entries: Vec<IndexEntry>,
+    entries: RefCell<Vec<IndexEntry>>,
     /// 索引根目录。
     roots: Vec<PathBuf>,
     /// 索引档的路径（有它才有冷启动加速）。
     store_path: Option<PathBuf>,
     /// 上一次搜索的结果视图 —— 翻页靠它，不重跑匹配。
-    view: Option<View>,
+    view: RefCell<Option<View>>,
 }
 
 /// 一次搜索留下的视图。
@@ -73,10 +87,10 @@ impl Engine {
                     let count = entries.len() as u32;
                     return Ok((
                         Engine {
-                            entries,
+                            entries: RefCell::new(entries),
                             roots,
                             store_path: store_path.clone(),
-                            view: None,
+                            view: RefCell::new(None),
                         },
                         count,
                     ));
@@ -88,10 +102,10 @@ impl Engine {
         let entries = scan::scan(&roots)?;
         let count = entries.len() as u32;
         let engine = Engine {
-            entries,
+            entries: RefCell::new(entries),
             roots,
             store_path,
-            view: None,
+            view: RefCell::new(None),
         };
         engine.persist();
         Ok((engine, count))
@@ -104,16 +118,9 @@ impl Engine {
         //   用户点「刷新」就该看到磁盘现在的样子。
         let entries = scan::scan(&self.roots)?;
         let count = entries.len() as u32;
-        // 借 interior mutability：搜索线程是唯一的持有者，
-        // 不会有人在扫描途中同时读索引。
-        // 【为什么用 UnsafeCell 而不是 Mutex】
-        //   引擎只被搜索线程一个线程碰（见 worker.rs），
-        //   加锁只会带来「搜索被扫描堵住」的老问题。
-        unsafe {
-            let me = self as *const Engine as *mut Engine;
-            (*me).entries = entries;
-            (*me).view = None;
-        }
+        *self.entries.borrow_mut() = entries;
+        // 视图描述的是旧索引 → 必须作废（翻页会拿到错误的条目）
+        *self.view.borrow_mut() = None;
         self.persist();
         Ok(count)
     }
@@ -121,7 +128,7 @@ impl Engine {
     /// 把索引写到存档（失败不致命 —— 只是下次冷启动慢一点）。
     fn persist(&self) {
         if let Some(sp) = &self.store_path {
-            if let Err(e) = store::save(&self.entries, &self.roots, sp) {
+            if let Err(e) = store::save(&self.entries.borrow(), &self.roots, sp) {
                 eprintln!("[sextant] 索引落盘失败（不影响使用）: {e}");
             }
         }
@@ -150,9 +157,10 @@ impl Engine {
         let q = query::parse(&req.query).ok_or(EngineError::SearchFailed)?;
 
         // 匹配
+        let entries = self.entries.borrow();
         let mut folders: Vec<u32> = Vec::new();
         let mut files: Vec<u32> = Vec::new();
-        for (i, e) in self.entries.iter().enumerate() {
+        for (i, e) in entries.iter().enumerate() {
             if q.matches(e) {
                 if e.is_folder {
                     folders.push(i as u32);
@@ -164,24 +172,30 @@ impl Engine {
 
         // 排序
         let cmp = comparator(req.sort);
-        folders.sort_by(|a, b| cmp(&self.entries[*a as usize], &self.entries[*b as usize]));
-        files.sort_by(|a, b| cmp(&self.entries[*a as usize], &self.entries[*b as usize]));
+        folders.sort_by(|a, b| cmp(&entries[*a as usize], &entries[*b as usize]));
+        files.sort_by(|a, b| cmp(&entries[*a as usize], &entries[*b as usize]));
+        drop(entries); // 放掉借用，后面要写 view
 
         let total_folders = folders.len() as u32;
         let total_files = files.len() as u32;
 
-        // 记下视图（翻页靠它）
-        unsafe {
-            let me = self as *const Engine as *mut Engine;
-            (*me).view = Some(View {
-                query: req.query.clone(),
-                folders,
-                files,
-                sort: req.sort,
-            });
-        }
+        let view = View {
+            query: req.query.clone(),
+            folders,
+            files,
+            sort: req.sort,
+        };
 
-        let mut result = self.build_page(req, total_files, total_folders);
+        // 记下视图（翻页靠它）
+        *self.view.borrow_mut() = Some(view);
+
+        // build_page 需要 `&View` —— 这里从 RefCell 里借出来用。
+        // 【为什么不会 panic】
+        //   上面那条 `borrow_mut()` 已经在语句结束时**放掉**了借用标记，
+        //   这里重新 borrow 是安全的（不是嵌套借用）。
+        let view_guard = self.view.borrow();
+        let mut result = self.build_page(req, view_guard.as_ref().expect("刚写进去的视图"), total_files, total_folders);
+        drop(view_guard);
         result.elapsed_ms = started.elapsed().as_millis() as u64;
         if !q.warnings.is_empty() {
             result.warning = Some(q.warnings.join("；"));
@@ -192,7 +206,8 @@ impl Engine {
     /// 读取第 `req.page` 页（**不重跑匹配**）。
     pub fn page(&self, req: &SearchRequest) -> Result<SearchResult, EngineError> {
         let started = Instant::now();
-        let view = self.view.as_ref().ok_or(EngineError::NotFound)?;
+        let view_guard = self.view.borrow();
+        let view = view_guard.as_ref().ok_or(EngineError::NotFound)?;
 
         // 查询变了 → 旧页号失效
         if view.query != req.query {
@@ -205,14 +220,22 @@ impl Engine {
 
         let total_files = view.files.len() as u32;
         let total_folders = view.folders.len() as u32;
-        let mut result = self.build_page(req, total_files, total_folders);
+        // 【为什么把 view 传进去而不是在里面再 borrow 一次】
+        //   这里已经持有了 `view` 的借用，再 borrow 一次会 panic
+        //   （RefCell 的借用标记不区分「读」还是「写」）。
+        let mut result = self.build_page(req, view, total_files, total_folders);
         result.elapsed_ms = started.elapsed().as_millis() as u64;
         Ok(result)
     }
 
     /// 从视图里切出第 `page` 页。
-    fn build_page(&self, req: &SearchRequest, total_files: u32, total_folders: u32) -> SearchResult {
-        let view = self.view.as_ref().expect("build_page 只在有视图时调用");
+    fn build_page(
+        &self,
+        req: &SearchRequest,
+        view: &View,
+        total_files: u32,
+        total_folders: u32,
+    ) -> SearchResult {
         let size = req.page_size.max(1) as usize;
         let offset = req.page as usize * size;
 
@@ -244,12 +267,15 @@ impl Engine {
         };
 
         // 高亮：只对**本页**的条目算（不是全表）
-        let mut entries: Vec<Entry> = Vec::with_capacity(page_items.len());
+        let entries = self.entries.borrow();
+        let mut out_entries: Vec<Entry> = Vec::with_capacity(page_items.len());
+        // 查询串解析一次就够（同一页里所有条目共用）
+        let parsed = query::parse(&view.query);
         for id in page_items {
-            let e = &self.entries[*id as usize];
+            let e = &entries[*id as usize];
             let mut out = e.to_entry();
-            if let Some(q) = query::parse(&view.query) {
-                let (name_ranges, path_ranges) = query::highlight_ranges(&q, e);
+            if let Some(q) = &parsed {
+                let (name_ranges, path_ranges) = query::highlight_ranges(q, e);
                 out.highlights = name_ranges
                     .iter()
                     .map(|(s, t)| Highlight {
@@ -265,7 +291,7 @@ impl Engine {
                     })
                     .collect();
             }
-            entries.push(out);
+            out_entries.push(out);
         }
 
         // 分组边界（只有「全部」列表才有）
@@ -275,13 +301,13 @@ impl Engine {
                 SortOrder::Desc => total_files,
             } as u64;
             let raw = base.saturating_sub(req.page as u64 * req.page_size as u64);
-            Some(raw.min(entries.len() as u64) as u32)
+            Some(raw.min(out_entries.len() as u64) as u32)
         } else {
             None
         };
 
         SearchResult {
-            entries,
+            entries: out_entries,
             total_entries,
             total_files,
             total_folders,
