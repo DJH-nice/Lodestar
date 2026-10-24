@@ -30,6 +30,12 @@ mod settings;
 mod shortcut;
 // （`tray` 同上 —— 见上面那段「为什么 `lifecycle` 与 `tray` 都是私有 `mod`」。）
 mod tray;
+// 【为什么 `volumes` 现在是 `pub mod`】
+//   Task 4 只落「枚举卷」这一半 —— 真正的调用点在 Task 5（卷监控）才接上。
+//   私有 `mod` 里的 `pub` 项会被 `dead_code` 判死（见上面那段说明），
+//   Task 5 还没做 → 先用 `pub mod` 顶住告警，
+//   **Task 5 接上调用点后要改回私有 `mod`**（跟 `lifecycle` / `tray` 一样）。
+pub mod volumes;
 mod watcher;
 
 use std::sync::{Arc, Mutex};

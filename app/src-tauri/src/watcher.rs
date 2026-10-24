@@ -1757,7 +1757,7 @@ mod tests {
         //   而 `/private/var` 是**排除规则**里的一条（macOS 的系统临时区）。
         //   → 用它做测试目录的话，事件会被排除规则挡掉（测不到东西）。
         //   `/tmp` 的真实路径是 `/private/tmp`，**不在**排除前缀里 ✓
-        let dir = PathBuf::from("/tmp").join(format!("sextant-e2e-{}", std::process::id()));
+        let dir = PathBuf::from("/tmp").join(format!("lodestar-e2e-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let (engine, _) = search_core::Engine::new(&[dir.as_path()]).unwrap();
