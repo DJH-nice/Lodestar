@@ -1015,7 +1015,7 @@ git commit -m "feat(worker): 支持附加/分离根目录 + 落盘改成 per 根
 - Produces:
   ```rust
   // src/volumes.rs
-  pub fn mounted_local_volumes() -> Vec<PathBuf>;
+  pub fn mounted_local_volumes() -> Result<Vec<PathBuf>, String>;   // ★ 失败要能分辨
   pub fn filter_local_volumes(mounts: &[(PathBuf, u32)]) -> Vec<PathBuf>;   // 纯函数，可测
   ```
   （Task 5 用它们）
@@ -1064,7 +1064,7 @@ const MNT_LOCAL: u32 = libc::MNT_LOCAL as u32;
 ///   1. `MNT_LOCAL` —— 本地磁盘（排除 smbfs / nfs / afpfs / webdav）
 ///   2. 挂载点是 `/Volumes` 的**直接子目录**（排除 `/` 与 `/System/Volumes/*`）
 ///   3. 不是 `/Volumes/Macintosh HD` 那个指向 `/` 的符号链接
-pub fn mounted_local_volumes() -> Vec<PathBuf> {
+pub fn mounted_local_volumes() -> Result<Vec<PathBuf>, String> {
     // 【getfsstat 的两段式调用】第一次只问「有多少个」，
     // 第二次才把内容填进我们给的数组里（缓冲区是**我们自己的** Vec → 线程安全）。
     unsafe {
@@ -1074,14 +1074,27 @@ pub fn mounted_local_volumes() -> Vec<PathBuf> {
         //   在 macOS 上照抄会编译不过，或者更糟：传错语义。）
         let count = libc::getfsstat(std::ptr::null_mut(), 0, libc::MNT_NOWAIT);
         if count <= 0 {
-            return Vec::new();
+            // 【为什么失败要能分辨】调用方（监控线程）靠这个函数的**集合变化**
+            //   判断卷出现/消失。空列表 = 「没有卷」；而系统调用失败**也是**空列表
+            //   → 会被误判成「所有卷都被拔了」→ 触发不必要的拆索引，
+            //     下一秒又挂回来 → **U 盘被全量重扫一遍**（十几秒）。
+            //   → 失败走 Err，让调用方**这一轮什么都不做**。
+            return Err(format!(
+                "getfsstat 问个数失败（errno={:?}）",
+                std::io::Error::last_os_error()
+            ));
         }
         let mut buf = vec![std::mem::zeroed::<libc::statfs>(); count as usize];
         let bytes = std::mem::size_of::<libc::statfs>() * count as usize;
-        let count = libc::getfsstat(buf.as_mut_ptr(), bytes as libc::c_int, libc::MNT_NOWAIT);
-        if count <= 0 {
-            return Vec::new();
+        let filled = libc::getfsstat(buf.as_mut_ptr(), bytes as libc::c_int, libc::MNT_NOWAIT);
+        if filled < 0 {
+            return Err(format!(
+                "getfsstat 取内容失败（errno={:?}）",
+                std::io::Error::last_os_error()
+            ));
         }
+        // 内核返回的是**它实际拷贝进来的个数**（缓冲区装不下就只拷前几个）
+        let count = filled.min(count) as usize;
         let mounts: Vec<(PathBuf, u32)> = buf[..count as usize]
             .iter()
             .map(|s| {
@@ -1094,7 +1107,7 @@ pub fn mounted_local_volumes() -> Vec<PathBuf> {
                 )
             })
             .collect();
-        filter_local_volumes(&mounts)
+        Ok(filter_local_volumes(&mounts))
     }
 }
 
@@ -1382,7 +1395,13 @@ pub fn spawn_volume_monitor<R: Runtime>(app: AppHandle<R>) {
             let mut known: HashSet<PathBuf> = HashSet::new();
             loop {
                 std::thread::sleep(POLL_INTERVAL);
-                let now: HashSet<PathBuf> = mounted_local_volumes().into_iter().collect();
+                // 【枚举失败 ≠ 没有卷】失败时**这一轮什么都不做**（别把瞬时错误
+                //   当成「所有卷都被拔了」→ 触发不必要的拆索引 + 重新全量扫）。
+                let Ok(list) = mounted_local_volumes() else {
+                    crate::logging::log_line("[volumes] 枚举挂载点失败，这一轮跳过");
+                    continue;
+                };
+                let now: HashSet<PathBuf> = list.into_iter().collect();
                 let (appeared, disappeared) = diff_volumes(&known, &now);
                 for v in disappeared {
                     detach_volume(&app, &v);
@@ -1441,7 +1460,11 @@ fn attach_volume<R: Runtime>(app: &AppHandle<R>, volume: &Path) {
                     let Some(searcher) = current_searcher(&app) else { return };
                     // 【拔盘竞态】扫的这几十秒里用户可能把盘拔了 →
                     //   复查一次，没挂载就丢弃结果（不把死盘的条目塞进索引）。
-                    if !mounted_local_volumes().contains(&volume) {
+                    // 【枚举失败时保守处理】拿不到清单就当「还在」（不丢弃结果）
+                    let still_there = mounted_local_volumes()
+                        .map(|list| list.contains(&volume))
+                        .unwrap_or(true);
+                    if !still_there {
                         crate::logging::log_line(&format!("[volumes] {} 扫描期间被拔掉，丢弃", volume.display()));
                         app.state::<VolumeState>().remove(&volume);
                         return;
@@ -1563,10 +1586,14 @@ pub fn rebuild_engine<R: Runtime>(
 ) -> Result<u32, String> {
     let mut resolved = effective_paths(paths);
     // 【已挂载的卷要一起带上】换索引目录不该把 U 盘踢出索引
-    for v in crate::volumes::mounted_local_volumes() {
-        let s = v.to_string_lossy().into_owned();
-        if !resolved.contains(&s) {
-            resolved.push(s);
+    // 【枚举失败就不要乱改根列表】拿不到清单时保持原样（宁可少索引一个卷，
+    //   也不能把用户正在用的根踢掉）
+    if let Ok(list) = crate::volumes::mounted_local_volumes() {
+        for v in list {
+            let s = v.to_string_lossy().into_owned();
+            if !resolved.contains(&s) {
+                resolved.push(s);
+            }
         }
     }
     ...
