@@ -1397,8 +1397,9 @@ pub fn spawn_volume_monitor<R: Runtime>(app: AppHandle<R>) {
                 std::thread::sleep(POLL_INTERVAL);
                 // 【枚举失败 ≠ 没有卷】失败时**这一轮什么都不做**（别把瞬时错误
                 //   当成「所有卷都被拔了」→ 触发不必要的拆索引 + 重新全量扫）。
+                // ⚠️ 失败日志 `mounted_local_volumes()` 内部**已经打过一条**了
+                //   （带 errno）→ 这里不要再打一遍（否则日志里同一件事两行）。
                 let Ok(list) = mounted_local_volumes() else {
-                    crate::logging::log_line("[volumes] 枚举挂载点失败，这一轮跳过");
                     continue;
                 };
                 let now: HashSet<PathBuf> = list.into_iter().collect();
