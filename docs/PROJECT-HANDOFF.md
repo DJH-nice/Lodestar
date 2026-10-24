@@ -268,28 +268,48 @@ lodestar/                          ← 新仓库（git 已初始化，1 次提�
 - 打包验证：`.app` ≤12M、`otool -L` 无外部 dylib
 - 加 CI（GitHub Actions：cargo test + vitest + 打包自检）
 
-**与 M2 合并时的三步（已实测验证）**
+**与 M2 合并：✅ 已完成（2026-10-24，提交 `dd651eb`）**
 > 背景：M2 给 `IndexEntry` 加了 `child_file_count` / `child_folder_count`
 > 两个字段（`childfilecount:` / `childfoldercount:` 用）。
-> M3 的增量更新只维护了 `child_count` → 合并后那两个计数会**漂移**。
+> M3 的增量更新只维护 `child_count` → 合并后那两个计数会**漂移**。
 >
-> **① 解决 2 处冲突**（实测：`git merge-tree` 干跑的结果）
+> **① 解决冲突** —— ⚠️ **实际是 6 处，不是原来记的 2 处**：
+> 那份「2 处」是在「改名 Sextant → Lodestar」**之前**测的；
+> 改名让同一批文件两边都改过 → 多出 4 处撞车。实际解法：
 >   - `search-core/src/lib.rs`：两行都留（`pub mod incremental;` + `pub mod mime;`）
->   - `search-core/src/engine.rs`：留 M3 的 `apply_changes` 那一块
->   （`scan.rs` 与 `store.rs` **自动合并**，不用管）
+>   - `search-core/src/engine.rs`：`use` 都留；方法块留 M3 的（`apply_changes` 等）
+>   - `search-core/src/scan.rs`：**两边的好处都要** ——
+>     M2 把 `make_entry` 改成「元数据由调用方传进来」（省掉每个条目第二次 stat），
+>     M3 要它 `pub(crate)`（增量更新器复用同一份构造）→ **合成一个签名**
+>   - `app/src-tauri/src/watcher.rs`：纯改名撞车 → M3 的措辞 + master 的前缀
+>   - `AGENTS.md` / `PROJECT-HANDOFF.md`：两边各一张**实测表** →
+>     **两张都留**（master 的表 + M3 的「实时更新」三行）
 >
-> **② 让增量更新维护那两个新计数**（`search-core/src/incremental.rs`，约 8 行）
+> **② 让增量更新维护那两个新计数**（`search-core/src/incremental.rs`）
 >   - `ChildDelta` 加 `files` / `folders` 两个字段
 >   - `bump()` 多收一个 `is_folder` 参数
 >   - 应用增量时多写两行：
 >     `e.child_file_count = ...; e.child_folder_count = ...;`
 >
 > **③ 把护栏的快照也扩到那两个字段**
->   （`search-core/tests/incremental.rs` 的 `Snapshot` 类型 + 取值处，2 行）
+>   （`search-core/tests/incremental.rs` 的 `Snapshot` 类型 + 取值处）
 >   → **不扩的话漂移不会被抓到** —— 实测：扩之前 19 条全绿，
 >     扩之后 **8 条变红**（`child_folder_count` 对不上）✓
 >
-> 三步做完，合并后的 `cargo test -p search-core` **19 条全绿**（已实测）。
+> **④ 三处合并文档没写、但必须做的**（都是合并时才暴露的）：
+>   - **`incremental.rs` 的两处 `make_entry` 调用要补 `meta`** ——
+>     M3 原版在 `make_entry` 内部自己 stat；合并后 `make_entry` 不碰磁盘了
+>     → 不补就是 size/mtime 全 0 → **增量索引与全量重扫对不上**。
+>   - **「目录 → 文件」类型变化那一支要记两次 `bump`** ——
+>     父目录的**总数**不变，但少了 1 个目录、多了 1 个文件。
+>   - **`engine.rs` 里一个乱码字符**（M3 分支自带：「用这张表」的「张」坏成两个 U+FFFD）。
+>
+> 合并后实测：`cargo test -p search-core` **112 项全绿**（增量护栏 19 条）、
+> `cargo test` **200 项全绿**、`pnpm vitest run` **266 项全绿**。
+
+**外接卷索引**（插上 U 盘就能搜到里面的文件）：
+设计已定稿 —— [`superpowers/specs/2026-10-24-external-volume-indexing-design.md`](superpowers/specs/2026-10-24-external-volume-indexing-design.md)，
+实施计划见 `superpowers/plans/2026-10-24-external-volume-indexing.md`。
 
 **另有两件小事**：
 - `CreditsPanel.vue` 里还写着上游 FSearch 与 GPL 的说明 → 要重写

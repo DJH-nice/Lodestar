@@ -178,14 +178,20 @@ lodestar/
 
 ## 正在做的工作
 
-**M3/M4 还没做完**，具体清单见 [`docs/PROJECT-HANDOFF.md`](docs/PROJECT-HANDOFF.md)：
+**M3 已完成并合回 master**（2026-10-24，提交 `dd651eb`）——
+实时更新从「全量重扫」改成「脏路径 → 就地改索引」。
+剩下的是 **M4（收口）**，清单见 [`docs/PROJECT-HANDOFF.md`](docs/PROJECT-HANDOFF.md)：
 
-- **实时更新还是全量重扫** → ~~M3 要改成「脏目录重扫 + diff」~~ → **M3 已完成**：
-  改成「脏路径 → 就地改索引」（`search-core/src/incremental.rs`）。
-  实测改 1 个文件 **0.01~0.05ms**、100 个文件 **0.5~2.7ms**（一次更新）、端到端可见 **407ms**。
 - UX 缺口：⌘K 命令面板、浅色主题、QuickLook、`~` 展开、MiB/GiB、可配置排除规则。
+- 致谢面板还写着上游 FSearch 与 GPL 的说明 → 要重写（引擎已自研，GPL 义务已消失）。
+- `app/README.md` 里还有旧的上游构建步骤 → 要重写。
+- 打包验证、CI（cargo test + vitest + 打包自检）。
 
-（M2 的「补齐查询语法」已完成 —— 见下面的「语法表 = 实现」。）
+**M2 的「补齐查询语法」已完成** —— 见下面的「语法表 = 实现」。
+
+⚠️ **外接卷索引**（插上 U 盘就能搜到里面的文件）的设计已定稿：
+[`docs/superpowers/specs/2026-10-24-external-volume-indexing-design.md`](docs/superpowers/specs/2026-10-24-external-volume-indexing-design.md)
+—— 实施计划见 `docs/superpowers/plans/2026-10-24-external-volume-indexing.md`。
 
 ## 语法表 = 实现（2026-10-24 起）
 
