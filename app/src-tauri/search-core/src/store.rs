@@ -229,17 +229,29 @@ fn parse(buf: &[u8]) -> Option<(Vec<IndexEntry>, Vec<PathBuf>)> {
 ///   哈希是定长十六进制 → 永远是合法文件名。
 ///
 /// 【碰撞了会怎样】
-///   档里**记着自己的根路径**（见 [`parse_root`]）→ 读出来对不上就当没有档
-///   （退回全量扫描）→ 碰撞最多浪费一次扫描，**不会读错数据**。
+///   哈希吃的是**原始字节**（见 [`fnv1a64`]）→ 字节不同的路径**必然**落到
+///   不同的档文件 → 「两个根共用一份档」这件事根本不会发生。
+///   万一还是撞了（FNV-1a 理论上仍能被构造出碰撞），档里**记着自己的根路径**
+///   （见 [`parse_root]`）→ 读出来对不上就当没有档（退回全量扫描）
+///   → 最多浪费一次扫描，**不会读错数据**。
 pub fn root_archive_path(dir: &Path, root: &Path) -> PathBuf {
-    dir.join(format!("{:016x}.bin", fnv1a64(&root.to_string_lossy())))
+    dir.join(format!(
+        "{:016x}.bin",
+        fnv1a64(root.as_os_str().as_encoded_bytes())
+    ))
 }
 
 /// FNV-1a 64 位 —— 自己写，不依赖 `DefaultHasher`
 /// （后者的种子不保证跨 Rust 版本稳定，不能拿来当持久化文件名）。
-fn fnv1a64(s: &str) -> u64 {
+///
+/// 【为什么吃原始字节，不吃 lossy 字符串】
+///   lossy 会把**非法 UTF-8 字节**统一替换成 U+FFFD →
+///   两个**字节不同**的路径会算出**同一个哈希**、落到**同一个档文件**上，
+///   而档里记的 lossy 路径又「对得上」→ **读到别的根的档**。
+///   吃原始字节就没这个问题：字节不同 → 哈希不同 → 档文件不同。
+fn fnv1a64(bytes: &[u8]) -> u64 {
     let mut h: u64 = 0xcbf2_9ce4_8422_2325;
-    for b in s.as_bytes() {
+    for b in bytes {
         h ^= *b as u64;
         h = h.wrapping_mul(0x0000_0100_0000_01b3);
     }
@@ -536,5 +548,27 @@ mod tests {
         //   **残缺的索引**当完整的用 —— 比「读不出来」危险得多。
         let buf = serialize_root(Path::new("/Users/me"), &sample());
         assert!(parse_root(&buf[..buf.len() - 1]).is_none(), "截断的档必须被拒");
+    }
+
+    #[test]
+    fn paths_with_the_same_lossy_form_get_different_archives() {
+        // 两个路径的 lossy 形式相同（都含非法 UTF-8 字节 → 都被替换成 U+FFFD），
+        // 但原始字节不同 → 必须落到**不同的档文件**（否则会读到别的根的档）。
+        let dir = std::env::temp_dir().join(format!("lodestar-store-lossy-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        use std::os::unix::ffi::OsStrExt;
+        let a = std::path::PathBuf::from(std::ffi::OsStr::from_bytes(b"/Volumes/\xff\xfe"));
+        let b = std::path::PathBuf::from(std::ffi::OsStr::from_bytes(b"/Volumes/\xff\xfd"));
+        assert_eq!(
+            a.to_string_lossy(),
+            b.to_string_lossy(),
+            "前提：这两个路径的 lossy 形式必须相同"
+        );
+        assert_ne!(
+            root_archive_path(&dir, &a),
+            root_archive_path(&dir, &b),
+            "原始字节不同 → 必须落到不同的档文件"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
