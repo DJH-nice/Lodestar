@@ -200,14 +200,12 @@ const POLL_INTERVAL: Duration = Duration::from_secs(1);
 ///   结果表里留着已经拔掉的盘的条目（用户最不能接受的那种：盘都拔了还搜得到）。
 ///   → 必须显式发事件。
 ///
-/// 【⚠️ 交接给 Task 6（前端那一半）】
-///   本常量**还没有**进 `event_names::EVENT_NAMES` —— 那道护栏要求
-///   「前端必须真的在听」，而前端的 `listen` 是 Task 6 的活。
-///   → Task 6 要做两件事：
-///     ① 把本常量加进 `event_names::EVENT_NAMES`，并把那里的数量断言 7 改成 8；
-///     ② 在 `app/src/App.vue` 里加一行 `listen("index-volumes-changed", …)`
-///        （**必须是字面量** —— 那道护栏断言的是「事件名出现在含 listen 的那一行上」）。
-///   → 在那之前，这个事件**发了没人听**：结果表要等 Task 6 落地才自动刷新。
+/// 【这一行的两端都接上了】（Task 6 落地后的状态）
+///   ① 本常量**已经**在 `event_names::EVENT_NAMES` 表里 → 有护栏盯着；
+///   ② 前端**已经**在 `app/src/App.vue` 里
+///      `listen("index-volumes-changed", …)`（**字面量** ——
+///      那道护栏断言的是「事件名出现在含 listen 的那一行上」）。
+///   → 有人删掉前端的订阅 → 护栏立刻红（不会再出现「发了没人听」）。
 pub const VOLUMES_CHANGED_EVENT: &str = "index-volumes-changed";
 
 /// 一个卷现在的状态。

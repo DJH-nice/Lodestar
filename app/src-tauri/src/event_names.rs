@@ -52,6 +52,7 @@ pub const EVENT_NAMES: &[&str] = &[
     crate::lifecycle::OPEN_SETTINGS_EVENT,
     crate::lifecycle::VISIBILITY_EVENT,
     crate::watcher::AUTO_REFRESH_EVENT,
+    crate::volumes::VOLUMES_CHANGED_EVENT,
     crate::OPEN_USER_GUIDE_EVENT,
     crate::OPEN_SYNTAX_CHEATSHEET_EVENT,
     crate::OPEN_CREDITS_EVENT,
@@ -203,7 +204,7 @@ mod tests {
         //     新增事件时**必须**同时改这个数字（改的时候就会看见这张表）。
         assert_eq!(
             EVENT_NAMES.len(),
-            7,
+            8,
             "事件表少了一条或多了一条 —— \
              新增 Rust→前端 的事件时，记得把它加进 EVENT_NAMES 并更新这个数字"
         );

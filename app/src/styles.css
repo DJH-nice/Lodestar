@@ -497,6 +497,21 @@ input {
   text-overflow: ellipsis;
 }
 
+/* 外接卷的状态 —— 「U盘 · 正在索引…」「U盘 · 12,433 项」。
+   颜色只用现成的令牌（不写死新颜色值）。 */
+.sb-volume {
+  color: var(--fg-3);
+  margin-right: 8px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  max-width: 22vw;
+}
+
+/* 索引失败的卷 —— 要比别的卷显眼（跟 .sb-error 一样用 --danger）。 */
+.sb-volume.is-failed {
+  color: var(--danger);
+}
+
 .tb-refresh {
   display: inline-flex;
   align-items: center;

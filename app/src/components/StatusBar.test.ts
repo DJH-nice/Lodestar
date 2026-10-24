@@ -100,3 +100,65 @@ describe("StatusBar 的查询警告", () => {
     app.unmount();
   });
 });
+
+/**
+ * 外接卷的状态 —— 状态栏必须让用户看见「盘上的文件进索引了没有」。
+ *
+ *  【为什么要有这个测试】插上 U 盘后的首扫可能要几十秒，
+ *  界面上一个字都不显示的话，用户会以为功能坏了（而且是**静默**地坏）。
+ */
+describe("StatusBar 的外接卷状态", () => {
+  it("状态栏会显示外接卷的状态", () => {
+    const { app, host } = mountStatusBar({
+      scanning: false,
+      indexed: 120,
+      paths: ["/Users/me"],
+      error: null,
+      visible: true,
+      volumes: [
+        { path: "/Volumes/U盘", label: "U盘", phase: { state: "Ready" }, indexed: 42 },
+        {
+          path: "/Volumes/移动硬盘",
+          label: "移动硬盘",
+          phase: { state: "Indexing" },
+          indexed: 0,
+        },
+      ],
+    });
+    expect(host.textContent).toContain("U盘");
+    expect(host.textContent).toContain("42");
+    expect(host.textContent).toContain("正在索引");
+    app.unmount();
+  });
+
+  it("没有插盘时不显示卷那一行", () => {
+    const { app, host } = mountStatusBar({
+      scanning: false,
+      indexed: 120,
+      paths: ["/Users/me"],
+      error: null,
+    });
+    expect(host.querySelector(".sb-volume")).toBeNull();
+    app.unmount();
+  });
+
+  it("索引失败的卷要写明「索引失败」（不能只显示个卷名）", () => {
+    const { app, host } = mountStatusBar({
+      scanning: false,
+      indexed: 120,
+      paths: ["/Users/me"],
+      error: null,
+      volumes: [
+        {
+          path: "/Volumes/坏盘",
+          label: "坏盘",
+          phase: { state: "Failed", detail: "读不出来" },
+          indexed: 0,
+        },
+      ],
+    });
+    expect(host.textContent).toContain("坏盘");
+    expect(host.textContent).toContain("索引失败");
+    app.unmount();
+  });
+});

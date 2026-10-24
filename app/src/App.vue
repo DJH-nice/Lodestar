@@ -483,6 +483,7 @@ onMounted(() => {
   void listenForSyntaxCheatsheet();
   void listenForCredits();
   void listenForAutoRefresh();
+  void listenForVolumesChanged();
   void listenForAwake();
   void listenForVisibility();
   void listenForOpenSettings();
@@ -502,6 +503,7 @@ onBeforeUnmount(() => {
   unlistenSyntaxCheatsheet?.();
   unlistenCredits?.();
   unlistenAutoRefresh?.();
+  unlistenVolumesChanged?.();
   unlistenAwake?.();
   unlistenVisibility?.();
   unlistenOpenSettings?.();
@@ -765,6 +767,42 @@ async function listenForAutoRefresh(): Promise<void> {
     /* 【什么时候会失败】不在 Tauri 环境里（单元测试、浏览器里直接开 vite dev）。
        那时没有后端、不会有自动刷新事件 —— 不影响别的功能。 */
     console.warn("[lodestar] 监听「索引自动刷新」事件失败（不在 Tauri 环境里？）", e);
+  }
+}
+
+/* ---- 外接卷 ---- */
+
+/** 取消监听的函数 —— 卸载时调它。 */
+let unlistenVolumesChanged: UnlistenFn | null = null;
+
+/** 订阅「外接卷变化」事件 —— 插上 / 拔掉 U 盘、或卷扫完时 Rust 会发这个。
+ *
+ *  【事件名】必须是 Rust 侧 `volumes::VOLUMES_CHANGED_EVENT` 的值
+ *  `"index-volumes-changed"`。
+ *
+ *  【为什么不能靠轮询撞】
+ *    前端靠 800ms 轮询里的「scanning 从 true 翻到 false」来触发重搜，
+ *    而卷的附加 / 分离**不会**让 `scanning` 翻转 → 轮询撞不出来 →
+ *    结果表里留着已经拔掉的盘的条目（用户最不能接受的那种：盘都拔了还搜得到）。
+ *    → 必须显式发事件。
+ *
+ *  【为什么这里写【字面量】而不是常量】—— 同上面那条：
+ *  Rust 侧那道护栏（`app/src-tauri/src/event_names.rs`）断言的是
+ *  「这个事件名出现在**含 `listen` 的那一行**上」——
+ *  写成常量的话字符串只在声明处，删掉订阅护栏也不会红。
+ *
+ *  【载荷就是当前的索引状态】—— 不用再等 800ms 的轮询去撞状态翻转。 */
+async function listenForVolumesChanged(): Promise<void> {
+  try {
+    const un = await listen<IndexStatus>("index-volumes-changed", (ev) => {
+      status.value = ev.payload;
+      refreshKey.value += 1;
+    });
+    unlistenVolumesChanged = un;
+  } catch (e) {
+    /* 【什么时候会失败】不在 Tauri 环境里（单元测试、浏览器里直接开 vite dev）。
+       那时没有后端、不会有卷变化事件 —— 不影响别的功能。 */
+    console.warn("[lodestar] 监听「外接卷变化」事件失败（不在 Tauri 环境里？）", e);
   }
 }
 

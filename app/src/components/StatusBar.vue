@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { computed } from "vue";
-import type { IndexStatus, SearchResult } from "../lib/types";
+import type { IndexStatus, SearchResult, VolumeStatus } from "../lib/types";
 
 const props = defineProps<{
   result: SearchResult | null;
@@ -14,12 +14,41 @@ const hitText = computed(() => {
   if (r.warning) return r.warning;
   return `${r.total_entries} 项（文件 ${r.total_files} · 目录 ${r.total_folders}）`;
 });
+
+/** 一个卷在状态栏上怎么写。
+ *
+ *  【为什么每个阶段都要写出来】
+ *   插上 U 盘后的首扫可能要几十秒 —— 界面上什么都不显示的话，
+ *   用户会以为功能坏了（而且是**静默**地坏）。
+ */
+function volumeText(v: VolumeStatus): string {
+  switch (v.phase.state) {
+    case "Indexing":
+      return `${v.label} · 正在索引…`;
+    case "Failed":
+      return `${v.label} · 索引失败`;
+    default:
+      return `${v.label} · ${v.indexed.toLocaleString()} 项`;
+  }
+}
 </script>
 
 <template>
   <footer class="statusbar">
     <span class="sb-left">{{ hitText }}</span>
     <span class="sb-right">
+      <!-- 【外接卷】
+           用户插了 U 盘就得看得见「盘上的文件进索引了没有」——
+           首扫可能要几十秒，没有反馈的话用户会以为功能坏了。
+           `v-for` 的 key 用挂载点路径 —— 那是卷的唯一标识。 -->
+      <span
+        v-for="v in status?.volumes ?? []"
+        :key="v.path"
+        class="sb-volume"
+        :class="{ 'is-failed': v.phase.state === 'Failed' }"
+        :title="v.path"
+        >{{ volumeText(v) }}</span
+      >
       <span v-if="status?.scanning">正在扫描索引…</span>
       <span v-else-if="status">已索引 {{ status.indexed }} 项</span>
       <!-- 【索引出错的原因必须显示出来】

@@ -53,6 +53,32 @@ export interface IndexStatus {
    *    `IndexState::snapshot()` 里那个占位 `true` 是同一个取舍。
    */
   visible?: boolean;
+  /** 当前插着的**外接卷**及各自的状态。
+   *
+   *  【为什么是可选的】和 `visible` 一样：**填不出来的调用点一律给空列表** ——
+   *  缺省 = 「没有卷」= 状态栏不显示卷那一行（**不是故障**）。
+   */
+  volumes?: VolumeStatus[];
+}
+
+/** 一个外接卷的状态。
+ *
+ *  【与 Rust 侧一一对应】`volumes::VolumeStatus`；
+ *  `phase` 的形状来自 Rust 侧的
+ *  `#[serde(tag = "state", content = "detail")]`（`VolumePhase`）。
+ */
+export interface VolumeStatus {
+  /** 挂载点路径（如 `/Volumes/U盘`）。 */
+  path: string;
+  /** 卷名。 */
+  label: string;
+  /** 处在哪一步。 */
+  phase:
+    | { state: "Indexing" }
+    | { state: "Ready" }
+    | { state: "Failed"; detail: string };
+  /** 已经索引进去多少条。 */
+  indexed: number;
 }
 
 /** 书签的两种类型：
