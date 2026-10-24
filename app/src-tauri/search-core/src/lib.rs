@@ -14,7 +14,7 @@
 //!
 //! 【数据流】
 //! ```text
-//!   磁盘 ──scan──► IndexEntry[] ──store──► index.bin（下次启动直接读档）
+//!   磁盘 ──scan──► IndexEntry[] ──store──► 每根一个档（下次启动直接读档）
 //!                      │
 //!                      ├──fold（索引期折叠一次）──► folded_name / folded_path
 //!                      │

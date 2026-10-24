@@ -38,20 +38,22 @@ fn request(query: &str) -> SearchRequest {
 fn main() {
     let home = std::env::var("HOME").unwrap_or_else(|_| "/".into());
     let home_path = PathBuf::from(&home);
-    let store = PathBuf::from(&home)
-        .join("Library/Application Support/com.lodestar.macos/index.bin");
+    // 【为什么是「目录」】索引档现在是 **v3：每根一个文件**
+    //   （app config 目录的 `index/` 里，每个根一份）——
+    //   → 这里量的是**应用真正在用的那份档**，不是某个已经不存在的单文件。
+    let store_dir = PathBuf::from(&home).join("Library/Application Support/com.lodestar.macos/index");
 
     println!("=== 1. 读档（冷启动的关键）===");
-    if !store.exists() {
-        println!("  （还没有索引档：{store:?}）");
+    if !store_dir.exists() {
+        println!("  （还没有索引档：{store_dir:?}）");
     } else {
         // 读三遍取最小 —— 第一次可能受磁盘缓存影响
         let mut best = f64::MAX;
         let mut count = 0;
         for _ in 0..3 {
             let t = Instant::now();
-            match search_core::store::load(&store) {
-                Some((entries, _)) => {
+            match search_core::store::load_root(&store_dir, &home_path) {
+                Some(entries) => {
                     let d = ms_since(t);
                     if d < best {
                         best = d;
@@ -105,7 +107,7 @@ fn main() {
     println!("\n=== 4. 索引内存 ====");
     let mem = std::process::Command::new("/usr/bin/du")
         .arg("-h")
-        .arg(&store)
+        .arg(&store_dir)
         .output()
         .ok()
         .and_then(|o| String::from_utf8(o.stdout).ok())
@@ -117,12 +119,15 @@ fn main() {
     // 【为什么要单独量】落盘是「把内存里的索引写成文件」。
     //   增量更新若要**顺手**落盘，这个耗时就在增量更新的关键路径上 ——
     //   量清楚才知道能不能放在同步路径里。
-    let probe_store = std::env::temp_dir().join("sextant-bench-persist.bin");
+    //
+    // 【为什么是「目录」】v3 的档是**每根一个文件** → 探针目录也照这个布局来。
+    let probe_dir = std::env::temp_dir().join("sextant-bench-persist");
+    let _ = std::fs::remove_dir_all(&probe_dir);
     let entries = engine.all_entries();
     let mut best = f64::MAX;
     for _ in 0..3 {
         let t = Instant::now();
-        if let Err(e) = search_core::store::save(&entries, &[home_path.clone()], &probe_store) {
+        if let Err(e) = search_core::store::save_root(&probe_dir, &home_path, &entries) {
             println!("  ✗ 落盘失败：{e}");
             return;
         }
@@ -137,8 +142,8 @@ fn main() {
     let mut best_load = f64::MAX;
     for _ in 0..3 {
         let t = Instant::now();
-        match search_core::store::load(&probe_store) {
-            Some((e, _)) => {
+        match search_core::store::load_root(&probe_dir, &home_path) {
+            Some(e) => {
                 let d = ms_since(t);
                 if d < best_load {
                     best_load = d;
@@ -161,7 +166,7 @@ fn main() {
     let mut best_ser = f64::MAX;
     for _ in 0..3 {
         let t = Instant::now();
-        let buf = search_core::store::serialize(&entries, &[home_path.clone()]);
+        let buf = search_core::store::serialize_root(&home_path, &entries);
         let d = ms_since(t);
         if d < best_ser {
             best_ser = d;
@@ -171,12 +176,13 @@ fn main() {
     println!("  其中 序列化（纯 CPU）：{best_ser:.1} ms");
 
     // 写盘那一段：fsync 与不 fsync 的差别
-    let buf = search_core::store::serialize(&entries, &[home_path.clone()]);
+    let buf = search_core::store::serialize_root(&home_path, &entries);
+    let probe_path = search_core::store::root_archive_path(&probe_dir, &home_path);
     for sync in [true, false] {
         let mut best_w = f64::MAX;
         for _ in 0..3 {
             let t = Instant::now();
-            search_core::store::save_bytes(&buf, &probe_store, sync).unwrap();
+            search_core::store::save_bytes(&buf, &probe_path, sync).unwrap();
             let d = ms_since(t);
             if d < best_w {
                 best_w = d;
@@ -199,7 +205,7 @@ fn main() {
     }
     println!("  其中 拷一份条目（落盘线程要用的）：{best_copy:.1} ms");
 
-    let _ = std::fs::remove_file(&probe_store);
+    let _ = std::fs::remove_dir_all(&probe_dir);
 
     // ─────────────────────────────────────────────────────────────
     // 6. 增量更新（M3）—— 「改文件 → 索引跟上」到底要多久

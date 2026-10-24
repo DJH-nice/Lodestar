@@ -10,7 +10,7 @@
 
 use std::cell::RefCell;
 use std::cmp::Ordering;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
@@ -114,39 +114,22 @@ impl Engine {
     ) -> Result<(Engine, u32), EngineError> {
         let roots = validate_paths(paths)?;
         let mut all: Vec<IndexEntry> = Vec::new();
-        // 【为什么要按路径去重】
-        //   两个根**互相嵌套**时（$HOME 与 $HOME/Documents —— 设置面板的文件夹
-        //   选择器允许这么配），同一条路径会落进**两个**档：外层根的档里已经
-        //   包含了内层根的文件 → 读两份 = 同一批文件进索引两次。
-        //   而「每根一个档」的布局会把它**放大**：每冷启动一次就多一份
-        //   （实测 6 → 10 → 16 条，越滚越大）。
-        //   → 读档时按路径去重：**一条路径只进索引一次**。
-        //   （根之间**不嵌套**时压根不会重复 → 那个开关让我们跳过这次哈希。）
-        let nested = roots_are_nested(&roots);
-        let mut seen: HashSet<Box<str>> = HashSet::new();
         for root in &roots {
             // 每个根各读各的档 —— 有档就秒开，没档就扫这一个根。
             let entries = match &store_dir {
                 Some(dir) => match store::load_root(dir, root) {
                     Some(e) => e,
                     None => {
-                        let e = scan::scan(&[root.clone()])?;
-                        // 写档失败不致命（下次冷启动慢一点而已）
-                        if let Err(e) = store::save_root(dir, root, &e) {
-                            eprintln!("[lodestar] 索引档写入失败（不影响使用）: {e}");
-                        }
-                        e
+                        // 【为什么不在这儿写档】末尾的 `persist()` 会把**所有**根的档
+                        //   写一遍 —— 在这儿再写一遍就是**同一个根写两次**
+                        //   （$HOME 量级多写一次 3.4MB ≈ 10ms，纯浪费）。
+                        //   → 这里只扫，末尾统一落盘。
+                        scan::scan(&[root.clone()])?
                     }
                 },
                 None => scan::scan(&[root.clone()])?,
             };
-            for e in entries {
-                if nested && !seen.insert(e.path.clone().into_boxed_str()) {
-                    // 另一个根的档里已经收过这条路径了 → 只留一份
-                    continue;
-                }
-                all.push(e);
-            }
+            all.extend(entries);
         }
         let count = all.len() as u32;
         let by_path = build_by_path(&all);
@@ -174,15 +157,21 @@ impl Engine {
         //   现在这一版先保证「刷新后内容一定是最新的」——
         //   用户点「刷新」就该看到磁盘现在的样子。
         let roots = self.roots.borrow();
-        let nested = roots_are_nested(&roots);
-        let mut entries = scan::scan(roots.as_slice())?;
-        drop(roots);
-        // 【为什么重扫也要去重】根嵌套时扫描会把同一批文件收两遍 →
-        //   不去重的话「刷新后」的条目数会比「冷启动读档」的多
-        //   （一个 6、一个 4）→ 用户点一下刷新，条目数就变了。
-        if nested {
-            entries = dedupe_by_path(entries);
+        if roots.is_empty() {
+            // 【为什么根被摘光时返回空索引，而不是报错】
+            //   根被摘光是一个**合法状态**（用户把索引目录全删了 / 外接卷全拔了）
+            //   → 索引就该是空的。`scan::scan(&[])` 报的是 InvalidArg，
+            //   那是「参数非法」，不是这里的情况 → 不能把错误传给上层。
+            drop(roots);
+            *self.entries.borrow_mut() = Vec::new();
+            *self.by_path.borrow_mut() = HashMap::new();
+            // 视图描述的是旧索引 → 必须作废
+            *self.view.borrow_mut() = None;
+            // 【档不动】根被摘掉时它那份档原地留着 —— 插回来时要复用
+            return Ok(0);
         }
+        let entries = scan::scan(roots.as_slice())?;
+        drop(roots);
         let count = entries.len() as u32;
         *self.by_path.borrow_mut() = build_by_path(&entries);
         *self.entries.borrow_mut() = entries;
@@ -218,6 +207,28 @@ impl Engine {
     ///   M3 的增量更新靠 `by_path` O(1) 定位「这条路径在索引里的哪」。
     ///   挂了新条目却没登记 → 增量更新认不出它 → 索引悄悄过期。
     pub fn attach_root(&self, root: &Path, entries: Vec<IndexEntry>) -> u32 {
+        // 【为什么不许与已有的根重叠】见 [`drop_nested_roots`] 的四条坑 ——
+        //   运行期附加的根（外接卷）也要守**同一条**规则，
+        //   否则「建引擎时守住了、附加时没守住」→ 坑照样会踩。
+        //
+        // ⚠️ **同一个根重复附加不算「重叠」** —— 那是「替换」（幂等），
+        //   外接卷重新扫描时要靠它把旧条目换成新的。
+        let clash = {
+            let roots = self.roots.borrow();
+            roots
+                .iter()
+                .find(|r| {
+                    let r = r.as_path();
+                    r != root && (root.starts_with(r) || r.starts_with(root))
+                })
+                .cloned()
+        };
+        if let Some(other) = clash {
+            eprintln!("[lodestar] 根 {root:?} 与已有的根 {other:?} 重叠 → 不附加");
+            // 什么都没变 → 返回**当前**的条目数
+            return self.entries.borrow().len() as u32;
+        }
+
         // 先摘旧的（幂等）
         self.detach_root(root);
 
@@ -250,19 +261,30 @@ impl Engine {
     pub fn detach_root(&self, root: &Path) -> u32 {
         let mut all = self.entries.borrow_mut();
         // 【组件级前缀】字符串前缀会让 `/a/bc` 被 `/a/b` 命中 → 漏索引
-        all.retain(|e| !Path::new(&e.path).starts_with(root));
+        all.retain(|e| !path_in_root(Path::new(&e.path), root));
         *self.by_path.borrow_mut() = build_by_path(&all);
         let count = all.len() as u32;
         drop(all);
 
+        // 【为什么要按「包含」摘根，而不是按「相等」】
+        //   条目是按**包含**删的（整个子树都没了）→ 落在那个子树里的**根**
+        //   也必须一起从根列表里摘掉 —— 否则它会留在列表里、被算出一个
+        //   **空 part** → 用空档**覆盖掉它那份好档** → 下次冷启动它的索引被永久抹掉。
+        //   （口径必须与删条目的那一句一致 —— 同一份真相，见 [`path_in_root`]。）
+        //
         // roots 与 real_roots 一一对应 → 按**同一个下标**删
         {
             let mut roots = self.roots.borrow_mut();
             let mut real_roots = self.real_roots.borrow_mut();
-            if let Some(pos) = roots.iter().position(|r| r == root) {
-                roots.remove(pos);
-                if pos < real_roots.len() {
-                    real_roots.remove(pos);
+            // 从后往前删 → 删掉之后前面的下标不受影响
+            let mut pos = roots.len();
+            while pos > 0 {
+                pos -= 1;
+                if path_in_root(&roots[pos], root) {
+                    roots.remove(pos);
+                    if pos < real_roots.len() {
+                        real_roots.remove(pos);
+                    }
                 }
             }
         }
@@ -533,13 +555,18 @@ impl Engine {
 
     /// 把索引按根切成「每根一份字节流」。
     ///
+    /// 【这个函数返回的是「所有根」的快照】
+    ///   引擎**不知道**哪个根变了 → 「只重写变了的根」是 **worker 侧**的职责
+    ///   （worker 拿着旧快照对比，见 `worker.rs` 的落盘槽）。
+    ///   → 调用方（worker）自己决定写哪些档。
+    ///
+    /// 【为什么要按根切】每根一个档 → 插拔一个外接卷**只作废它自己那份**，
+    ///   $HOME 的档**不受影响**（这一条是**读档侧**真的成立的，见 `store.rs` 的 v3 说明）。
+    ///
     /// 【为什么要「序列化」而不是「给一份条目拷贝」】
     ///   条目拷贝要给 8,537 × 6 个 String 各分配一次（实测 **2.0ms**），
     ///   而序列化只是拼字节（实测约 **1ms**）—— 而且序列化本来就是
     ///   落盘必须做的那一步，不做就白做一遍。
-    ///
-    /// 【为什么按根切】每根一个档 → 拔掉一个卷只影响它自己那份，
-    ///   \$HOME 那份**不用重写**（省掉几 MB 的写盘）。
     ///
     /// 【为什么放在后台线程】写盘那一段实测 **9.6ms**
     ///   （新建 inode 的 fsync 很贵）—— 放在关键路径上会毁掉增量更新的
@@ -557,7 +584,7 @@ impl Engine {
                 let part: Vec<IndexEntry> = entries
                     .iter()
                     // 【组件级前缀】字符串前缀会让 `/a/bc` 被 `/a/b` 命中 → 漏索引
-                    .filter(|e| Path::new(&e.path).starts_with(root))
+                    .filter(|e| path_in_root(Path::new(&e.path), root))
                     .cloned()
                     .collect();
                 (store::root_archive_path(dir, root), store::serialize_root(root, &part))
@@ -620,38 +647,6 @@ fn resolve_real_roots(roots: &[PathBuf]) -> Vec<PathBuf> {
         .collect()
 }
 
-/// 这些根之间有没有**互相嵌套**的（`$HOME` 与 `$HOME/Documents` 这种）。
-///
-/// 【为什么关心它】
-///   嵌套时同一条路径会被**收两遍**（外层根的档里已经包含了内层根的文件）
-///   → 索引里出现重复条目。见 [`dedupe_by_path`]。
-fn roots_are_nested(roots: &[PathBuf]) -> bool {
-    roots.iter().enumerate().any(|(i, r)| {
-        roots
-            .iter()
-            .enumerate()
-            .any(|(j, o)| i != j && r.starts_with(o))
-    })
-}
-
-/// 按路径去重（**保留第一条**）。
-///
-/// 【为什么需要它】
-///   两个根嵌套时，同一条路径会被收进**两个**档（外层根的档里已经包含了
-///   内层根的文件）→ 读档时索引里出现**两份**，而且「每根一个档」的布局
-///   会让它**每冷启动一次就多一份**（实测 6 → 10 → 16 条，越滚越大）。
-///   → **一条路径只进索引一次**（这也是 `by_path` 能当唯一真相的前提）。
-fn dedupe_by_path(entries: Vec<IndexEntry>) -> Vec<IndexEntry> {
-    let mut seen: HashSet<Box<str>> = HashSet::with_capacity(entries.len());
-    let mut out = Vec::with_capacity(entries.len());
-    for e in entries {
-        if seen.insert(e.path.clone().into_boxed_str()) {
-            out.push(e);
-        }
-    }
-    out
-}
-
 /// 校验索引根目录。
 ///
 /// 【为什么必须校验绝对路径】
@@ -663,8 +658,10 @@ fn dedupe_by_path(entries: Vec<IndexEntry>) -> Vec<IndexEntry> {
 ///   但**外接卷会拔掉** —— 枚举到卷的那一刻它还在，几毫秒后就没了。
 ///   那时若因为它建不起引擎 → **整个应用没有索引**。
 ///   → 改成：跳过不存在的；**一个都不剩**才报错（那才是真的配错了）。
+///
+/// 【为什么还要丢掉「被别的根包住」的根】见 [`drop_nested_roots`]。
 fn validate_paths(paths: &[&Path]) -> Result<Vec<PathBuf>, EngineError> {
-    let mut out = Vec::with_capacity(paths.len());
+    let mut candidates: Vec<PathBuf> = Vec::with_capacity(paths.len());
     for p in paths {
         if !p.is_absolute() {
             return Err(EngineError::InvalidArg);
@@ -673,12 +670,68 @@ fn validate_paths(paths: &[&Path]) -> Result<Vec<PathBuf>, EngineError> {
         if !p.is_dir() {
             continue;
         }
-        out.push(p.to_path_buf());
+        candidates.push(p.to_path_buf());
     }
-    if out.is_empty() {
+    if candidates.is_empty() {
         return Err(EngineError::InvalidArg);
     }
-    Ok(out)
+    // 【根之间不许嵌套】—— 一个不变式，消掉四个坑（见 drop_nested_roots）。
+    let roots = drop_nested_roots(candidates);
+    if roots.is_empty() {
+        return Err(EngineError::InvalidArg);
+    }
+    Ok(roots)
+}
+
+/// 丢掉**被别的根包含**的根（`$HOME` 与 `$HOME/Documents` 里的后者）。
+///
+/// 【为什么必须丢掉，而不是报错】
+///   用户可能误配（先加了 `$HOME`，后来又加了 `$HOME/Documents`）。
+///   报错 = 整个应用没有索引 → 那是最糟的结果。
+///   丢掉内层根 → **内容不丢**（那些文件仍在 `$HOME` 里）→
+///   只是不再单独索引一遍。
+///
+/// 【为什么根之间不能嵌套】一旦嵌套，会同时踩四个坑：
+///   1. 摘掉外层根 → 按路径前缀删条目 → 内层根的条目被**连带**删掉；
+///   2. 摘掉外层根 → 内层根还留在根列表里 → 它的档被算出**空 part**
+///      → 用空档**覆盖掉它那份好档** → 下次冷启动它的索引被永久抹掉；
+///   3. 扫描时同一个文件的 `depth` 会随「扫一个根」还是「扫所有根」而变
+///      （1 vs 2）→ `depth:` / `parents:` 是真实查询字段 →
+///      **点一次刷新，前后结果就不一样**；
+///   4. 同一条路径在索引里出现两次 → 搜索结果里同一个文件显示两遍。
+///   → 一个不变式（**根之间不嵌套**）把这四个坑一起消掉。
+///
+/// 【为什么不能边加边判】
+///   先收进来的那个根，可能被**后收进来的**那个包住
+///   → 必须**先收集全部候选根，再两两判断**。
+fn drop_nested_roots(candidates: Vec<PathBuf>) -> Vec<PathBuf> {
+    let mut kept: Vec<PathBuf> = Vec::with_capacity(candidates.len());
+    for (i, cand) in candidates.iter().enumerate() {
+        // 被**别的**候选根包住 → 丢弃。
+        // （`j != i`：同一个路径配两次 → 第二个也在这里被丢掉 ✓）
+        let outer = candidates
+            .iter()
+            .enumerate()
+            .find(|(j, other)| *j != i && cand.starts_with(other))
+            .map(|(_, other)| other);
+        match outer {
+            Some(outer) => eprintln!(
+                "[lodestar] 索引根 {cand:?} 已被 {outer:?} 包含 → 忽略它（那些文件仍在 {outer:?} 里）"
+            ),
+            None => kept.push(cand.clone()),
+        }
+    }
+    kept
+}
+
+/// 这条路径**是不是**在这个根底下（**组件级**）。
+///
+/// 【为什么不能用字符串前缀】`/a/bc` 会被 `/a/b` 命中 → 漏索引。
+///
+/// 【为什么是「一份真相」】归属判定有两处要用（摘根时删条目、切档时挑条目），
+///   两处口径不一致的话，摘根会**连带删掉别的根的条目**（见 [`Engine::detach_root`]）。
+fn path_in_root(path: &Path, root: &Path) -> bool {
+    path.starts_with(root)
 }
 
 /// 排序比较器（**全序** —— 任意两个不同条目都不相等）。
@@ -788,8 +841,13 @@ mod tests {
     use super::*;
     use std::path::PathBuf;
 
+    /// 临时目录/档目录的名字要带的序号。
+    ///
+    /// 【为什么不能只用 pid】同一个测试二进制**并发**跑两次会拿到同一个 pid
+    ///   → 临时目录撞车 → 互相删对方的目录 → 测试结果随机。
+    static SEQ: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
     fn fixture() -> PathBuf {
-        static SEQ: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
         let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         let dir = std::env::temp_dir().join(format!("lodestar-engine-{}-{}", std::process::id(), seq));
         let _ = std::fs::remove_dir_all(&dir);
@@ -1037,47 +1095,78 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// 第二次启动必须是**读档**，不是「又扫了一遍」。
+    ///
+    /// 【为什么不能只断言「条目数相等」】
+    ///   重扫出来的东西一样多 → 只比数字的话，「读档」与「重扫」分不开
+    ///   （档读不出来时会静默退回扫描，测试照样绿）。
+    ///   → 第一次落档后**往树里加一个文件**：重扫会多出一条，读档不会。
     #[test]
-    fn store_makes_the_second_start_instant() {
+    fn the_second_start_reads_the_archive_instead_of_rescanning() {
         let dir = fixture();
-        let store_path = std::env::temp_dir().join(format!(
-            "lodestar-engine-store-{}.bin",
-            std::process::id()
+        let store_dir = std::env::temp_dir().join(format!(
+            "lodestar-engine-store-{}-{}",
+            std::process::id(),
+            SEQ.fetch_add(1, std::sync::atomic::Ordering::SeqCst)
         ));
-        let _ = std::fs::remove_file(&store_path);
+        let _ = std::fs::remove_dir_all(&store_dir);
 
         let (engine, n1) =
-            Engine::new_with_store(&[dir.as_path()], Some(store_path.clone())).unwrap();
+            Engine::new_with_store(&[dir.as_path()], Some(store_dir.clone())).unwrap();
         assert!(n1 >= 4);
         drop(engine);
 
-        // 第二次：应该读档而不是扫描
+        // 树变了 → 「重扫」会多出一条，「读档」不会
+        std::fs::write(dir.join("gamma.txt"), "new").unwrap();
+
         let (engine2, n2) =
-            Engine::new_with_store(&[dir.as_path()], Some(store_path.clone())).unwrap();
-        assert_eq!(n1, n2);
+            Engine::new_with_store(&[dir.as_path()], Some(store_dir.clone())).unwrap();
+        assert_eq!(
+            n1, n2,
+            "第二次必须是读档 —— 树已经变了，重扫会多出一条"
+        );
         let res = engine2.search(&request("*", 0, 10)).unwrap();
         assert!(res.total_entries >= 4);
 
-        let _ = std::fs::remove_file(&store_path);
+        let _ = std::fs::remove_dir_all(&store_dir);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// **每个根各有一份档** —— 换根不会作废别的根的档（v3 的核心语义）。
+    ///
+    /// 【为什么要有这条】v2 是「一份档装所有根」，换根 → 整份档作废 → 全量重扫。
+    ///   v3 拆成「每根一个档」之后，$HOME 的档与卷的档**互不影响**。
     #[test]
-    fn store_with_different_roots_is_ignored() {
+    fn each_root_keeps_its_own_archive() {
         let dir_a = fixture();
         let dir_b = fixture();
-        let store_path = std::env::temp_dir().join(format!(
-            "lodestar-engine-store2-{}.bin",
-            std::process::id()
+        let store_dir = std::env::temp_dir().join(format!(
+            "lodestar-engine-store2-{}-{}",
+            std::process::id(),
+            SEQ.fetch_add(1, std::sync::atomic::Ordering::SeqCst)
         ));
-        let _ = std::fs::remove_file(&store_path);
-        let (engine, _) = Engine::new_with_store(&[dir_a.as_path()], Some(store_path.clone())).unwrap();
+        let _ = std::fs::remove_dir_all(&store_dir);
+
+        let (engine, n_a) =
+            Engine::new_with_store(&[dir_a.as_path()], Some(store_dir.clone())).unwrap();
         drop(engine);
-        // 换根目录 → 存档不匹配 → 必须重新扫
-        let (engine2, _) = Engine::new_with_store(&[dir_b.as_path()], Some(store_path.clone())).unwrap();
-        let res = engine2.search(&request("*", 0, 10)).unwrap();
-        assert!(res.total_entries >= 4);
-        let _ = std::fs::remove_file(&store_path);
+
+        // 换根 → B 没有档 → 扫 B；**A 的档不受影响**
+        let (engine2, n_b) =
+            Engine::new_with_store(&[dir_b.as_path()], Some(store_dir.clone())).unwrap();
+        assert!(n_b >= 4);
+        assert!(engine2.search(&request("*", 0, 10)).unwrap().total_entries >= 4);
+
+        // 再单独读 A → 条目数与第一次一样（**A 的档没被 B 作废**）
+        let (_engine3, n_a2) =
+            Engine::new_with_store(&[dir_a.as_path()], Some(store_dir.clone())).unwrap();
+        assert_eq!(n_a, n_a2, "换根不该作废别的根的档");
+
+        // 档目录里应该有两个档（每根一个）
+        let files = std::fs::read_dir(&store_dir).unwrap().count();
+        assert_eq!(files, 2, "每个根一份档");
+
+        let _ = std::fs::remove_dir_all(&store_dir);
         let _ = std::fs::remove_dir_all(&dir_a);
         let _ = std::fs::remove_dir_all(&dir_b);
     }

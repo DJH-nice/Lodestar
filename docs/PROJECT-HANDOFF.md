@@ -115,7 +115,7 @@ lodestar/                          ← 新仓库（git 已初始化，1 次提�
 | 引擎 | **纯 Rust 自研**（`search-core` crate） | 不依赖 Tauri，可 `cargo test -p search-core` 单独测 |
 | 依赖 | `regex` / `unicode-normalization` / `libc` / `notify 8.2.0` / `serde` | **没有 ICU、没有 GLib、没有 Pango、没有 PCRE2** |
 | 监控 | `notify 8.2.0`（底层 FSEvents） | 已有 |
-| 存储 | 自定义二进制索引档 `index.bin` | app config 目录里 |
+| 存储 | 自定义二进制索引档（**每根一个文件**，v3 格式） | app config 目录的 `index/` 里 |
 | 打包 | `bash app/scripts/bundle-app.sh` | **唯一入口** |
 | 环境 | Rust 1.98.1 aarch64 / Node 22.14.0 / pnpm 9.15.9 / Xcode 完整版 | |
 

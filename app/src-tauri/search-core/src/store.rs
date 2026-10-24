@@ -33,8 +33,10 @@ const MAGIC: &[u8; 4] = b"SXTX";
 /// 【v2】加了「子文件数 / 子目录数」两个字段（`childfilecount:` /
 ///   `childfoldercount:` 需要它们）。老档直接作废 → 重扫一次。
 ///
-/// 【为什么 v2 还在】`engine.rs` / `worker.rs` 仍在用 v2 的
-///   `serialize` / `save` / `load` —— 等调用方切到 v3 之后才删。
+/// 【为什么 v2 还在】`engine.rs` / `worker.rs` **都已经切到 v3 了** ——
+///   现在只剩 `store.rs` 自己的测试还在用 v2 的 `serialize` / `save` / `load`。
+///   它们是 **pub** API（不会触发 dead_code 警告）——
+///   等 Task 3 把它们连同那几个测试一起删掉。
 const VERSION_V2: u32 = 2;
 
 /// 格式版本 —— **v3**：**每根一个档**。
