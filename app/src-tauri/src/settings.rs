@@ -402,6 +402,21 @@ pub fn effective_index_paths(settings: &Settings) -> Vec<PathBuf> {
         .collect()
 }
 
+/// 索引档（store）目录 —— **唯一真相**。
+///
+/// 【为什么要抽出来】
+///   两个地方要用**同一个**目录：
+///   - 建引擎时**写**档（[`build_engine`]）
+///   - 卷附加时**读**档（`volumes::scan_volume` —— 插回来的盘要秒开）
+///   两处各写一遍 `app_config_dir().join("index")` → 改了一处忘了另一处 →
+///   卷永远命不中旧档 → 每次插上都要全量重扫（几十万文件 → 几十秒）。
+pub fn index_store_dir<R: Runtime>(app: &AppHandle<R>) -> Option<PathBuf> {
+    app.path()
+        .app_config_dir()
+        .ok()
+        .map(|dir| dir.join("index"))
+}
+
 /// 建引擎（**不碰全局状态**）—— 返回 (Searcher, indexed, 引擎实际的根)。
 ///
 /// 【参数是【已解析】的路径】空 → `$HOME` 的回退由调用方做
@@ -426,11 +441,7 @@ fn build_engine<R: Runtime>(
     // 索引档现在是「**每根一个文件**」的目录（见 search-core/src/store.rs 的 v3 格式）。
     // ⚠️ 不能叫 index.bin —— 磁盘上那个 3.4MB 的旧 v2 档还占着这个名字，
     // 建目录会失败 → 档永远写不进去 → 每次冷启动都静默地全量重扫。
-    let store_dir = app
-        .path()
-        .app_config_dir()
-        .ok()
-        .map(|dir| dir.join("index"));
+    let store_dir = index_store_dir(app);
     let (engine, indexed) =
         search_core::Engine::new_with_store(&refs, store_dir).map_err(|e| e.to_string())?;
     // 【为什么报「引擎实际的根」，而不是请求的那份】
@@ -480,7 +491,20 @@ pub fn rebuild_engine<R: Runtime>(
     app: &AppHandle<R>,
     paths: &[String],
 ) -> Result<u32, String> {
-    let resolved = effective_paths(paths);
+    let mut resolved = effective_paths(paths);
+    // 【已挂载的卷要一起带上】换索引目录不该把 U 盘踢出索引 ——
+    //   卷是**运行期**挂上来的（不在用户的设置里）→ 重建引擎时忘了带上
+    //   → 新引擎里根本没有它 → 它的条目全没了（用户：换完目录 U 盘就搜不到了）。
+    // 【枚举失败就不要乱改根列表】拿不到清单时保持原样 ——
+    //   宁可少索引一个卷，也不能把用户正在用的根踢掉。
+    if let Ok(list) = crate::volumes::mounted_local_volumes() {
+        for v in list {
+            let s = v.to_string_lossy().into_owned();
+            if !resolved.contains(&s) {
+                resolved.push(s);
+            }
+        }
+    }
     let (searcher, indexed, actual_roots) = build_engine(app, &resolved)?;
     let new_searcher = std::sync::Arc::new(searcher);
     let state = app.state::<std::sync::Mutex<Option<std::sync::Arc<search_core::Searcher>>>>();

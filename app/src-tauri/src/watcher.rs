@@ -1358,6 +1358,9 @@ fn notify_frontend<R: Runtime>(app: &AppHandle<R>) {
     // 【窗口可见性也要是真值】—— 前端拿这个载荷决定要不要继续跑那个 800ms 轮询，
     //   所以不能留 `snapshot()` 给的占位值。
     snapshot.visible = crate::lifecycle::window_visible(&app);
+    // 【卷的状态也要是真值】—— snapshot() 给的是空列表（它不知道卷的事）。
+    //   前端拿这个载荷更新状态栏 → 空列表 = 「没有卷」= 卷那一行会消失。
+    snapshot.volumes = crate::volumes::volume_statuses(&app);
     if let Err(e) = app.emit(AUTO_REFRESH_EVENT, snapshot) {
         // 【更新本身是成功的】—— 只是事件发不出去（运行时已经停了）。
         eprintln!("[lodestar] 自动更新完成，但通知前端失败: {e}");

@@ -30,12 +30,10 @@ mod settings;
 mod shortcut;
 // （`tray` 同上 —— 见上面那段「为什么 `lifecycle` 与 `tray` 都是私有 `mod`」。）
 mod tray;
-// 【为什么 `volumes` 现在是 `pub mod`】
-//   Task 4 只落「枚举卷」这一半 —— 真正的调用点在 Task 5（卷监控）才接上。
-//   私有 `mod` 里的 `pub` 项会被 `dead_code` 判死（见上面那段说明），
-//   Task 5 还没做 → 先用 `pub mod` 顶住告警，
-//   **Task 5 接上调用点后要改回私有 `mod`**（跟 `lifecycle` / `tray` 一样）。
-pub mod volumes;
+// （`volumes` 同上 —— Task 5 把「枚举卷」与「监控卷」接上了，
+//   调用点现在都在 crate 内（`setup()` 起监控线程、`settings::rebuild_engine`
+//   带上已挂载的卷）→ 改回私有 `mod`，让 `dead_code` 护栏重新生效。）
+mod volumes;
 mod watcher;
 
 use std::sync::{Arc, Mutex};
@@ -354,6 +352,9 @@ pub fn run() {
         .manage(Mutex::new(Option::<Arc<Searcher>>::None))
         .manage(IndexState::new())
         .manage(Lifecycle::new())
+        // 【卷状态】—— 「哪些外接卷插着、扫到哪一步了」。
+        //   与 `IndexState` 分开放（见 `volumes::VolumeState` 的说明）。
+        .manage(volumes::VolumeState::default())
         .setup(|app| {
             // 【设置迁移 —— 必须是 setup 的第一件事】
             //   产品名从 FSearch 改成 Lodestar → `identifier` 跟着变 →
@@ -394,6 +395,13 @@ pub fn run() {
             //   「监听哪些目录」由 watcher 自己每 1 秒**对账**一次决定
             //   （读 IndexState::paths()，见 watcher.rs），换目录它自己会跟上。
             watcher::spawn_watcher(app.handle());
+            // 外接卷监控（插上 U 盘就把它加进索引）。
+            //
+            // 【为什么可以在这里起】它只依赖 `VolumeState` 与引擎槽位 ——
+            //   两者这时都已经 manage 好了。
+            // 【启动时引擎还没建好也没关系】监控线程第一轮会看到
+            //   「引擎还没装好」→ 这一轮不接手 → 下一秒再试（见 `volumes::attach_volume`）。
+            volumes::spawn_volume_monitor(app.handle().clone());
             // 【空闲看门狗】—— 每秒重新判定「你是不是不用我了」。
             // 必须在 Lifecycle 被 manage 之后启动（它要读那个状态）。
             lifecycle::spawn_idle_watchdog(app.handle().clone());

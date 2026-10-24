@@ -353,6 +353,11 @@ impl IndexState {
             //   猜「可见」→ 只是多跑一点轮询（性能问题）。
             //   → 宁可性能出问题，也不要功能出问题。
             visible: true,
+            // 【占位值】`IndexState` 不知道卷的事（那是 `VolumeState` 的职责）
+            //   → 这里给空列表，由**每一个发给前端的调用点**覆盖成真值：
+            //   `commands::index_status` / `rescan` / `reindex`、
+            //   `watcher::auto_rescan`、`volumes::notify_frontend`。
+            volumes: Vec::new(),
         }
     }
 

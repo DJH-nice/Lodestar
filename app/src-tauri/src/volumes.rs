@@ -19,7 +19,11 @@
 //!   → 失败走 `Err`（带上 errno）+ 一条 warn 日志；
 //!     调用方**这一轮什么都不做**。
 
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
+use tauri::{AppHandle, Manager, Runtime};
 
 /// 挂载点的标志位：本地磁盘（网络盘 smbfs/nfs **没有**这个位）。
 ///
@@ -177,6 +181,381 @@ pub fn filter_local_volumes(mounts: &[(PathBuf, u32)]) -> Vec<PathBuf> {
     out
 }
 
+// ============================================================
+// 监控与编排 —— 「插上 U 盘就能搜到里面的文件」
+// ============================================================
+
+/// 每隔多久枚举一次挂载点。
+///
+/// 【为什么是 1 秒】`getfsstat` 的开销在几十微秒量级（见设计文档 §4）；
+///   1 秒的延迟对「插上盘」这个动作来说完全可以接受
+///   （人插完盘总还要点一下搜索框）。
+const POLL_INTERVAL: Duration = Duration::from_secs(1);
+
+/// 「外接卷变化了」事件 —— 载荷是 `IndexStatus`。
+///
+/// 【为什么需要它】
+///   前端靠 800ms 轮询里的「scanning 从 true 翻到 false」触发重搜。
+///   卷的附加/分离**不会**让 `scanning` 翻转 → 轮询撞不出来 →
+///   结果表里留着已经拔掉的盘的条目（用户最不能接受的那种：盘都拔了还搜得到）。
+///   → 必须显式发事件。
+///
+/// 【⚠️ 交接给 Task 6（前端那一半）】
+///   本常量**还没有**进 `event_names::EVENT_NAMES` —— 那道护栏要求
+///   「前端必须真的在听」，而前端的 `listen` 是 Task 6 的活。
+///   → Task 6 要做两件事：
+///     ① 把本常量加进 `event_names::EVENT_NAMES`，并把那里的数量断言 7 改成 8；
+///     ② 在 `app/src/App.vue` 里加一行 `listen("index-volumes-changed", …)`
+///        （**必须是字面量** —— 那道护栏断言的是「事件名出现在含 listen 的那一行上」）。
+///   → 在那之前，这个事件**发了没人听**：结果表要等 Task 6 落地才自动刷新。
+pub const VOLUMES_CHANGED_EVENT: &str = "index-volumes-changed";
+
+/// 一个卷现在的状态。
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct VolumeStatus {
+    /// 挂载点路径（如 `/Volumes/U盘`）。
+    pub path: String,
+    /// 卷名（挂载点的最后一段）。
+    pub label: String,
+    /// 处在哪一步。
+    pub phase: VolumePhase,
+    /// 已经索引进去多少条。
+    pub indexed: u32,
+}
+
+/// 卷的状态机。
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(tag = "state", content = "detail")]
+pub enum VolumePhase {
+    /// 正在扫（第一次插上，或插回来后的后台刷新）。
+    Indexing,
+    /// 就绪。
+    Ready,
+    /// 出错了（reason 是原因）。
+    Failed(String),
+}
+
+/// 卷状态 —— Tauri 管理的全局状态。
+///
+/// 【为什么单独一个状态而不是塞进 `IndexState`】
+///   `IndexState` 讲的是「引擎索引了什么」；
+///   这里讲的是「哪些外接卷插着、扫到哪一步了」—— 两件事，分开放。
+#[derive(Default)]
+pub struct VolumeState {
+    inner: Mutex<Vec<VolumeStatus>>,
+}
+
+impl VolumeState {
+    /// 当前所有卷的状态（给状态栏看）。
+    pub fn snapshot(&self) -> Vec<VolumeStatus> {
+        self.inner.lock().unwrap().clone()
+    }
+
+    fn set(&self, path: &Path, phase: VolumePhase, indexed: u32) {
+        let mut g = self.inner.lock().unwrap();
+        let label = path
+            .file_name()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        match g.iter_mut().find(|v| v.path == path.to_string_lossy()) {
+            Some(v) => {
+                v.phase = phase;
+                v.indexed = indexed;
+            }
+            None => g.push(VolumeStatus {
+                path: path.to_string_lossy().into_owned(),
+                label,
+                phase,
+                indexed,
+            }),
+        }
+    }
+
+    fn remove(&self, path: &Path) {
+        let mut g = self.inner.lock().unwrap();
+        g.retain(|v| v.path != path.to_string_lossy());
+    }
+}
+
+/// 比较「上次知道的」与「现在的」→ (新出现的, 消失的)。
+///
+/// 【为什么差分而不是直接对着当前集合做】
+///   差分能明确回答两件事：**谁来了**（要附加）、**谁走了**（要分离）。
+///   直接对当前集合做的话，「走了」这件事就没人管了。
+pub fn diff_volumes(
+    known: &HashSet<PathBuf>,
+    now: &HashSet<PathBuf>,
+) -> (Vec<PathBuf>, Vec<PathBuf>) {
+    let mut appeared: Vec<PathBuf> = now.difference(known).cloned().collect();
+    let mut disappeared: Vec<PathBuf> = known.difference(now).cloned().collect();
+    appeared.sort();
+    disappeared.sort();
+    (appeared, disappeared)
+}
+
+/// 当前所有卷的状态 —— **拿不到状态就当没有卷**。
+///
+/// 【为什么用 `try_state` 而不是 `state`】
+///   `state()` 在状态没被 manage 时会 **panic** ——
+///   而 mock app（测试）与「状态还没注册」的早期路径上确实没有它。
+///   → 拿不到就给空列表（= 状态栏不显示卷那一行，**不是故障**）。
+pub fn volume_statuses<R: Runtime>(app: &AppHandle<R>) -> Vec<VolumeStatus> {
+    app.try_state::<VolumeState>()
+        .map(|s| s.snapshot())
+        .unwrap_or_default()
+}
+
+/// 记一个卷的状态 —— **状态没注册就跳过**。
+///
+/// 【为什么不用 `state()`】`state()` 在状态没被 manage 时会 panic ——
+///   而这里跑在**监控线程**里：panic 会让整条监控链**静默死掉**
+///   （卷从此不再被索引，而且没有任何报错）。
+///   → 拿不到就跳过状态更新（功能照常，只是状态栏少那一行）。
+fn set_volume_state<R: Runtime>(
+    app: &AppHandle<R>,
+    path: &Path,
+    phase: VolumePhase,
+    indexed: u32,
+) {
+    if let Some(state) = app.try_state::<VolumeState>() {
+        state.set(path, phase, indexed);
+    }
+}
+
+/// 把一个卷从状态里去掉 —— **状态没注册就跳过**（理由同 [`set_volume_state`]）。
+fn remove_volume_state<R: Runtime>(app: &AppHandle<R>, path: &Path) {
+    if let Some(state) = app.try_state::<VolumeState>() {
+        state.remove(path);
+    }
+}
+
+/// 起监控线程：每秒枚举一次挂载点，驱动附加/分离。
+pub fn spawn_volume_monitor<R: Runtime>(app: AppHandle<R>) {
+    let spawned = std::thread::Builder::new()
+        .name("lodestar-volumes".into())
+        .spawn(move || {
+            // 【known 装的是什么】上一次已知的卷 —— **挂载点路径本身**。
+            //   ⚠️ 它必须是**同一个 PathBuf**：附加与分离用的是「索引空间写法」，
+            //   拼写不同 → 摘根静默无效 → **幽灵条目**（盘都拔了还搜得到它的文件）。
+            //   → 这里存的与附加时用的那份**逐字相同**（都来自同一轮枚举）。
+            let mut known: HashSet<PathBuf> = HashSet::new();
+            loop {
+                std::thread::sleep(POLL_INTERVAL);
+                // 【枚举失败 ≠ 没有卷】失败时**这一轮什么都不做**（别把瞬时错误
+                //   当成「所有卷都被拔了」→ 触发不必要的拆索引 + 重新全量扫）。
+                // ⚠️ 失败日志 `mounted_local_volumes()` 内部**已经打过一条**了
+                //   （带 errno）→ 这里不要再打一遍（否则日志里同一件事两行）。
+                let Ok(list) = mounted_local_volumes() else {
+                    continue;
+                };
+                let now: HashSet<PathBuf> = list.into_iter().collect();
+                let (appeared, disappeared) = diff_volumes(&known, &now);
+                for v in disappeared {
+                    detach_volume(&app, &v);
+                    known.remove(&v);
+                }
+                for v in appeared {
+                    // 【只有真的接下了才记进 known】
+                    //   接不下 = 引擎还没装好（启动路径上引擎要建一会儿）。
+                    //   → 不记 → 下一秒它还是「新出现的」→ 会再试一次。
+                    //   （记了就永远不再试 → 那个卷永远进不了索引。）
+                    if attach_volume(&app, &v) {
+                        known.insert(v);
+                    }
+                }
+                // 【卷被改名了会怎样】
+                //   macOS 改名 = 卸载 + 以新名字挂载 → 这里看到「旧的消失 + 新的出现」
+                //   → 旧的那个被分离、新的那个当**新盘**处理（没有档 → 全量扫）。
+                //   旧盘留下的档会变成孤儿文件（**暂不清理**，见设计文档 §8）。
+            }
+        });
+    if let Err(e) = spawned {
+        eprintln!("[lodestar] 起卷监控线程失败，外接盘不会被索引: {e}");
+    }
+}
+
+/// 把一个卷从索引里摘掉。
+fn detach_volume<R: Runtime>(app: &AppHandle<R>, volume: &Path) {
+    let Some(searcher) = current_searcher(app) else {
+        return;
+    };
+    // 【⚠️ 这里传的必须是「与挂时逐字相同」的那份路径】
+    //   `detach_root` 比的是**索引空间写法**，不是规范化后的真实路径 ——
+    //   拼写不同 → 静默无效 → 条目留着 = 幽灵条目。
+    //   → 调用方传的就是 `known` 里存的那份 PathBuf（与附加时同一个）✓
+    match searcher.detach_root(volume) {
+        Ok(indexed) => {
+            crate::logging::log_line(&format!(
+                "[volumes] 已摘掉 {}（剩 {indexed} 项）",
+                volume.display()
+            ));
+            remove_volume_state(app, volume);
+            // 路径也要从状态里去掉 —— 否则 watcher 会继续监听已消失的路径
+            remove_path(app, volume, indexed);
+            // 索引变了 → 前端要重搜
+            notify_frontend(app);
+        }
+        Err(e) => {
+            // 【这不是故障】「没挂过」才会走到这里 ——
+            //   拔得太快（附加线程还在扫）或那次附加本来就失败了。
+            //   → 引擎里没有它的条目 → **没有幽灵条目要清**。
+            //   （「挂过但拼写不同」那种真幽灵，worker 侧已经挡住了。）
+            crate::logging::log_line(&format!(
+                "[volumes] 摘掉 {} 时它没挂过（忽略）: {e}",
+                volume.display()
+            ));
+        }
+    }
+}
+
+/// 把一个卷加进索引。返回 `true` = 这次真的接下了（调用方可以记进 `known`）。
+///
+/// 【为什么要开一个自己的线程】
+///   第一次插上要**全量扫**这个卷（可能几十万文件 → 几十秒）。
+///   那个扫描绝不能占着监控线程（否则拔盘都检测不到），
+///   更不能占着搜索 worker（否则搜索全堵死）。
+fn attach_volume<R: Runtime>(app: &AppHandle<R>, volume: &Path) -> bool {
+    // 【引擎还没装好就别扫】——
+    //   启动路径上引擎要建一会儿（$HOME 量级 1 秒），那段时间里没有引擎可挂。
+    //   这时候扫出来的条目**无处可挂** → 白扫一遍（几十万文件 → 几十秒）。
+    //   → 返回 false = 「这一轮不接手」→ 监控线程**不把它记进 known**
+    //     → 下一秒再试（引擎好了就能挂上）。
+    if current_searcher(app).is_none() {
+        return false;
+    }
+    let app = app.clone();
+    // 【⚠️ 路径必须是【逐字相同】的那一份】——
+    //   附加与分离都要用「同一个 PathBuf」→ 这里 clone 出来的这份
+    //   与监控线程 `known` 里存的那份逐字相同 ✓（两边都来自同一轮枚举）。
+    let volume = volume.to_path_buf();
+    let spawned = std::thread::Builder::new()
+        .name("lodestar-volume-attach".into())
+        .spawn(move || {
+            set_volume_state(&app, &volume, VolumePhase::Indexing, 0);
+            match scan_volume(&app, &volume) {
+                Ok(entries) => {
+                    // 【引擎要在扫完【之后】才取】——
+                    //   扫的这几十秒里用户可能换了索引目录（重建引擎）→
+                    //   扫之前取到的引擎那时已经过期了 → 挂到旧引擎上 → 白扫。
+                    let Some(searcher) = current_searcher(&app) else {
+                        return;
+                    };
+                    // 【拔盘竞态】扫的这几十秒里用户可能把盘拔了 →
+                    //   复查一次，没挂载就丢弃结果（不把死盘的条目塞进索引）。
+                    // 【枚举失败时保守处理】拿不到清单就当「还在」（不丢弃结果）
+                    let still_there = mounted_local_volumes()
+                        .map(|list| list.contains(&volume))
+                        .unwrap_or(true);
+                    if !still_there {
+                        crate::logging::log_line(&format!(
+                            "[volumes] {} 扫描期间被拔掉，丢弃",
+                            volume.display()
+                        ));
+                        remove_volume_state(&app, &volume);
+                        return;
+                    }
+                    match searcher.attach_root(&volume, entries) {
+                        Ok(indexed) => {
+                            crate::logging::log_line(&format!(
+                                "[volumes] 已挂上 {}（{indexed} 项）",
+                                volume.display()
+                            ));
+                            set_volume_state(&app, &volume, VolumePhase::Ready, indexed);
+                            commit_paths(&app, &volume, indexed);
+                            notify_frontend(&app);
+                        }
+                        Err(e) => {
+                            set_volume_state(&app, &volume, VolumePhase::Failed(e.to_string()), 0);
+                        }
+                    }
+                }
+                Err(e) => {
+                    set_volume_state(&app, &volume, VolumePhase::Failed(e.to_string()), 0);
+                }
+            }
+        });
+    if let Err(e) = spawned {
+        eprintln!("[lodestar] 起卷附加线程失败: {e}");
+        return false;
+    }
+    true
+}
+
+/// 拿当前活着的引擎句柄。
+fn current_searcher<R: Runtime>(app: &AppHandle<R>) -> Option<Arc<search_core::Searcher>> {
+    let state = app.try_state::<Mutex<Option<Arc<search_core::Searcher>>>>()?;
+    let guard = state.inner().lock().ok()?;
+    guard.clone()
+}
+
+/// 扫一个卷的全部条目。
+///
+/// 【为什么要先读档】插回来的盘**上次扫过** → 档还在 → 读档就是毫秒级，
+/// 用户立刻能搜到；卷的新增/删除由 watcher 跟上（见 `watcher.rs`）。
+fn scan_volume<R: Runtime>(
+    app: &AppHandle<R>,
+    volume: &Path,
+) -> Result<Vec<search_core::IndexEntry>, String> {
+    // 【索引档目录的唯一真相在 `settings::index_store_dir`】——
+    //   写档的地方（建引擎）与读档的地方（这里）必须是**同一个目录**，
+    //   否则卷永远命不中旧档 → 每次插上都要全量重扫。
+    if let Some(dir) = crate::settings::index_store_dir(app) {
+        if let Some(entries) = search_core::store::load_root(&dir, volume) {
+            crate::logging::log_line(&format!(
+                "[volumes] {} 命中旧索引档，秒开",
+                volume.display()
+            ));
+            return Ok(entries);
+        }
+    }
+    search_core::scan::scan(&[volume.to_path_buf()]).map_err(|e| e.to_string())
+}
+
+/// 把「引擎索引了哪些目录」更新到状态里（卷加进来了）。
+///
+/// 【为什么必须更新】
+///   `watcher::desired_watch_dirs` 读的就是 `IndexState.paths` ——
+///   不更新的话，新挂上的卷**不会被 FSEvents 监听** → 它的变化永远进不了索引。
+fn commit_paths<R: Runtime>(app: &AppHandle<R>, volume: &Path, indexed: u32) {
+    let state = app.state::<crate::index_state::IndexState>();
+    let (gen, mut paths) = state.engine_snapshot();
+    let volume = volume.to_string_lossy().into_owned();
+    if !paths.iter().any(|p| p == &volume) {
+        paths.push(volume);
+    }
+    // 【条件提交】期间要是换过引擎 → 这次结果描述的是旧引擎 → 丢弃
+    state.commit_if_current(gen, paths, indexed);
+}
+
+/// 把一个目录从「引擎索引了哪些目录」里去掉（卷拔掉了）。
+///
+/// 【为什么必须去掉】
+///   `watcher::desired_watch_dirs` 读的就是这份列表 ——
+///   不去掉的话 watcher 会**继续监听一个已经不存在的路径**，
+///   每秒对账一次都会失败一次（还会在日志里刷屏）。
+///
+/// 【`indexed` 用的是引擎报回来的总数】——
+///   `detach_root` 返回「分离之后的索引条目总数」→ 那是**当前引擎的真实条数**；
+///   而 `state.snapshot().indexed` 是上一次提交时的旧值（可能已经过时）。
+fn remove_path<R: Runtime>(app: &AppHandle<R>, volume: &Path, indexed: u32) {
+    let state = app.state::<crate::index_state::IndexState>();
+    let (gen, mut paths) = state.engine_snapshot();
+    let volume = volume.to_string_lossy().into_owned();
+    paths.retain(|p| p != &volume);
+    state.commit_if_current(gen, paths, indexed);
+}
+
+/// 通知前端「索引变了，重搜一次」。
+fn notify_frontend<R: Runtime>(app: &AppHandle<R>) {
+    use tauri::Emitter;
+    let mut st = app.state::<crate::index_state::IndexState>().snapshot();
+    st.visible = crate::lifecycle::window_visible(app);
+    st.volumes = volume_statuses(app);
+    if let Err(e) = app.emit(VOLUMES_CHANGED_EVENT, st) {
+        eprintln!("[lodestar] 通知前端失败: {e}");
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -306,5 +685,131 @@ mod tests {
         //     而且结果要和内部枚举**一致**）。
         let from_public = mounted_local_volumes().expect("公开入口也该成功");
         assert_eq!(from_public, vols, "公开入口与内部枚举结果不一致");
+    }
+
+    // ── 差分：新出现的 / 消失的（Task 5） ──
+
+    #[test]
+    fn newly_mounted_volumes_are_detected() {
+        let known: HashSet<PathBuf> = HashSet::new();
+        let now: HashSet<PathBuf> = [PathBuf::from("/Volumes/U盘")].into_iter().collect();
+        let (appeared, disappeared) = diff_volumes(&known, &now);
+        assert_eq!(appeared, vec![PathBuf::from("/Volumes/U盘")]);
+        assert!(disappeared.is_empty());
+    }
+
+    #[test]
+    fn unplugged_volumes_are_detected() {
+        let known: HashSet<PathBuf> = [PathBuf::from("/Volumes/U盘")].into_iter().collect();
+        let now: HashSet<PathBuf> = HashSet::new();
+        let (appeared, disappeared) = diff_volumes(&known, &now);
+        assert!(appeared.is_empty());
+        assert_eq!(disappeared, vec![PathBuf::from("/Volumes/U盘")]);
+    }
+
+    #[test]
+    fn an_unchanged_set_produces_nothing() {
+        let s: HashSet<PathBuf> = [PathBuf::from("/Volumes/U盘")].into_iter().collect();
+        let (appeared, disappeared) = diff_volumes(&s, &s);
+        assert!(appeared.is_empty() && disappeared.is_empty());
+    }
+
+    // ── 卷状态（状态机本身） ──
+
+    #[test]
+    fn a_volume_state_starts_empty() {
+        let state = VolumeState::default();
+        assert!(state.snapshot().is_empty());
+    }
+
+    #[test]
+    fn setting_a_volume_records_its_label() {
+        let state = VolumeState::default();
+        state.set(
+            Path::new("/Volumes/U盘"),
+            VolumePhase::Indexing,
+            0,
+        );
+        let snap = state.snapshot();
+        assert_eq!(snap.len(), 1);
+        assert_eq!(snap[0].path, "/Volumes/U盘");
+        assert_eq!(snap[0].label, "U盘", "卷名 = 挂载点的最后一段");
+        assert!(matches!(snap[0].phase, VolumePhase::Indexing));
+    }
+
+    #[test]
+    fn setting_the_same_volume_twice_updates_it_in_place() {
+        let state = VolumeState::default();
+        state.set(Path::new("/Volumes/U盘"), VolumePhase::Indexing, 0);
+        state.set(Path::new("/Volumes/U盘"), VolumePhase::Ready, 42);
+        let snap = state.snapshot();
+        assert_eq!(snap.len(), 1, "同一个卷不该出现两次");
+        assert!(matches!(snap[0].phase, VolumePhase::Ready));
+        assert_eq!(snap[0].indexed, 42);
+    }
+
+    #[test]
+    fn removing_a_volume_takes_it_out_of_the_snapshot() {
+        let state = VolumeState::default();
+        state.set(Path::new("/Volumes/U盘"), VolumePhase::Ready, 42);
+        state.remove(Path::new("/Volumes/U盘"));
+        assert!(state.snapshot().is_empty());
+    }
+
+    // ── 附加/分离后要更新 `IndexState.paths` ──
+    //
+    // 【为什么这条很要紧】`watcher::desired_watch_dirs` 读的就是那份列表 ——
+    //   不更新的话，新挂上的卷**不会被 FSEvents 监听** → 它的变化永远进不了索引。
+
+    /// 一个带 `IndexState` 的 mock app —— 够跑 `commit_paths` / `remove_path` 了。
+    fn mock_app_with_index_state() -> tauri::App<tauri::test::MockRuntime> {
+        let app = tauri::test::mock_app();
+        app.manage(crate::index_state::IndexState::new());
+        app
+    }
+
+    #[test]
+    fn attaching_a_volume_adds_it_to_the_watched_paths() {
+        let app = mock_app_with_index_state();
+        let handle = app.handle().clone();
+        commit_paths(&handle, Path::new("/Volumes/U盘"), 123);
+        let state = handle.state::<crate::index_state::IndexState>();
+        let (_, paths) = state.engine_snapshot();
+        assert!(
+            paths.iter().any(|p| p == "/Volumes/U盘"),
+            "挂上的卷必须进 `IndexState.paths`（watcher 靠它监听）：{paths:?}"
+        );
+        assert_eq!(state.snapshot().indexed, 123, "条目数也要一起提交");
+    }
+
+    #[test]
+    fn attaching_the_same_volume_twice_does_not_duplicate_the_path() {
+        let app = mock_app_with_index_state();
+        let handle = app.handle().clone();
+        commit_paths(&handle, Path::new("/Volumes/U盘"), 1);
+        commit_paths(&handle, Path::new("/Volumes/U盘"), 2);
+        let (_, paths) = handle
+            .state::<crate::index_state::IndexState>()
+            .engine_snapshot();
+        assert_eq!(
+            paths.iter().filter(|p| *p == "/Volumes/U盘").count(),
+            1,
+            "同一个卷不该被列两次：{paths:?}"
+        );
+    }
+
+    #[test]
+    fn detaching_a_volume_removes_it_from_the_watched_paths() {
+        let app = mock_app_with_index_state();
+        let handle = app.handle().clone();
+        commit_paths(&handle, Path::new("/Volumes/U盘"), 123);
+        remove_path(&handle, Path::new("/Volumes/U盘"), 7);
+        let state = handle.state::<crate::index_state::IndexState>();
+        let (_, paths) = state.engine_snapshot();
+        assert!(
+            !paths.iter().any(|p| p == "/Volumes/U盘"),
+            "拔掉的卷必须从 `IndexState.paths` 里去掉（否则 watcher 继续监听死路径）：{paths:?}"
+        );
+        assert_eq!(state.snapshot().indexed, 7, "条目数也要一起提交");
     }
 }
