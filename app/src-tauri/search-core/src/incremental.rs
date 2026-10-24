@@ -432,7 +432,10 @@ fn classify(p: &Path) -> Kind {
 ///
 /// 【两根都试】先按真实路径试，再按原样路径试 ——
 ///   万一监听器报的就是原样路径，也不至于漏。
-fn map_to_index_space(roots: &[(PathBuf, PathBuf)], raw: &Path) -> Option<PathBuf> {
+///
+/// 【为什么它是 `pub`】worker 也要用**同一份**映射
+///   （「这条变化属于哪个根？」）—— 自己再写一遍就成了第二份真相。
+pub fn map_to_index_space(roots: &[(PathBuf, PathBuf)], raw: &Path) -> Option<PathBuf> {
     for (indexed, real) in roots {
         if let Ok(rel) = raw.strip_prefix(real) {
             return Some(indexed.join(rel));

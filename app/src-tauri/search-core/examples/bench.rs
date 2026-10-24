@@ -121,7 +121,7 @@ fn main() {
     //   量清楚才知道能不能放在同步路径里。
     //
     // 【为什么是「目录」】v3 的档是**每根一个文件** → 探针目录也照这个布局来。
-    let probe_dir = std::env::temp_dir().join("sextant-bench-persist");
+    let probe_dir = std::env::temp_dir().join("lodestar-bench-persist");
     let _ = std::fs::remove_dir_all(&probe_dir);
     let entries = engine.all_entries();
     let mut best = f64::MAX;
@@ -217,7 +217,7 @@ fn main() {
     //   用 `$HOME` 当基准可以，但**不能往用户的家目录里造测试文件** ——
     //   所以这里造一份**同样条目数**的临时索引。
     println!("\n=== 6. 增量更新（改文件 → 索引跟上）===");
-    let bench_dir = std::env::temp_dir().join("sextant-bench-incremental");
+    let bench_dir = std::env::temp_dir().join("lodestar-bench-incremental");
     let _ = std::fs::remove_dir_all(&bench_dir);
     for d in 0..40 {
         let sub = bench_dir.join(format!("d{d:02}"));

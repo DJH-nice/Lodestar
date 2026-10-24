@@ -13,18 +13,18 @@
 //!   症状是「数字显示很快，但感觉很慢」，很容易误判成搜索算法慢。
 //!   → 这正是 M3 要治的病：**增量更新**只要几毫秒，堵不住谁。
 
-use std::collections::HashMap;
-use std::path::PathBuf;
+use std::collections::{HashMap, HashSet};
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{channel, RecvTimeoutError, Sender};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
-use crate::engine::Engine;
-use crate::incremental::{ChangeSet, UpdateReport};
+use crate::engine::{path_in_root, Engine};
+use crate::incremental::{self, ChangeSet, UpdateReport};
 use crate::store;
-use crate::types::{EngineError, SearchRequest, SearchResult};
+use crate::types::{EngineError, IndexEntry, SearchRequest, SearchResult};
 
 /// 两次**落盘**之间至少隔这么久。
 ///
@@ -56,6 +56,22 @@ enum Job {
     ApplyChanges {
         changes: ChangeSet,
         reply: Sender<Result<UpdateReport, EngineError>>,
+    },
+    /// 附加一个根目录（条目由调用方**在 worker 之外**扫好）。
+    AttachRoot {
+        root: PathBuf,
+        entries: Vec<IndexEntry>,
+        reply: Sender<Result<u32, EngineError>>,
+    },
+    /// 分离一个根目录 —— 条目立即消失。
+    ///
+    /// 【⚠️ 路径必须与 attach 时**逐字相同**】
+    ///   引擎比的是**索引空间写法**（不是规范化后的真实路径）——
+    ///   拼写不同 → **静默无效** → 条目留着 = **幽灵条目**
+    ///   （用户最不能接受的那种：盘都拔了，搜得到它的文件）。
+    DetachRoot {
+        root: PathBuf,
+        reply: Sender<Result<u32, EngineError>>,
     },
     Shutdown,
 }
@@ -101,6 +117,18 @@ impl PersistSlot {
         g.insert(path, bytes);
         self.cv.notify_one();
     }
+
+    /// 丢掉某个根**还没写**的那份快照（摘根时用）。
+    ///
+    /// 【为什么摘根要丢掉它】
+    ///   落盘槽是「每根覆盖最新字节流」—— 摘根**之前**提交的那份快照
+    ///   还在排队 → 摘完根它仍会落盘 → 把那个根的档重写成**摘根前**的内容
+    ///   （陈旧档）。那个根已经不在索引里 → 档不会被读 → 不致命，
+    ///   但它属于同一族「陈旧档」问题 → 顺手修掉。
+    fn discard(&self, path: &Path) {
+        let mut g = self.jobs.lock().unwrap();
+        g.remove(path);
+    }
 }
 
 impl Persister {
@@ -112,7 +140,7 @@ impl Persister {
         });
         let thread_slot = Arc::clone(&slot);
         let handle = std::thread::Builder::new()
-            .name("sextant-persist".into())
+            .name("lodestar-persist".into())
             .spawn(move || {
                 loop {
                     let jobs = {
@@ -127,7 +155,7 @@ impl Persister {
                     }
                     for (path, bytes) in jobs {
                         if let Err(e) = store::save_bytes(&bytes, &path, true) {
-                            eprintln!("[sextant] 索引落盘失败（不影响使用）: {e}");
+                            eprintln!("[lodestar] 索引落盘失败（不影响使用）: {e}");
                         }
                     }
                 }
@@ -170,8 +198,14 @@ impl Searcher {
                 // 当前 query —— 翻页请求必须与之一致，
                 // 否则它读到的其实是上一次搜索的视图。
                 let mut current_query: Option<String> = None;
-                // 索引档是不是落后于内存里的索引。
-                let mut store_dirty = false;
+                // **哪些根的档落后了**（索引空间写法）。
+                //
+                // 【为什么是「按根」而不是一个 bool】
+                //   索引档现在是**每根一个文件** → 挂载的根不止一个
+                //   （$HOME + 若干外接卷）→ 落盘要能**只重写变了的那几个**：
+                //   插着 10 万文件的 U 盘时，每次都全量重写要动十几 MB，
+                //   而 $HOME 那份**根本没变** → 白烧 I/O 与 CPU。
+                let mut dirty_roots: HashSet<PathBuf> = HashSet::new();
                 // 上次交出去落盘的时刻（「两次落盘至少隔 2s」那道闸）。
                 let mut last_persist_at = Instant::now();
 
@@ -212,11 +246,46 @@ impl Searcher {
                             }
                             Job::ApplyChanges { changes, reply } => {
                                 let res = engine.apply_changes(&changes);
-                                if res.is_ok() {
+                                if let Ok(report) = &res {
                                     current_query = None; // 视图已被替换
-                                    store_dirty = true;
+                                    // 【退化成全量重扫时，引擎自己已经把所有根写过档了】
+                                    //   （`Engine::apply_changes` → `rescan()` → `persist()`）
+                                    //   → 不要再标脏（否则白写一遍）。
+                                    if !report.fell_back {
+                                        mark_changed_roots(&mut dirty_roots, &engine, &changes.paths);
+                                    }
                                 }
                                 let _ = reply.send(res);
+                            }
+                            Job::AttachRoot { root, entries, reply } => {
+                                let count = engine.attach_root(&root, entries);
+                                // 【为什么先问一句「挂上了吗」】引擎会**静默拒绝**
+                                //   与已有根重叠的根（不变式：根之间不嵌套）——
+                                //   那种情况下这个根**不在**引擎里 → 没有它的档可写，
+                                //   而且引擎**根本没动**它的视图 → 翻页状态也不该作废。
+                                let attached = engine.roots().iter().any(|r| r == &root);
+                                if attached {
+                                    current_query = None; // 视图已被替换
+                                    // 新挂上的根 → **它那份档**要写（别的根不用动）。
+                                    dirty_roots.insert(root.clone());
+                                }
+                                let _ = reply.send(if attached {
+                                    Ok(count)
+                                } else {
+                                    // 引擎拒了（与已有根重叠）→ 上层要能知道「没挂上」
+                                    Err(EngineError::InvalidArg)
+                                });
+                            }
+                            Job::DetachRoot { root, reply } => {
+                                let count = engine.detach_root(&root);
+                                current_query = None; // 视图已被替换
+                                // 摘掉的根**不该**再写档 → 从待写名单里去掉；
+                                // 也把落盘槽里**已经排着**的那份丢掉（否则会落一份陈旧档）。
+                                dirty_roots.remove(&root);
+                                if let Some(dir) = engine.store_dir() {
+                                    persist_slot.discard(&store::root_archive_path(&dir, &root));
+                                }
+                                let _ = reply.send(Ok(count));
                             }
                             Job::Shutdown => break,
                         }
@@ -228,13 +297,25 @@ impl Searcher {
                     //   落盘的序列化（约 1ms）不会算进调用方的等待时间。
                     //   【为什么还要「至少隔 2s」】写一次 3MB 的档要 9.6ms ——
                     //   不设闸的话，持续小改动会把后台线程刷爆。
-                    if store_dirty && last_persist_at.elapsed() >= PERSIST_INTERVAL {
-                        let jobs = engine.serialize_for_store();
-                        if !jobs.is_empty() {
-                            for (path, bytes) in jobs {
-                                persist_slot.submit(path, bytes);
-                            }
-                            store_dirty = false;
+                    //   【为什么只写变了的根】插着 U 盘时，全量重写要动十几 MB，
+                    //   而 $HOME 那份**根本没变** → 只写**真的变了**的那几个根。
+                    //   （「每根一个档」的**读侧**隔离在 Task 1 就做到了，
+                    //     **写侧**隔离在这里补齐 —— 两边合起来才是「插拔卷不牵连 $HOME」。）
+                    if !dirty_roots.is_empty() && last_persist_at.elapsed() >= PERSIST_INTERVAL {
+                        // 引擎里已经不存在的根（被摘掉了）→ 不用再写
+                        let live: HashSet<PathBuf> = engine.roots().into_iter().collect();
+                        let wanted: Vec<PathBuf> = dirty_roots
+                            .iter()
+                            .filter(|r| live.contains(*r))
+                            .cloned()
+                            .collect();
+                        dirty_roots.retain(|r| live.contains(r));
+                        // 【只序列化「要」的那几个根】—— 没被挑中的根，
+                        //   它磁盘上的档**本来就是对的** ✓（不提交 ≠ 删掉）。
+                        for (path, bytes) in engine.serialize_roots_for_store(&wanted) {
+                            persist_slot.submit(path, bytes);
+                        }
+                        if !wanted.is_empty() {
                             last_persist_at = Instant::now();
                         }
                     }
@@ -307,6 +388,100 @@ impl Searcher {
             .recv()
             .map_err(|_| EngineError::Internal("搜索线程异常退出".into()))?
     }
+
+    /// 附加一个根目录。**条目由调用方扫好** —— 扫描绝不在这个线程上做
+    /// （30 万文件的盘要扫几十秒 → 搜索会被堵死）。
+    ///
+    /// 【返回值】附加之后的**索引条目总数**。
+    ///   引擎若因「与已有根重叠」**拒绝**附加（不变式：根之间不嵌套），
+    ///   这里返回 `Err(InvalidArg)` —— 上层要能知道「**没挂上**」。
+    ///
+    /// 【⚠️ 路径拼写】`root` 要与之后 [`Searcher::detach_root`] 用的
+    ///   **逐字相同**（索引空间写法）—— 拼写不同 → 摘根静默无效 → 幽灵条目。
+    pub fn attach_root(
+        &self,
+        root: &Path,
+        entries: Vec<IndexEntry>,
+    ) -> Result<u32, EngineError> {
+        let (reply_tx, reply_rx) = channel();
+        self.tx
+            .send(Job::AttachRoot {
+                root: root.to_path_buf(),
+                entries,
+                reply: reply_tx,
+            })
+            .map_err(|_| EngineError::Internal("搜索线程已退出".into()))?;
+        reply_rx
+            .recv()
+            .map_err(|_| EngineError::Internal("搜索线程异常退出".into()))?
+    }
+
+    /// 分离一个根目录 —— 条目**立即**从索引里消失。
+    ///
+    /// 【⚠️ 路径必须与 attach 时**逐字相同**】
+    ///   引擎比的是**索引空间写法**（`self.roots` 与条目路径），
+    ///   **不是**规范化后的真实路径 ——
+    ///   拼写不同 → **静默无效** → 条目留着 = **幽灵条目**
+    ///   （用户最不能接受的那种：盘都拔了，搜得到它的文件）。
+    ///
+    /// 【返回值】分离之后的**索引条目总数**。
+    pub fn detach_root(&self, root: &Path) -> Result<u32, EngineError> {
+        let (reply_tx, reply_rx) = channel();
+        self.tx
+            .send(Job::DetachRoot {
+                root: root.to_path_buf(),
+                reply: reply_tx,
+            })
+            .map_err(|_| EngineError::Internal("搜索线程已退出".into()))?;
+        reply_rx
+            .recv()
+            .map_err(|_| EngineError::Internal("搜索线程异常退出".into()))?
+    }
+}
+
+/// 把一批变化路径映射回它所属的根 —— **只**把这些根标脏。
+///
+/// 【为什么要有这一层】落盘是**每 2 秒**一次的后台动作。
+///   插着 U 盘时，每次落盘周期都要重写 $HOME 的 3.4MB **加上** U 盘那份十几 MB ——
+///   而 $HOME 那份**根本没变** → 白烧 I/O 与 CPU。
+///   → 只重写**真的变了**的那个根 ✓。
+///
+/// 【路径为什么要映射】FSEvents 报的是**真实路径**，
+///   索引里的根是按**索引空间**拼的 —— 两边要靠 `root_pairs()` 对上。
+///
+/// 【找不到归属根怎么办】宁可多写，不能写错 → **所有**根都标脏
+///   （路径落在所有根之外，或者它的根刚被摘掉了 → 说不清是哪份档该更新）。
+fn mark_changed_roots(dirty: &mut HashSet<PathBuf>, engine: &Engine, paths: &[PathBuf]) {
+    let pairs = engine.root_pairs();
+    let mut unknown = false;
+    for p in paths {
+        match owning_root(&pairs, p) {
+            Some(root) => {
+                dirty.insert(root);
+            }
+            None => unknown = true,
+        }
+    }
+    if unknown {
+        dirty.extend(engine.roots());
+    }
+}
+
+/// 这条变化路径属于哪个根（**索引空间**写法）。
+///
+/// 【为什么不自己写一遍前缀判定】
+///   - 真实路径 → 索引空间：用增量更新的**同一份**映射
+///     （`incremental::map_to_index_space`）；
+///   - 索引空间路径 → 它的根：用引擎的**同一份** helper（`engine::path_in_root`）。
+///   → 「路径属于哪个根」这件事**只有一份真相**（全局约束 C10）。
+fn owning_root(pairs: &[(PathBuf, PathBuf)], raw: &Path) -> Option<PathBuf> {
+    // 真实路径 → 索引空间
+    let mapped = incremental::map_to_index_space(pairs, raw)?;
+    // 索引空间路径 → 它的根（组件级判定）
+    pairs
+        .iter()
+        .find(|(indexed, _)| path_in_root(&mapped, indexed))
+        .map(|(indexed, _)| indexed.clone())
 }
 
 impl Drop for Searcher {
@@ -317,5 +492,40 @@ impl Drop for Searcher {
         }
         // 搜索线程退了 → 把还没落盘的补上（**不能丢**）。
         self.persister.shutdown();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 变化路径 → 它所属的根（**索引空间**写法）。
+    ///
+    /// 【为什么要钉住】FSEvents 报的是**真实路径**，
+    ///   索引里的根是按**索引空间**拼的 —— 两边对不上，
+    ///   就会把变化算到**错的根**头上 → 改一份档、漏一份档。
+    #[test]
+    fn a_change_path_maps_back_to_its_root() {
+        let pairs = vec![
+            (PathBuf::from("/tmp/home"), PathBuf::from("/private/tmp/home")),
+            (PathBuf::from("/Volumes/U盘"), PathBuf::from("/Volumes/U盘")),
+        ];
+        // 真实路径（macOS 上 /tmp 是 /private/tmp 的链接）→ 索引空间的根
+        assert_eq!(
+            owning_root(&pairs, Path::new("/private/tmp/home/sub/a.txt")),
+            Some(PathBuf::from("/tmp/home"))
+        );
+        // 监听器报的就是原样路径 → 也要对得上
+        assert_eq!(
+            owning_root(&pairs, Path::new("/tmp/home/sub/a.txt")),
+            Some(PathBuf::from("/tmp/home"))
+        );
+        // 另一个根（外接卷）
+        assert_eq!(
+            owning_root(&pairs, Path::new("/Volumes/U盘/x.log")),
+            Some(PathBuf::from("/Volumes/U盘"))
+        );
+        // 所有根之外 → 找不到（→ 保守处理：全部重写）
+        assert_eq!(owning_root(&pairs, Path::new("/elsewhere/x.log")), None);
     }
 }

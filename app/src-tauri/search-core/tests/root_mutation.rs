@@ -302,6 +302,87 @@ fn attaching_a_root_nested_inside_an_existing_root_is_rejected() {
     );
 }
 
+/// worker（`Searcher`）也能附加/分离根 —— 上层只能通过它操作引擎。
+///
+/// 【为什么要走 worker 而不是直接用 `Engine`】
+///   引擎**只被搜索线程独占**（`worker.rs` 的串行不变式）：
+///   上层要改索引，只能把请求**排队**给那个线程 —— 另起线程改引擎 = 竞态。
+#[test]
+fn the_searcher_can_attach_and_detach_a_root() {
+    use search_core::Searcher;
+    let home = fixture("w-home", false);
+    let usb = fixture("w-usb", true);
+    let (engine, _) = Engine::new(&[home.as_path()]).unwrap();
+    let searcher = Searcher::new(engine);
+    let entries = search_core::scan::scan(&[usb.clone()]).unwrap();
+    let n = searcher.attach_root(&usb, entries).expect("应该能附加");
+    assert!(n > 0);
+    let res = searcher.search(request("beta")).expect("应该能搜");
+    assert_eq!(res.total_files, 1);
+    searcher.detach_root(&usb).expect("应该能分离");
+    let res = searcher.search(request("beta")).expect("应该还能搜");
+    assert_eq!(res.total_files, 0, "拔盘后不该还搜得到");
+}
+
+/// 落盘要**只重写变了的根** —— $HOME 那份**没变**就不该被动。
+///
+/// 【为什么要钉住】插着一个 10 万文件的 U 盘时，每次落盘周期全量重写
+///   要动十几 MB（$HOME 的 3.4MB **加上** U 盘那份）——
+///   而 $HOME 那份**根本没变** → 光 I/O 就吃掉几个百分点 CPU。
+///   「每根一个档」的**读侧**隔离（插拔卷不作废 $HOME 的档）在 Task 1 就做到了，
+///   **写侧**隔离在这里 —— 两边合起来才是「插拔卷不牵连 $HOME」。
+///
+/// 【怎么判「没被重写」】看**修改时刻**（mtime）——
+///   内容可能一模一样（重写同样的内容 → 字节相同），
+///   只有**真的重写**才会动 mtime。
+#[test]
+fn only_the_changed_root_is_rewritten_on_disk() {
+    use search_core::store;
+    let home = fixture("persist-home", false);
+    let usb = fixture("persist-usb", true);
+    let store_dir = std::env::temp_dir().join(format!(
+        "lodestar-roots-persist-store-{}-{}",
+        std::process::id(),
+        next_seq()
+    ));
+    let _ = std::fs::remove_dir_all(&store_dir);
+
+    let (engine, _) =
+        Engine::new_with_store(&[home.as_path()], Some(store_dir.clone())).unwrap();
+    let home_archive = store::root_archive_path(&store_dir, &home);
+    // 建引擎时已经把 $HOME 的档写好了
+    let home_mtime = std::fs::metadata(&home_archive).unwrap().modified().unwrap();
+
+    let searcher = search_core::Searcher::new(engine);
+    let entries = search_core::scan::scan(&[usb.clone()]).unwrap();
+    searcher.attach_root(&usb, entries).expect("应该能附加");
+
+    // 等落盘那一拍（worker 每 2 秒醒一次）
+    let usb_archive = store::root_archive_path(&store_dir, &usb);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+    while !usb_archive.exists() && std::time::Instant::now() < deadline {
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    assert!(usb_archive.exists(), "U 盘那份档应该被写出来");
+
+    // $HOME 那份**没变** → 不该被重写（mtime 不动）
+    let home_mtime_after = std::fs::metadata(&home_archive).unwrap().modified().unwrap();
+    assert_eq!(
+        home_mtime, home_mtime_after,
+        "没变的根不该被重写（落盘要只写变了的根）"
+    );
+
+    // 内容也要对：U 盘那份里能看到 U 盘上的文件
+    let got = store::load_root(&store_dir, &usb).expect("U 盘那份档应该能读出来");
+    assert!(
+        got.iter().any(|e| e.path.ends_with("beta.log")),
+        "U 盘那份档里应该有它自己的条目"
+    );
+
+    drop(searcher);
+    let _ = std::fs::remove_dir_all(&store_dir);
+}
+
 /// 附加一个根之后，那个根里的路径**仍然能被增量更新**。
 ///
 /// 【为什么要有这条护栏】

@@ -10,10 +10,8 @@
 //!   固定头 + 定长记录 + 字符串。没用 mmap，先用「整读整解析」——
 //!   8K 条目约 1.1MB，读+解析在 10ms 以内，已经够用；
 //!   mmap 的列存布局是 M2 的优化项（见设计文档 §4.1）。
-//!   目前并存两种布局：**v2**（一份档装所有根）与 **v3**（**每根一个档**）——
-//!   v3 是为了「插拔外接卷时，只有卷自己的档作废，$HOME 的档不受影响」。
-//!   两种布局的**条目部分完全一样**（见 `write_entry` / `read_entry`），
-//!   差别只在**头**。
+//!   现在只有一种布局：**v3**（**每根一个档**）——
+//!   为了「插拔外接卷时，只有卷自己的档作废，$HOME 的档不受影响」。
 //!
 //! 【为什么写临时文件再 rename】
 //!   直接写目标文件的话，中途被杀会留下**半个文件** ——
@@ -28,17 +26,6 @@ use crate::types::IndexEntry;
 /// 魔数 —— 认文件用。
 const MAGIC: &[u8; 4] = b"SXTX";
 
-/// 格式版本 —— **v2**：一份档装所有根（各根的条目混在一起）。
-///
-/// 【v2】加了「子文件数 / 子目录数」两个字段（`childfilecount:` /
-///   `childfoldercount:` 需要它们）。老档直接作废 → 重扫一次。
-///
-/// 【为什么 v2 还在】`engine.rs` / `worker.rs` **都已经切到 v3 了** ——
-///   现在只剩 `store.rs` 自己的测试还在用 v2 的 `serialize` / `save` / `load`。
-///   它们是 **pub** API（不会触发 dead_code 警告）——
-///   等 Task 3 把它们连同那几个测试一起删掉。
-const VERSION_V2: u32 = 2;
-
 /// 格式版本 —— **v3**：**每根一个档**。
 ///
 /// 【v3】改成**每个根一个档** —— 档里不再有 roots 列表，只有「自己这个根」。
@@ -48,13 +35,14 @@ const VERSION_V2: u32 = 2;
 ///   v2 的老档直接作废 → 一次性全量重扫（可接受）。
 const VERSION: u32 = 3;
 
-// ───────────────────────── 条目读写（v2 / v3 共用） ─────────────────────────
+// ───────────────────────── 条目读写 ─────────────────────────
 //
-// 【为什么要共用】v2 与 v3 的**头**不同（v2 记 roots 列表、v3 记自己的根路径），
-//   但**条目部分一模一样**。抄两遍的话，将来加一个字段要记得改两处 ——
+// 【为什么条目部分要单独成对】`write_entry` / `read_entry` 是**一对互逆的实现**
+//   —— 抄两遍（每个格式一份）的话，将来加一个字段要记得改两处 ——
 //   漏一处就会写出「字段静默全是 0」的档，比读不出来还难查。
+//   现在只剩 v3 一种格式了 → 这一对由 v3 的**逐字节 golden**（见测试）钉住。
 
-/// 写一条条目（v2 / v3 两种格式的**条目部分完全一样**）。
+/// 写一条条目。
 fn write_entry(buf: &mut Vec<u8>, e: &IndexEntry) {
     write_str(buf, &e.name);
     write_str(buf, &e.path);
@@ -77,10 +65,9 @@ fn write_entry(buf: &mut Vec<u8>, e: &IndexEntry) {
 
 /// 所有条目的字节数（**不含头**）—— 落盘前的容量估算。
 ///
-/// 【为什么要抽出来】v2 的 `serialize` 与 v3 的 `serialize_root` 都要先算
-///   「这份档大概多大」→ 一次分配、零拷贝。抄两份的话，其中一份迟早会漏字段
-///   —— v2 那份就漏了 `child_file_count` / `child_folder_count` 各 4 字节
-///   （今天只是多一次 Vec 扩容，不影响正确性，但它证明这段逻辑没有单一真相）。
+/// 【为什么要抽出来】`serialize_root` 要先算「这份档大概多大」
+///   → 一次分配、零拷贝。抄一份到别处的话，那份迟早会漏字段 —— 漏一个字段
+///   就会写出「字段静默全是 0」的档，比读不出来还难查。
 ///
 /// 【必须与 `write_entry` 逐字段对齐】这里算的每个字段，
 ///   `write_entry` 都必须真的写出去。**估小了**只是多一次扩容；
@@ -135,43 +122,6 @@ fn read_entry(r: &mut Reader<'_>) -> Option<IndexEntry> {
     })
 }
 
-/// 把索引序列化成字节流 —— 落盘的 **CPU 部分**。
-///
-/// 【为什么要单独抽出来】落盘有两段成本：**序列化**（CPU）与
-///   **写盘**（I/O）。哪一段贵，决定了「能不能放在关键路径上」——
-///   所以要能分别量。
-pub fn serialize(entries: &[IndexEntry], roots: &[PathBuf]) -> Vec<u8> {
-    // 【为什么先算准大小】估小了会让 Vec **扩容时拷贝**整个缓冲区 ——
-    //   3MB 的档要拷两三次，实测多花约 1ms（序列化总耗时的一半）。
-    //   先扫一遍把大小算准 → 一次分配、零拷贝。
-    //   （条目部分的大小由 `entries_bytes` 统一算 —— v2/v3 共用一份真相。）
-    let cap = 64usize + roots.len() * 32 + entries_bytes(entries);
-
-    let mut buf: Vec<u8> = Vec::with_capacity(cap);
-    buf.extend_from_slice(MAGIC);
-    buf.extend_from_slice(&VERSION_V2.to_le_bytes());
-    buf.extend_from_slice(&(roots.len() as u32).to_le_bytes());
-    for r in roots {
-        write_str(&mut buf, &r.to_string_lossy());
-    }
-    buf.extend_from_slice(&(entries.len() as u32).to_le_bytes());
-    for e in entries {
-        write_entry(&mut buf, e);
-    }
-
-    buf
-}
-
-/// 把索引写到 `path`（原子替换）。
-pub fn save(entries: &[IndexEntry], roots: &[PathBuf], path: &Path) -> std::io::Result<()> {
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-
-    let buf = serialize(entries, roots);
-    save_bytes(&buf, path, true)
-}
-
 /// 把**已经序列化好的**字节流写到 `path`（原子替换）。
 ///
 /// 【为什么要单独抽出来】落盘有两段成本：
@@ -180,7 +130,7 @@ pub fn save(entries: &[IndexEntry], roots: &[PathBuf], path: &Path) -> std::io::
 ///
 /// 【`sync` 参数】`true` = 落盘再 rename（断电也不会留下半个档）。
 ///   `false` = 不 fsync —— 断电时这个档可能坏掉，
-///   但**读档失败会退回全量扫描**（见 [`load`]），所以只是慢，不会出错。
+///   但**读档失败会退回全量扫描**（见 [`load_root`]），所以只是慢，不会出错。
 pub fn save_bytes(buf: &[u8], path: &Path, sync: bool) -> std::io::Result<()> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
@@ -196,44 +146,6 @@ pub fn save_bytes(buf: &[u8], path: &Path, sync: bool) -> std::io::Result<()> {
     }
     std::fs::rename(&tmp, path)?;
     Ok(())
-}
-
-/// 从 `path` 读索引。**读不出来就返回 None**（调用方退回全量扫描）。
-///
-/// 【为什么「读不出来」不是错误】
-///   没有存档、格式版本变了、文件被截断 —— 这三种都该走「重新扫一遍」，
-///   而不是让应用起不来。
-pub fn load(path: &Path) -> Option<(Vec<IndexEntry>, Vec<PathBuf>)> {
-    let mut buf = Vec::new();
-    std::fs::File::open(path).ok()?.read_to_end(&mut buf).ok()?;
-    parse(&buf)
-}
-
-/// 解析缓冲区。拆出来是为了能单测「字节流 → 索引」。
-fn parse(buf: &[u8]) -> Option<(Vec<IndexEntry>, Vec<PathBuf>)> {
-    let mut r = Reader { buf, pos: 0 };
-    if r.take(4)? != MAGIC {
-        return None;
-    }
-    let version = r.u32()?;
-    if version != VERSION_V2 {
-        return None;
-    }
-    let root_count = r.u32()? as usize;
-    let mut roots = Vec::with_capacity(root_count);
-    for _ in 0..root_count {
-        roots.push(PathBuf::from(r.string()?));
-    }
-    let entry_count = r.u32()? as usize;
-    // 档里的条目数不可信 → 先看剩下的字节装不装得下（见 `count_fits`）。
-    if !count_fits(r.buf, r.pos, entry_count) {
-        return None;
-    }
-    let mut entries = Vec::with_capacity(entry_count);
-    for _ in 0..entry_count {
-        entries.push(read_entry(&mut r)?);
-    }
-    Some((entries, roots))
 }
 
 // ───────────────────────── v3：每根一个档 ─────────────────────────
@@ -278,9 +190,8 @@ fn fnv1a64(bytes: &[u8]) -> u64 {
 
 /// 把**一个根**的条目序列化成字节流。
 ///
-/// 【与 v2 的 `serialize` 有什么不同】
-///   v2：MAGIC + 版本 + **roots 列表** + 全部条目（所有根混在一起）。
-///   v3：MAGIC + 版本 + **这个根的路径** + 这个根的条目。
+/// 【档的布局】MAGIC + 版本 + **这个根的路径** + 这个根的条目。
+///   （v2 时代是「一份档装所有根」—— 已被 v3 取代，理由见 [`VERSION`]。）
 pub fn serialize_root(root: &Path, entries: &[IndexEntry]) -> Vec<u8> {
     // 【为什么按头部实际字节算，别靠一个固定的常数蒙】
     //   头 = 魔数(4) + 版本(4) + 根路径的长度前缀(4) + 根路径 + 条目数前缀(4)
@@ -452,49 +363,11 @@ mod tests {
     #[test]
     fn round_trip_preserves_everything() {
         let entries = sample();
-        let roots = vec![PathBuf::from("/Users/me/Documents")];
-        let mut buf = Vec::new();
-        buf.extend_from_slice(MAGIC);
-        buf.extend_from_slice(&VERSION_V2.to_le_bytes());
-        buf.extend_from_slice(&(roots.len() as u32).to_le_bytes());
-        for r in &roots {
-            write_str(&mut buf, &r.to_string_lossy());
-        }
-        buf.extend_from_slice(&(entries.len() as u32).to_le_bytes());
-        // 【这里为什么要手写字节，不能调 `write_entry`】
-        //   这份手写布局是 **v2 落盘格式的规格（golden）** —— 用户磁盘上
-        //   已经有 v2 老档，它**不能变**。
-        //   如果这里改成调 `write_entry`，这个测试就只证明
-        //   「`write_entry` 与 `read_entry` 互逆」→ 将来有人给
-        //   `write_entry` 加了字段却忘了 bump 版本号 → 两个 helper 一起变
-        //   → 这个测试**照样全绿**，而**老档会被静默读成错值**。
-        //   独立于实现的期望字节才能立刻把这类改动顶红。
-        for e in &entries {
-            write_str(&mut buf, &e.name);
-            write_str(&mut buf, &e.path);
-            write_str(&mut buf, &e.dir);
-            write_str(&mut buf, &e.extension);
-            write_str(&mut buf, &e.folded_name);
-            write_str(&mut buf, &e.folded_path);
-            buf.extend_from_slice(&e.size.to_le_bytes());
-            buf.extend_from_slice(&e.mtime.to_le_bytes());
-            buf.push(if e.is_folder { 1 } else { 0 });
-            buf.extend_from_slice(&e.depth.to_le_bytes());
-            buf.extend_from_slice(&e.child_count.to_le_bytes());
-            buf.extend_from_slice(&e.child_file_count.to_le_bytes());
-            buf.extend_from_slice(&e.child_folder_count.to_le_bytes());
-        }
+        let root = PathBuf::from("/Users/me/Documents");
+        let buf = serialize_root(&root, &entries);
 
-        // v2 的落盘字节必须与这份手写期望**逐字节相同** ——
-        //   用户磁盘上已经有 v2 老档，它**不能变**。
-        assert_eq!(
-            serialize(&entries, &roots),
-            buf,
-            "v2 的落盘字节必须逐字节不变（跨版本契约）"
-        );
-
-        let (got_entries, got_roots) = parse(&buf).expect("应该能解析");
-        assert_eq!(got_roots, roots);
+        let (got_root, got_entries) = parse_root(&buf).expect("应该能解析");
+        assert_eq!(got_root, root.to_string_lossy(), "根路径要原样回来");
         assert_eq!(got_entries.len(), entries.len());
         for (a, b) in got_entries.iter().zip(entries.iter()) {
             assert_eq!(a.name, b.name);
@@ -515,45 +388,27 @@ mod tests {
 
     #[test]
     fn garbage_input_is_rejected_not_panicked() {
-        assert!(parse(b"").is_none());
-        assert!(parse(b"XXXX").is_none());
-        assert!(parse(b"SXTX").is_none(), "截断的档必须被拒");
+        assert!(parse_root(b"").is_none());
+        assert!(parse_root(b"XXXX").is_none());
+        assert!(parse_root(b"SXTX").is_none(), "截断的档必须被拒");
         // 版本不对 → 当作没有存档
         let mut buf = Vec::from(MAGIC);
         buf.extend_from_slice(&999u32.to_le_bytes());
-        assert!(parse(&buf).is_none());
-    }
-
-    #[test]
-    fn save_then_load_on_disk() {
-        let dir = std::env::temp_dir().join(format!("lodestar-store-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        let path = dir.join("index.bin");
-        let entries = sample();
-        let roots = vec![PathBuf::from("/Users/me/Documents")];
-        save(&entries, &roots, &path).unwrap();
-        let (got, got_roots) = load(&path).expect("应该能读档");
-        assert_eq!(got.len(), entries.len());
-        assert_eq!(got_roots, roots);
-        let _ = std::fs::remove_dir_all(&dir);
+        assert!(parse_root(&buf).is_none());
     }
 
     #[test]
     fn an_older_archive_version_is_rejected() {
-        // 老档（v1）少两个字段 → 版本对不上 → 当作没有存档 → 重新扫一次。
+        // 老档（v2）布局不同（头里是 roots 列表）→ 版本对不上 → 当作没有存档
+        //   → 重新扫一次。
         // 【为什么要钉住】静默读半截老档 = 子文件数/子目录数全是 0 →
         //   `childfilecount:` 会给出一批**看着正常、其实全错**的结果。
         let mut buf = Vec::from(MAGIC);
-        buf.extend_from_slice(&(VERSION_V2 - 1).to_le_bytes());
+        buf.extend_from_slice(&(VERSION - 1).to_le_bytes());
         assert!(
-            parse(&buf).is_none(),
+            parse_root(&buf).is_none(),
             "旧版本档案必须被拒 —— 否则会读出一份字段缺失的索引"
         );
-    }
-
-    #[test]
-    fn missing_file_returns_none() {
-        assert!(load(Path::new("/nonexistent/lodestar/index.bin")).is_none());
     }
 
     #[test]
@@ -597,18 +452,6 @@ mod tests {
     #[test]
     fn a_missing_archive_returns_none() {
         assert!(load_root(Path::new("/nonexistent/lodestar"), Path::new("/Users/me")).is_none());
-    }
-
-    #[test]
-    fn a_v2_archive_is_never_read_as_a_v3_archive() {
-        // 【为什么要钉住】v2 的头是「roots 列表」、v3 的头是「自己的根路径」——
-        //   布局不同，但**字符串是从同一个偏移开始读的**。版本号写错一位，
-        //   就会把「roots 列表」当成「根路径」读出来 → 静默读到错的档。
-        let entries = sample();
-        let v2 = serialize(&entries, &[PathBuf::from("/Users/me")]);
-        assert!(parse_root(&v2).is_none(), "v2 的档不能被 v3 读出来");
-        let v3 = serialize_root(Path::new("/Users/me"), &entries);
-        assert!(parse(&v3).is_none(), "v3 的档不能被 v2 读出来");
     }
 
     #[test]
@@ -834,13 +677,6 @@ mod tests {
         buf.extend_from_slice(b"/r");
         buf.extend_from_slice(&u32::MAX.to_le_bytes()); // 条目数：42.9 亿
         assert!(parse_root(&buf).is_none(), "在说谎的档必须被拒");
-
-        // v2 那边同理（v2 的档也还在用）
-        let mut buf2 = Vec::from(MAGIC);
-        buf2.extend_from_slice(&VERSION_V2.to_le_bytes());
-        buf2.extend_from_slice(&0u32.to_le_bytes());
-        buf2.extend_from_slice(&u32::MAX.to_le_bytes());
-        assert!(parse(&buf2).is_none(), "在说谎的 v2 档必须被拒");
     }
 
     #[test]

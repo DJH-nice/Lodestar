@@ -402,7 +402,7 @@ pub fn effective_index_paths(settings: &Settings) -> Vec<PathBuf> {
         .collect()
 }
 
-/// 建引擎（**不碰全局状态**）—— 返回 (Searcher, indexed)。
+/// 建引擎（**不碰全局状态**）—— 返回 (Searcher, indexed, 引擎实际的根)。
 ///
 /// 【参数是【已解析】的路径】空 → `$HOME` 的回退由调用方做
 /// （[`effective_paths`]）—— 这样「引擎索引哪些目录」与
@@ -421,7 +421,7 @@ pub fn effective_index_paths(settings: &Settings) -> Vec<PathBuf> {
 fn build_engine<R: Runtime>(
     app: &AppHandle<R>,
     resolved: &[String],
-) -> Result<(search_core::Searcher, u32), String> {
+) -> Result<(search_core::Searcher, u32, Vec<String>), String> {
     let refs: Vec<&Path> = resolved.iter().map(|p| Path::new(p)).collect();
     // 索引档现在是「**每根一个文件**」的目录（见 search-core/src/store.rs 的 v3 格式）。
     // ⚠️ 不能叫 index.bin —— 磁盘上那个 3.4MB 的旧 v2 档还占着这个名字，
@@ -433,7 +433,19 @@ fn build_engine<R: Runtime>(
         .map(|dir| dir.join("index"));
     let (engine, indexed) =
         search_core::Engine::new_with_store(&refs, store_dir).map_err(|e| e.to_string())?;
-    Ok((search_core::Searcher::new(engine), indexed))
+    // 【为什么报「引擎实际的根」，而不是请求的那份】
+    //   引擎会**静默丢弃嵌套根**（$HOME 与 $HOME/Documents → 只留前者）——
+    //   请求的路径表与引擎实际根**不一致** →
+    //     - 多一路**冗余**的 FSEvents 监听（`watcher.rs` 的 `desired_watch_dirs`
+    //       读的就是状态里的这一份）；
+    //     - 状态栏显示的目录数也不对。
+    //   → 状态里报**引擎实际**的那份（唯一真相）。
+    let roots: Vec<String> = engine
+        .roots()
+        .iter()
+        .map(|p| p.to_string_lossy().into_owned())
+        .collect();
+    Ok((search_core::Searcher::new(engine), indexed, roots))
 }
 
 /// 重建引擎并替换掉全局句柄。**阻塞** —— 必须在后台线程跑。
@@ -469,7 +481,7 @@ pub fn rebuild_engine<R: Runtime>(
     paths: &[String],
 ) -> Result<u32, String> {
     let resolved = effective_paths(paths);
-    let (searcher, indexed) = build_engine(app, &resolved)?;
+    let (searcher, indexed, actual_roots) = build_engine(app, &resolved)?;
     let new_searcher = std::sync::Arc::new(searcher);
     let state = app.state::<std::sync::Mutex<Option<std::sync::Arc<search_core::Searcher>>>>();
     // 【索引状态也要从 app 拿】—— 它跟引擎句柄一样是全局的一份
@@ -478,10 +490,10 @@ pub fn rebuild_engine<R: Runtime>(
     // 旧 Arc 在这里被 drop（join 旧 worker 线程 + fs_engine_free）
     *guard = Some(new_searcher);
     // 【同一把锁内提交状态】—— 装引擎 → 递增代次 → 提交，一步到位。
-    // paths 用的是**已解析**的那一份（和引擎索引的目录一致）。
+    // paths 用的是**引擎实际**的那一份（引擎会丢弃嵌套根 → 请求的那份可能更多）。
     // 【不动 scanning】—— scanning 归**持令牌的那一方**管：
     //   reindex 命令自己 begin() 拿到令牌，收尾时自己 end_scan(token)。
-    index_state.commit_new_engine(resolved, indexed);
+    index_state.commit_new_engine(actual_roots, indexed);
     Ok(indexed)
 }
 
@@ -572,7 +584,7 @@ pub fn rebuild_engine_if_absent<R: Runtime>(
         if let Some(hook) = take_build_hook() {
             hook();
         }
-        let (searcher, indexed) = build_engine(app, &resolved)?;
+        let (searcher, indexed, actual_roots) = build_engine(app, &resolved)?;
 
         // ③ 同一把锁：再判空 → 装上 + 提交状态
     let state = app.state::<std::sync::Mutex<Option<std::sync::Arc<search_core::Searcher>>>>();
@@ -586,10 +598,10 @@ pub fn rebuild_engine_if_absent<R: Runtime>(
     }
     *guard = Some(std::sync::Arc::new(searcher));
     // 【同一把锁内提交状态】—— 判空 → 装引擎 → 提交状态，一步到位。
-    // paths 用的是**已解析**的那一份（和引擎索引的目录一致）。
+    // paths 用的是**引擎实际**的那一份（引擎会丢弃嵌套根 → 请求的那份可能更多）。
     // 【递增引擎代次】—— 换引擎了 → 代次 +1（M1，见 `index_state.rs`）。
     // 【不动 scanning】—— 收尾归 run_scan_blocking。
-    index_state.commit_new_engine(resolved, indexed);
+    index_state.commit_new_engine(actual_roots, indexed);
     // ④ 续：自己的扫描结束（scanning 由 run_scan_blocking 管的令牌持有者负责）
     // 【放在槽位锁释放之后】—— end_scan 拿的是 IndexState 自己的锁，
     //   与槽位锁不是同一把 → 不会死锁（锁序：槽位锁 → IndexState 锁）。

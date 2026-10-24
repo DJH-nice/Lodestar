@@ -256,6 +256,13 @@ impl Engine {
 
     /// 分离一个根目录 —— 条目**立即**从索引里消失。
     ///
+    /// 【⚠️ 路径必须与 attach 时**逐字相同**】
+    ///   这里比的是**索引空间写法**（`self.roots` 与条目路径），
+    ///   **不是**规范化后的真实路径 ——
+    ///   拼写不同（例如 attach 用 `/Volumes/U盘`、detach 用它的真实路径）
+    ///   → **静默无效** → 条目留着 = **幽灵条目**（用户最不能接受的那种）。
+    ///   → 摘根时要用与挂载时**完全一样**的那个字符串。
+    ///
     /// 【它的档不删】—— 插回来时要复用（用户要的是「插回来立刻能搜」）。
     /// 档不动是因为落盘只写「当前在索引里的根」→ 拔掉的卷那份文件原地不动 ✓。
     pub fn detach_root(&self, root: &Path) -> u32 {
@@ -538,7 +545,11 @@ impl Engine {
     }
 
     /// （索引空间根, 真实路径根）的对照表。
-    fn root_pairs(&self) -> Vec<(PathBuf, PathBuf)> {
+    ///
+    /// 【为什么 worker 需要它】FSEvents 报的是**真实路径**
+    ///   （`/private/tmp/...`），索引里的路径是按**索引空间**拼的 ——
+    ///   两边要靠这张表对上（「这条变化属于哪个根？」）。
+    pub fn root_pairs(&self) -> Vec<(PathBuf, PathBuf)> {
         let roots = self.roots.borrow();
         let real_roots = self.real_roots.borrow();
         roots
@@ -546,6 +557,17 @@ impl Engine {
             .zip(real_roots.iter())
             .map(|(a, b)| (a.clone(), b.clone()))
             .collect()
+    }
+
+    /// 引擎**实际**索引的根目录（索引空间写法）。
+    ///
+    /// 【为什么不能报「请求的那份」】引擎会**静默丢弃嵌套根**
+    ///   （见 [`drop_nested_roots`]）—— 请求的路径表与实际根不一致 →
+    ///   多一路冗余的 FSEvents 监听（`watcher.rs` 的 `desired_watch_dirs`
+    ///   读的就是它）+ 状态栏显示的目录数也不对。
+    ///   → 上层要报「引擎索引了哪些目录」，就报这一份。
+    pub fn roots(&self) -> Vec<PathBuf> {
+        self.roots.borrow().clone()
     }
 
     /// 索引档的**目录**（没有就说明**没开**落盘）。
@@ -557,8 +579,8 @@ impl Engine {
     ///
     /// 【这个函数返回的是「所有根」的快照】
     ///   引擎**不知道**哪个根变了 → 「只重写变了的根」是 **worker 侧**的职责
-    ///   （worker 拿着旧快照对比，见 `worker.rs` 的落盘槽）。
-    ///   → 调用方（worker）自己决定写哪些档。
+    ///   （worker 拿变化路径映射回根，见 `worker.rs` 的落盘那段）。
+    ///   → 要只序列化某几个根，用 [`Engine::serialize_roots_for_store`]。
     ///
     /// 【为什么要按根切】每根一个档 → 插拔一个外接卷**只作废它自己那份**，
     ///   $HOME 的档**不受影响**（这一条是**读档侧**真的成立的，见 `store.rs` 的 v3 说明）。
@@ -572,6 +594,21 @@ impl Engine {
     ///   （新建 inode 的 fsync 很贵）—— 放在关键路径上会毁掉增量更新的
     ///   「几毫秒」承诺，还会把排在后面的搜索堵住。
     pub fn serialize_for_store(&self) -> Vec<(PathBuf, Vec<u8>)> {
+        let roots = self.roots.borrow().clone();
+        self.serialize_roots_for_store(&roots)
+    }
+
+    /// **只**序列化指定的那几个根 —— worker 用它实现「只重写变了的根」。
+    ///
+    /// 【为什么要有这个「只挑几个」的版本】
+    ///   落盘是**每 2 秒**一次的后台动作。插着一个 10 万文件的 U 盘时，
+    ///   每次都把**所有**根重新序列化一遍 → 光 CPU 就是几毫秒到几十毫秒，
+    ///   而 $HOME 那份**根本没变**。
+    ///   → 只序列化**真的变了**的那个根 ✓。
+    ///
+    /// 【为什么「不写」不等于「删掉」】
+    ///   没被挑中的根，它磁盘上的档**本来就是对的** ✓（不提交 ≠ 删掉）。
+    pub fn serialize_roots_for_store(&self, wanted: &[PathBuf]) -> Vec<(PathBuf, Vec<u8>)> {
         // 没有索引档 → 没什么可落盘的
         let Some(dir) = self.store_dir.as_ref() else {
             return Vec::new();
@@ -580,6 +617,8 @@ impl Engine {
         let roots = self.roots.borrow();
         roots
             .iter()
+            // 【不在「要的」名单里 → 不碰】—— 档文件原地不动 ✓
+            .filter(|root| wanted.contains(root))
             .map(|root| {
                 let part: Vec<IndexEntry> = entries
                     .iter()
@@ -593,7 +632,7 @@ impl Engine {
     }
     /// 全部索引条目的一份**拷贝**。
     ///
-    /// 【谁在用】落盘。`store::save` 要的是 `&[IndexEntry]`，
+    /// 【谁在用】落盘。`store::serialize_root` 要的是 `&[IndexEntry]`，
     ///   而条目归引擎的 `RefCell` 所有 —— 借出去会撞上运行期借用检查，
     ///   所以这里给一份快照（拷贝）。
     ///
@@ -730,7 +769,10 @@ fn drop_nested_roots(candidates: Vec<PathBuf>) -> Vec<PathBuf> {
 ///
 /// 【为什么是「一份真相」】归属判定有两处要用（摘根时删条目、切档时挑条目），
 ///   两处口径不一致的话，摘根会**连带删掉别的根的条目**（见 [`Engine::detach_root`]）。
-fn path_in_root(path: &Path, root: &Path) -> bool {
+///   现在**还有第三处**（worker 侧「这条变化属于哪个根？」）——
+///   → 把它开放成 `pub(crate)`，让 worker 也用**这一份**，
+///   而不是自己再写一遍 `starts_with`。
+pub(crate) fn path_in_root(path: &Path, root: &Path) -> bool {
     path.starts_with(root)
 }
 
@@ -1165,6 +1207,44 @@ mod tests {
         // 档目录里应该有两个档（每根一个）
         let files = std::fs::read_dir(&store_dir).unwrap().count();
         assert_eq!(files, 2, "每个根一份档");
+
+        let _ = std::fs::remove_dir_all(&store_dir);
+        let _ = std::fs::remove_dir_all(&dir_a);
+        let _ = std::fs::remove_dir_all(&dir_b);
+    }
+
+    /// **只**序列化「要」的那几个根 —— 别的根**不碰**。
+    ///
+    /// 【为什么要有这条】落盘是**每 2 秒**一次的后台动作：
+    ///   插着一个 10 万文件的 U 盘时，每次都全量重写要动十几 MB，
+    ///   而 $HOME 那份**根本没变** → 白烧 CPU 与 I/O。
+    ///   → worker 只把**变了**的根交给这个函数 ✓。
+    #[test]
+    fn only_the_requested_roots_are_serialized() {
+        let dir_a = fixture();
+        let dir_b = fixture();
+        let store_dir = std::env::temp_dir().join(format!(
+            "lodestar-engine-store3-{}-{}",
+            std::process::id(),
+            SEQ.fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+        ));
+        let _ = std::fs::remove_dir_all(&store_dir);
+        let (engine, _) = Engine::new_with_store(
+            &[dir_a.as_path(), dir_b.as_path()],
+            Some(store_dir.clone()),
+        )
+        .unwrap();
+
+        let only_a = engine.serialize_roots_for_store(&[dir_a.clone()]);
+        assert_eq!(only_a.len(), 1, "只该序列化要的那个根");
+        assert_eq!(
+            only_a[0].0,
+            store::root_archive_path(&store_dir, &dir_a),
+            "交出去的档路径必须是那个根自己的档"
+        );
+
+        let all = engine.serialize_for_store();
+        assert_eq!(all.len(), 2, "全部根都要在");
 
         let _ = std::fs::remove_dir_all(&store_dir);
         let _ = std::fs::remove_dir_all(&dir_a);
