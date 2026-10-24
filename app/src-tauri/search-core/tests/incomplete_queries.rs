@@ -21,7 +21,7 @@ fn make_tree() -> PathBuf {
     static SEQ: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
     let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
     let root = std::env::temp_dir().join(format!(
-        "sextant-incomplete-{}-{}",
+        "lodestar-incomplete-{}-{}",
         std::process::id(),
         seq
     ));

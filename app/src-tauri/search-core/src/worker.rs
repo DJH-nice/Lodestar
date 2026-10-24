@@ -44,7 +44,7 @@ impl Searcher {
     pub fn new(engine: Engine) -> Searcher {
         let (tx, rx) = channel::<Job>();
         let handle = std::thread::Builder::new()
-            .name("sextant-search".into())
+            .name("lodestar-search".into())
             .spawn(move || {
                 // 当前 query —— 翻页请求必须与之一致，
                 // 否则它读到的其实是上一次搜索的视图。

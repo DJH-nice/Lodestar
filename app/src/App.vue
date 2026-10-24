@@ -544,7 +544,7 @@ async function listenForUserGuide(): Promise<void> {
     /* 【什么时候会失败】不在 Tauri 环境里（单元测试、浏览器里直接开 vite dev）。
        那时没有原生菜单栏可点，事件也不会来 —— 不影响别的功能。
        （单元测试里这个模块被 mock 掉了，见 App.test.ts / UserGuide.test.ts。） */
-    console.warn("[sextant] 监听「打开手册」事件失败（不在 Tauri 环境里？）", e);
+    console.warn("[lodestar] 监听「打开手册」事件失败（不在 Tauri 环境里？）", e);
   }
 }
 
@@ -565,7 +565,7 @@ async function listenForSyntaxCheatsheet(): Promise<void> {
     });
     unlistenSyntaxCheatsheet = un;
   } catch (e) {
-    console.warn("[sextant] 监听「打开语法速查」事件失败（不在 Tauri 环境里？）", e);
+    console.warn("[lodestar] 监听「打开语法速查」事件失败（不在 Tauri 环境里？）", e);
   }
 }
 
@@ -589,7 +589,7 @@ async function listenForCredits(): Promise<void> {
     });
     unlistenCredits = un;
   } catch (e) {
-    console.warn("[sextant] 监听「打开致谢与许可」事件失败（不在 Tauri 环境里？）", e);
+    console.warn("[lodestar] 监听「打开致谢与许可」事件失败（不在 Tauri 环境里？）", e);
   }
 }
 
@@ -633,7 +633,7 @@ async function listenForAwake(): Promise<void> {
   } catch (e) {
     /* 【什么时候会失败】不在 Tauri 环境里（单元测试、浏览器里直接开 vite dev）。
        那时不会有唤起事件 —— 不影响别的功能。 */
-    console.warn("[sextant] 监听「已唤起」事件失败（不在 Tauri 环境里？）", e);
+    console.warn("[lodestar] 监听「已唤起」事件失败（不在 Tauri 环境里？）", e);
   }
 }
 
@@ -675,7 +675,7 @@ async function listenForVisibility(): Promise<void> {
   } catch (e) {
     /* 【什么时候会失败】不在 Tauri 环境里（单元测试、浏览器里直接开 vite dev）。
        那时不会有可见性事件 —— 不影响别的功能。 */
-    console.warn("[sextant] 监听「窗口可见性」事件失败（不在 Tauri 环境里？）", e);
+    console.warn("[lodestar] 监听「窗口可见性」事件失败（不在 Tauri 环境里？）", e);
   }
 }
 
@@ -723,7 +723,7 @@ async function listenForOpenSettings(): Promise<void> {
   } catch (e) {
     /* 【什么时候会失败】不在 Tauri 环境里（单元测试、浏览器里直接开 vite dev）。
        那时没有托盘可点 —— 不影响别的功能。 */
-    console.warn("[sextant] 监听「打开设置」事件失败（不在 Tauri 环境里？）", e);
+    console.warn("[lodestar] 监听「打开设置」事件失败（不在 Tauri 环境里？）", e);
   }
 }
 
@@ -764,7 +764,7 @@ async function listenForAutoRefresh(): Promise<void> {
   } catch (e) {
     /* 【什么时候会失败】不在 Tauri 环境里（单元测试、浏览器里直接开 vite dev）。
        那时没有后端、不会有自动刷新事件 —— 不影响别的功能。 */
-    console.warn("[sextant] 监听「索引自动刷新」事件失败（不在 Tauri 环境里？）", e);
+    console.warn("[lodestar] 监听「索引自动刷新」事件失败（不在 Tauri 环境里？）", e);
   }
 }
 
@@ -794,7 +794,7 @@ async function onRescan() {
     refreshKey.value += 1;
   } catch (e) {
     /* 失败原因已经进了 index_status.error —— 下一个轮询周期状态栏会显示它。 */
-    console.error("[sextant] 重新扫描失败", e);
+    console.error("[lodestar] 重新扫描失败", e);
   } finally {
     /* 成功、失败都要复位 —— 见上面 rescanBusy 的说明。 */
     rescanBusy.value = false;
@@ -840,7 +840,7 @@ async function onSearchSubmit() {
     bookmarks.value = saved.bookmarks;
     recentQueries.value = saved.recentQueries;
   } catch (e) {
-    console.error("[sextant] 记录最近搜索失败", e);
+    console.error("[lodestar] 记录最近搜索失败", e);
   }
 }
 
@@ -858,7 +858,7 @@ async function toggleCurrentQueryBookmark() {
     bookmarks.value = saved.bookmarks;
     recentQueries.value = saved.recentQueries;
   } catch (e) {
-    console.error("[sextant] 收藏失败", e);
+    console.error("[lodestar] 收藏失败", e);
     bookmarkError.value = String(e);
   }
 }
@@ -881,7 +881,7 @@ async function togglePathBookmark(path: string) {
     bookmarks.value = saved.bookmarks;
     recentQueries.value = saved.recentQueries;
   } catch (e) {
-    console.error("[sextant] 收藏路径失败", e);
+    console.error("[lodestar] 收藏路径失败", e);
     /* 不静默吞掉 —— 菜单与卡片底部会显示它。 */
     pathBookmarkError.value = String(e);
   }
@@ -902,7 +902,7 @@ async function onRemoveBookmark(b: Bookmark) {
     bookmarks.value = saved.bookmarks;
     recentQueries.value = saved.recentQueries;
   } catch (e) {
-    console.error("[sextant] 删除书签失败", e);
+    console.error("[lodestar] 删除书签失败", e);
     panelError.value = `删除书签失败：${String(e)}`;
   }
 }
@@ -921,7 +921,7 @@ async function onUsePath(path: string) {
   try {
     await revealItemInDir(path);
   } catch (e) {
-    console.error("[sextant] 在访达里定位失败", e);
+    console.error("[lodestar] 在访达里定位失败", e);
   }
 }
 
@@ -948,7 +948,7 @@ async function onExportBookmarks() {
     if (!path) return;
     await writeBookmarksFile(path, buildBookmarksFile(bookmarks.value));
   } catch (e) {
-    console.error("[sextant] 导出书签失败", e);
+    console.error("[lodestar] 导出书签失败", e);
     panelError.value = `导出书签失败：${String(e)}`;
   }
 }
@@ -985,7 +985,7 @@ async function onImportBookmarks() {
     bookmarks.value = saved.bookmarks;
     recentQueries.value = saved.recentQueries;
   } catch (e) {
-    console.error("[sextant] 导入书签失败", e);
+    console.error("[lodestar] 导入书签失败", e);
     panelError.value = `导入书签失败：${String(e)}`;
   }
 }

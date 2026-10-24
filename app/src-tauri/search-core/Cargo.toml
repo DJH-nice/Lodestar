@@ -1,7 +1,7 @@
 [package]
 name = "search-core"
 version = "0.1.0"
-description = "Sextant 的自研搜索引擎内核（纯 Rust，不依赖 Tauri）"
+description = "Lodestar 的自研搜索引擎内核（纯 Rust，不依赖 Tauri）"
 edition = "2021"
 rust-version = "1.90"
 

@@ -1,4 +1,4 @@
-# Sextant —— 应用层开发说明
+# Lodestar —— 应用层开发说明
 
 这个目录是 **Tauri v2（Rust）+ Vue 3 + TypeScript** 的应用层。
 **搜索引擎内核不在这里**，在 `src-tauri/search-core/`（纯 Rust，不依赖 Tauri）。
@@ -110,8 +110,8 @@ bash app/scripts/bundle-app.sh
 
 | 文件 | 说明 |
 |---|---|
-| `Sextant.app` | 应用包本体（当前 **5.8M**） |
-| `Sextant.dmg` | 磁盘映像，给别人用（当前 **4.2M**） |
+| `Lodestar.app` | 应用包本体（当前 **5.8M**） |
+| `Lodestar.dmg` | 磁盘映像，给别人用（当前 **4.2M**） |
 
 ### 自检都查什么
 
@@ -163,7 +163,7 @@ macOS 只把 webview 的定时器**限流到 ~1Hz**，不会停掉它。
 
 ### 设置文件在哪
 
-`~/Library/Application Support/com.sextant.macos/settings.json`
+`~/Library/Application Support/com.lodestar.macos/settings.json`
 （目录名 = `tauri.conf.json` 的 `identifier`）。
 
 改 `identifier` = 换目录 = 老用户的设置全读不到 → **必须**在

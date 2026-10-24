@@ -370,7 +370,7 @@ mod tests {
     fn fixture() -> PathBuf {
         static SEQ: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
         let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        let dir = std::env::temp_dir().join(format!("sextant-scan-{}-{}", std::process::id(), seq));
+        let dir = std::env::temp_dir().join(format!("lodestar-scan-{}-{}", std::process::id(), seq));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(dir.join("sub")).unwrap();
         std::fs::write(dir.join("alpha.txt"), "hello").unwrap();

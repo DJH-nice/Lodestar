@@ -100,7 +100,7 @@ mod tests {
     fn library_subtree_is_excluded() {
         // `~/Library` 底下的一切都不进索引（26 万条目的那棵子树）
         assert!(path_is_excluded(Path::new(
-            "/Users/someone/Library/WebKit/com.sextant.macos/x.db"
+            "/Users/someone/Library/WebKit/com.lodestar.macos/x.db"
         )));
         assert!(path_is_excluded(Path::new("/Users/someone/Library")));
     }

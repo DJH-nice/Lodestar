@@ -37,7 +37,7 @@ fn make_tree() -> PathBuf {
     static SEQ: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
     let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
     let root = std::env::temp_dir().join(format!(
-        "sextant-fields-{}-{}",
+        "lodestar-fields-{}-{}",
         std::process::id(),
         seq
     ));
@@ -83,7 +83,7 @@ fn hits(engine: &Engine, query: &str) -> Vec<String> {
 fn child_counts_survive_the_round_trip_and_match_the_tree() {
     let root = make_tree();
     let store_path = std::env::temp_dir().join(format!(
-        "sextant-fields-store-{}.bin",
+        "lodestar-fields-store-{}.bin",
         std::process::id()
     ));
     let _ = std::fs::remove_file(&store_path);
@@ -120,7 +120,7 @@ fn child_counts_survive_the_round_trip_and_match_the_tree() {
 fn child_file_and_folder_counts_are_correct() {
     let root = make_tree();
     let store_path = std::env::temp_dir().join(format!(
-        "sextant-fields-store2-{}.bin",
+        "lodestar-fields-store2-{}.bin",
         std::process::id()
     ));
     let _ = std::fs::remove_file(&store_path);

@@ -1,7 +1,7 @@
 //! 应用生命周期 —— **状态机 + 空闲判定 + 唤起序列**。
 //!
 //! 【这个模块解决什么】
-//!   Sextant 改成「后台常驻」之后，需要一个地方统一回答三个问题：
+//!   Lodestar 改成「后台常驻」之后，需要一个地方统一回答三个问题：
 //!   ① 现在是「待用」还是「空闲」？
 //!   ② 什么时候该从「待用」切到「空闲」（= 该暂停自动重扫了）？
 //!   ③ 用户唤起时，窗口要怎么弄出来、索引要怎么补上？
@@ -57,7 +57,7 @@ pub const VISIBILITY_EVENT: &str = "app-visibility";
 ///   而写歪了的后果是「前端以为窗口还开着 → 继续白烧 CPU」。
 pub fn emit_visibility<R: Runtime>(app: &AppHandle<R>, visible: bool) {
     if let Err(e) = app.emit(VISIBILITY_EVENT, visible) {
-        eprintln!("[sextant] 通知前端「窗口可见性」失败: {e}");
+        eprintln!("[lodestar] 通知前端「窗口可见性」失败: {e}");
     }
 }
 
@@ -214,7 +214,7 @@ fn lock_unpoisoned<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
         Err(e) => {
             static POISON_LOGGED: Once = Once::new();
             POISON_LOGGED.call_once(|| {
-                eprintln!("[sextant] 生命周期锁中毒（取回内值继续跑）");
+                eprintln!("[lodestar] 生命周期锁中毒（取回内值继续跑）");
             });
             e.into_inner()
         }
@@ -657,7 +657,7 @@ pub fn wake<R: Runtime>(app: &AppHandle<R>) {
     //   它**不是**「窗口回来了」的信号 ——
     //   「打开设置」那条路要的是抽屉，不是搜索框（见 [`open_settings`]）。
     if let Err(e) = app.emit(AWAKE_EVENT, ()) {
-        eprintln!("[sextant] 通知前端「已唤起」失败: {e}");
+        eprintln!("[lodestar] 通知前端「已唤起」失败: {e}");
     }
 }
 
@@ -746,7 +746,7 @@ pub fn toggle<R: Runtime>(app: &AppHandle<R>) {
 ///    两条路径都指不到「抽屉被抢焦点」这件事。）
 pub fn open_settings<R: Runtime>(app: &AppHandle<R>) {
     if let Err(e) = app.emit(OPEN_SETTINGS_EVENT, ()) {
-        eprintln!("[sextant] 通知前端打开设置失败: {e}");
+        eprintln!("[lodestar] 通知前端打开设置失败: {e}");
     }
     wake_window(app);
 }
@@ -793,7 +793,7 @@ fn ensure_on_screen<R: Runtime>(app: &AppHandle<R>, win: &WebviewWindow<R>) {
     };
     let (x, y) = centered_on(target, window_rect);
     if let Err(e) = win.set_position(tauri::PhysicalPosition::new(x, y)) {
-        eprintln!("[sextant] 把窗口拉回屏幕失败: {e}");
+        eprintln!("[lodestar] 把窗口拉回屏幕失败: {e}");
     } else {
         crate::logging::log_line(&format!(
             "[lifecycle] 窗口原位置 ({}, {}) 不在任何屏幕上 → 拉回 ({}, {})",

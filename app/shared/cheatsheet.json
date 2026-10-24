@@ -1,6 +1,6 @@
 {
   "version": 1,
-  "note": "Sextant macOS 的「搜索语法速查卡」。每条 query 都用真实引擎实跑验证过（2026-10-24）。改这个文件前请先看 app/src-tauri/search-core/tests/cheatsheet_queries.rs —— 里面的测试会拿每条 query 去问引擎，语法写错会直接红。",
+  "note": "Lodestar macOS 的「搜索语法速查卡」。每条 query 都用真实引擎实跑验证过（2026-10-24）。改这个文件前请先看 app/src-tauri/search-core/tests/cheatsheet_queries.rs —— 里面的测试会拿每条 query 去问引擎，语法写错会直接红。",
   "groups": [
     {
       "key": "daily",

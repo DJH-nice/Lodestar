@@ -87,7 +87,7 @@ export function parseBookmarksFile(text: string): ParsedBookmarks {
   if (obj.format !== BOOKMARKS_FORMAT) {
     return {
       ok: false,
-      error: `不是 Sextant 书签文件（format 应为 "${BOOKMARKS_FORMAT}"）`,
+      error: `不是 Lodestar 书签文件（format 应为 "${BOOKMARKS_FORMAT}"）`,
     };
   }
   if (obj.version !== BOOKMARKS_VERSION) {

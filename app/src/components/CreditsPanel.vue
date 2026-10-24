@@ -8,7 +8,7 @@ import { getVersion } from "@tauri-apps/api/app";
  *  【为什么要有这个面板】软件装进 `/Applications` 之后，
  *   绝大多数用户不会再去翻仓库 → 许可与出处**必须能在应用里看见**。
  *
- *  【为什么不叫「关于」】macOS 的应用菜单里已经有系统的「关于 Sextant」
+ *  【为什么不叫「关于」】macOS 的应用菜单里已经有系统的「关于 Lodestar」
  *   （显示版本号与版权）。再放一个同名项会让人以为是同一个东西。
  *   → 这里叫「致谢与许可」，指向的是**法务信息**（许可 + 第三方组件）。
  *
@@ -46,7 +46,7 @@ onMounted(async () => {
       </header>
 
       <div class="panel-body credits-body">
-        <h3>Sextant</h3>
+        <h3>Lodestar</h3>
         <p class="credits-sub">
           版本 {{ version }} · macOS 上的文件搜索器
         </p>
@@ -66,11 +66,11 @@ onMounted(async () => {
         <p>
           本软件整体按
           <strong>MIT 许可</strong>发布
-          （Copyright © 2026 Sextant contributors）。
+          （Copyright © 2026 Lodestar contributors）。
         </p>
         <p class="credits-note">
           许可证全文与第三方组件声明装在本应用内：
-          <code>Sextant.app/Contents/Resources/licenses/</code>
+          <code>Lodestar.app/Contents/Resources/licenses/</code>
           （在访达里右键本应用 →「显示包内容」即可看到）。
         </p>
 

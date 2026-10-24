@@ -258,7 +258,7 @@ export function shortcutViewFromChange(res: ShortcutChange): ShortcutView {
  *
  *  【为什么要有这个函数】
  *   设置里存的是**用户的偏好**（「我想用 ⌥⌘Space」），
- *   而面板要显示的是「**此刻按下去会不会唤起 Sextant**」。
+ *   而面板要显示的是「**此刻按下去会不会唤起 Lodestar**」。
  *   两者会分叉 —— 终审 I-1 的那条证据链：
  *     启动时 ⌥⌘Space 被别的软件占着 → 注册失败 →
  *     设置里**一个字都没改**（偏好留着，好让用户重试）→

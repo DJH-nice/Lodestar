@@ -36,16 +36,23 @@ const SETTINGS_KEY: &str = "settings";
 ///     索引目录**全都读不到了**（用户看到的是「设置被清空」）。
 ///
 /// 【为什么是「一条链」而不是一个】
-///   identifier 改过两次：
+///   identifier 改过三次：
 ///     `com.fsearch.macos` →（2026-10-23 改名 Lodestar）→ `com.lodestar.macos`
 ///     →（2026-10-23 改名 Sextant）→ `com.sextant.macos`
+///     →（2026-10-24 改回 Lodestar）→ `com.lodestar.macos`
 ///   每一代的用户都可能在用，所以**每一代都要能被迁过来**。
-///   顺序：**最近的优先**（`com.lodestar.macos` 是绝大多数用户当前所在的那一代）。
+///   顺序：**最近的优先**（`com.sextant.macos` 是当前用户实际在用的那一代 ——
+///
+///   ⚠️ **当前 identifier 本身就是 `com.lodestar.macos`**，
+///   所以它**绝不能出现在这个列表里** ——
+///   出现了的话，迁移会拿「自己」当源拷贝到自己身上（自我覆盖）。
+///   （2026-10-24 那次改名回退就踩过这个坑：列表里留着 `com.lodestar.macos`，
+///   而新目录恰好也叫它 → 迁移在自环。）
 ///
 /// 【为什么只迁最靠前的那一个】
 ///   同时存在两个旧目录的情况几乎不存在（迁移时旧目录会被改名成 `.bak`），
 ///   而「挑最靠前的那个」符合直觉：那是用户最后一次真正在用的那份设置。
-const LEGACY_CONFIG_DIR_NAMES: &[&str] = &["com.lodestar.macos", "com.fsearch.macos"];
+const LEGACY_CONFIG_DIR_NAMES: &[&str] = &["com.sextant.macos", "com.fsearch.macos"];
 
 /// 把**旧目录**里的设置迁移到**新目录**（一次性、幂等）。
 ///
@@ -66,7 +73,7 @@ const LEGACY_CONFIG_DIR_NAMES: &[&str] = &["com.lodestar.macos", "com.fsearch.ma
 ///   迁移只是「锦上添花」，失败了就当没有旧设置，用默认设置跑。
 pub fn migrate_legacy_store<R: Runtime>(app: &AppHandle<R>) {
     let Ok(new_dir) = app.path().app_config_dir() else {
-        eprintln!("[sextant] 迁移设置：取不到 app config 目录，跳过");
+        eprintln!("[lodestar] 迁移设置：取不到 app config 目录，跳过");
         return;
     };
     let new_file = new_dir.join(STORE_FILE);
@@ -90,11 +97,11 @@ pub fn migrate_legacy_store<R: Runtime>(app: &AppHandle<R>) {
     let legacy_file = legacy_dir.join(STORE_FILE);
 
     if let Err(e) = std::fs::create_dir_all(&new_dir) {
-        eprintln!("[sextant] 迁移设置：建新目录失败: {e}");
+        eprintln!("[lodestar] 迁移设置：建新目录失败: {e}");
         return;
     }
     if let Err(e) = std::fs::copy(&legacy_file, &new_file) {
-        eprintln!("[sextant] 迁移设置：拷贝失败: {e}");
+        eprintln!("[lodestar] 迁移设置：拷贝失败: {e}");
         return;
     }
 
@@ -102,9 +109,9 @@ pub fn migrate_legacy_store<R: Runtime>(app: &AppHandle<R>) {
     let backup = parent.join(format!("{legacy_name}.bak"));
     if let Err(e) = std::fs::rename(&legacy_dir, &backup) {
         // 改名失败不影响已经拷过去的数据，只是旧目录还留在那儿。
-        eprintln!("[sextant] 迁移设置：旧目录改名失败（数据已迁移，不影响使用）: {e}");
+        eprintln!("[lodestar] 迁移设置：旧目录改名失败（数据已迁移，不影响使用）: {e}");
     }
-    eprintln!("[sextant] 已把旧设置从 {legacy_file:?} 迁移到 {new_file:?}");
+    eprintln!("[lodestar] 已把旧设置从 {legacy_file:?} 迁移到 {new_file:?}");
 }
 
 /// 一条书签。
@@ -171,7 +178,7 @@ pub struct Settings {
     ///   没有这个字段 —— 要能正常读出来（默认 true），不能整个读不出来。
     #[serde(default = "default_true")]
     pub auto_refresh: bool,
-    /// **全局快捷键** —— 在任何 app 里按下它都能唤起 Sextant。
+    /// **全局快捷键** —— 在任何 app 里按下它都能唤起 Lodestar。
     ///
     /// `None` = 不注册（用户主动关掉了）。
     ///
@@ -271,7 +278,7 @@ pub fn load<R: Runtime>(app: &AppHandle<R>) -> Settings {
     let store = match app.store(STORE_FILE) {
         Ok(s) => s,
         Err(e) => {
-            eprintln!("[sextant] 打开配置失败，用默认设置: {e}");
+            eprintln!("[lodestar] 打开配置失败，用默认设置: {e}");
             return Settings::default();
         }
     };
@@ -280,7 +287,7 @@ pub fn load<R: Runtime>(app: &AppHandle<R>) -> Settings {
         Some(v) => match serde_json::from_value(v) {
             Ok(s) => s,
             Err(e) => {
-                eprintln!("[sextant] 配置解析失败，用默认设置: {e}");
+                eprintln!("[lodestar] 配置解析失败，用默认设置: {e}");
                 Settings::default()
             }
         },
@@ -486,7 +493,7 @@ pub fn rebuild_engine<R: Runtime>(
 ///   实测踩过（探针日志）：
 ///     reindex(临时目录) → 索引就绪：2 项
 ///     search "marker"  → 1 条 ✓
-///     [sextant] 索引就绪：57817 项     ← 启动线程把引擎换回 $HOME
+///     [lodestar] 索引就绪：57817 项     ← 启动线程把引擎换回 $HOME
 ///     search "marker"  → 0 条 ✗        ← 同一句查询，结果凭空没了
 ///
 /// 【竞态为什么这样就没有了】两个装入点：

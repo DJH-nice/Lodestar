@@ -932,7 +932,7 @@ fn build_regex(pattern: &str, case_sensitive: bool, _quoted: bool) -> Pattern {
         Ok(r) => Pattern::Regex(Box::new(r)),
         Err(e) => {
             // 非法正则 → 退化成普通子串（总比整个查询失败强）
-            eprintln!("[sextant] 正则编译失败（{e}），退化成普通匹配：{pattern}");
+            eprintln!("[lodestar] 正则编译失败（{e}），退化成普通匹配：{pattern}");
             Pattern::Plain {
                 folded: fold(pattern),
                 needle: pattern.to_string(),

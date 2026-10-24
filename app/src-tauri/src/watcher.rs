@@ -812,7 +812,7 @@ pub fn apply_watch_list<T: WatchTarget>(
                 // 【只报一次】同一个目录失败一次就够了 ——
                 //   每秒重试是对的（目录可能稍后才出现），但每秒打一行日志不行。
                 if failed.insert(p.clone()) {
-                    eprintln!("[sextant] 监听目录 {} 失败: {e}", p.display());
+                    eprintln!("[lodestar] 监听目录 {} 失败: {e}", p.display());
                 }
             }
         }
@@ -969,7 +969,7 @@ pub fn spawn_watcher<R: Runtime>(app: &AppHandle<R>) {
                 //   watcher 监听的是**索引目录**（$HOME），FSEvents 是**递归**的
                 //   → 它看得见 $HOME 下的每一个变化，包括：
                 //     · `~/Library/...`（引擎排除了，但 watcher 照样看得见）
-                //       典型触发者：**Sextant 自己的 webview 数据**
+                //       典型触发者：**Lodestar 自己的 webview 数据**
                 //       （~/Library/WebKit/com.fsearch.macos/…）、Edge、百度网盘…
                 //     · `~/.minimax/...`（agent 的会话日志，一直在写）
                 //   这些路径**一个字节都不会进索引**，
@@ -1016,7 +1016,7 @@ pub fn spawn_watcher<R: Runtime>(app: &AppHandle<R>) {
                     ));
                 }
             }
-            Err(e) => eprintln!("[sextant] 文件监控出错: {e}"),
+            Err(e) => eprintln!("[lodestar] 文件监控出错: {e}"),
         },
     );
 
@@ -1032,11 +1032,11 @@ pub fn spawn_watcher<R: Runtime>(app: &AppHandle<R>) {
                     reconcile_loop(handle, watcher, t_signals, t_watched, t_count)
                 });
             if let Err(e) = spawned {
-                eprintln!("[sextant] 起文件监控线程失败，「自动刷新」不可用: {e}");
+                eprintln!("[lodestar] 起文件监控线程失败，「自动刷新」不可用: {e}");
             }
         }
         Err(e) => {
-            eprintln!("[sextant] 建文件监控失败，「自动刷新」不可用: {e}");
+            eprintln!("[lodestar] 建文件监控失败，「自动刷新」不可用: {e}");
         }
     }
 }
@@ -1141,7 +1141,7 @@ fn reconcile_loop<R: Runtime>(
                 ));
             }
             Err(e) => {
-                eprintln!("[sextant] 自动重扫失败: {e}");
+                eprintln!("[lodestar] 自动重扫失败: {e}");
                 crate::logging::log_line(&format!("[watch] 自动重扫 #{count} 失败: {e}"));
             }
         }
@@ -1176,7 +1176,7 @@ fn auto_rescan<R: Runtime>(app: &AppHandle<R>) -> Result<u32, String> {
     snapshot.visible = crate::lifecycle::window_visible(&app);
     if let Err(e) = app.emit(AUTO_REFRESH_EVENT, snapshot) {
         // 【重扫本身是成功的】—— 只是事件发不出去（运行时已经停了）。
-        eprintln!("[sextant] 自动重扫完成，但通知前端失败: {e}");
+        eprintln!("[lodestar] 自动重扫完成，但通知前端失败: {e}");
         crate::logging::log_line(&format!("[watch] 自动重扫完成，但事件发不出去: {e}"));
     }
     Ok(indexed)

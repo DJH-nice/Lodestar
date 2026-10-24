@@ -8,12 +8,12 @@
 //!   → 探针可以删，日志出口必须留 —— 所以把它拆成独立模块。
 //!
 //! 【它做什么】
-//!   一行到 stdout（`[sextant] …`）。debug 构建下**额外**落一份到
-//!   `/tmp/sextant-app.log` —— 因为 `pnpm tauri dev` 的 stdout 走管道，
+//!   一行到 stdout（`[lodestar] …`）。debug 构建下**额外**落一份到
+//!   `/tmp/lodestar-app.log` —— 因为 `pnpm tauri dev` 的 stdout 走管道，
 //!   管道被读满/中断时 `println!` 会阻塞，落盘不受影响。
 
 /// 日志前缀 —— 便于在混着别的输出的终端里一眼认出来。
-const PREFIX: &str = "[sextant]";
+const PREFIX: &str = "[lodestar]";
 
 /// 落盘路径（**只在 debug 构建里用**）。
 ///
@@ -21,7 +21,7 @@ const PREFIX: &str = "[sextant]";
 ///   `pnpm tauri dev` 的 stdout 走管道，管道被读满/中断时 `println!` 会阻塞 ——
 ///   那样界面看起来像「卡死」，其实是日志通道的问题。落盘不受影响。
 #[cfg(debug_assertions)]
-const LOG_PATH: &str = "/tmp/sextant-app.log";
+const LOG_PATH: &str = "/tmp/lodestar-app.log";
 
 /// 记一行运行日志。
 pub fn log_line(line: &str) {

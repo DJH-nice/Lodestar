@@ -1,11 +1,11 @@
 # 外接卷索引设计（插上 U 盘就能搜到里面的文件）
 
-> 生成时间：2026-10-24 · 分支 `master` · 工作区 `/Users/dongjiahao/Projects/sextant`
+> 生成时间：2026-10-24 · 分支 `master` · 工作区 `/Users/dongjiahao/Projects/lodestar`
 > 决策来源：用户明确要求「Lodestar 目前只能扫描本机磁盘，插入硬盘就无法扫描了」
 > 配套实施计划：待本设计确认后另出 `plans/2026-10-24-external-volume-indexing.md`
 >
-> **产品名说明**：用户口中的「Lodestar」在本仓库已改名为 **Sextant**（2026-10-23 换自研引擎那次）。
-> 本文一律用 **Sextant**，指的是同一个东西。
+> **产品名说明**：用户口中的「Lodestar」在本仓库已改名为 **Lodestar**（2026-10-23 换自研引擎那次）。
+> 本文一律用 **Lodestar**，指的是同一个东西。
 
 ---
 

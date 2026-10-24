@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# 打包一个【可分发版】的 Sextant.app。
+# 打包一个【可分发版】的 Lodestar.app。
 #
 # 【和上一版的根本区别】
 #   上一版要把 shim dylib 的 **18 个 Homebrew 依赖**（glib/pango/harfbuzz/icu…）
@@ -193,8 +193,8 @@ fi
 # --- 目标目录（跟着 CARGO_TARGET_DIR 走）---
 TARGET_DIR="$(cargo_target_dir)"
 BUNDLE="$TARGET_DIR/release/bundle/macos"
-APP="$BUNDLE/Sextant.app"
-BIN="$APP/Contents/MacOS/sextant-app"
+APP="$BUNDLE/Lodestar.app"
+BIN="$APP/Contents/MacOS/lodestar-app"
 
 echo "=== 1/5 构建 + 打包 .app ==="
 # 【必须用 `tauri build`，不能用 `tauri bundle`】
@@ -255,7 +255,7 @@ if [ -f "$REPO/THIRD-PARTY-NOTICES.md" ]; then
 fi
 
 cat > "$LICENSE_DIR/源码获取方式.txt" <<'SRC_NOTICE'
-Sextant —— 源码获取方式
+Lodestar —— 源码获取方式
 ======================
 
 本软件的源码在项目仓库里（LICENSE 文件里写着地址）。
@@ -298,7 +298,7 @@ echo "=== 5/5 打 .dmg（macOS 的标准分发容器）==="
 #   `tauri build --bundles dmg` 会**重新打包**一个 .app —— 那个 .app 里
 #   没有我们装进去的许可文件。
 #   → 只能拿**已经打好、已经签好名**的 .app 装进 .dmg。
-DMG_OUT="$BUNDLE/Sextant.dmg"
+DMG_OUT="$BUNDLE/Lodestar.dmg"
 DMG_STAGE="$(mktemp -d)"
 cleanup_dmg_stage() { [ -d "$DMG_STAGE" ] && rm -rf "$DMG_STAGE"; }
 trap cleanup_dmg_stage EXIT
@@ -310,16 +310,16 @@ ln -s /Applications "$DMG_STAGE/Applications"
 
 # 映像里放一份说明 —— 对方第一次打开会被 Gatekeeper 拦，得知道怎么办
 cat > "$DMG_STAGE/请先读我.txt" <<'DMG_README'
-Sextant macOS —— 使用说明
+Lodestar macOS —— 使用说明
 =========================
 
 安装
 ----
-1. 把左边的「Sextant.app」拖到右边的「应用程序」里。
+1. 把左边的「Lodestar.app」拖到右边的「应用程序」里。
 2. 首次打开时，macOS 可能会说「无法验证开发者」。
    —— 因为这个 app 没有付费的 Apple 开发者证书（Developer ID）。
-   —— 绕过办法：对着 Sextant.app **右键 → 打开** → 再点「打开」。
-      （或者在终端里执行：xattr -cr /Applications/Sextant.app）
+   —— 绕过办法：对着 Lodestar.app **右键 → 打开** → 再点「打开」。
+      （或者在终端里执行：xattr -cr /Applications/Lodestar.app）
 
 使用
 ----
@@ -335,12 +335,12 @@ Sextant macOS —— 使用说明
 许可与源码
 ----
 · 许可证全文、第三方组件声明、以及源码获取方式都装在应用包里：
-  在访达里右键 Sextant.app →「显示包内容」→ Contents/Resources/licenses/
+  在访达里右键 Lodestar.app →「显示包内容」→ Contents/Resources/licenses/
 · 应用内也可以看：顶部菜单栏「帮助 → 致谢与许可」。
 DMG_README
 
 # 打包：UDZO = 压缩的只读映像
-hdiutil create -srcfolder "$DMG_STAGE" -volname "Sextant" -fs HFS+ -format UDZO -ov "$DMG_OUT" >/dev/null
+hdiutil create -srcfolder "$DMG_STAGE" -volname "Lodestar" -fs HFS+ -format UDZO -ov "$DMG_OUT" >/dev/null
 # 映像本身也签一下 —— 没签名的映像挂载后 macOS 会说「已被损坏」
 codesign --force --sign - "$DMG_OUT" >/dev/null 2>&1 || true
 echo "dmg 完成：$DMG_OUT"
@@ -349,8 +349,8 @@ echo
 echo "=== .dmg 自检（挂载 → 验内容 → 卸载）==="
 DMG_MOUNT="$(mktemp -d)"
 if hdiutil attach "$DMG_OUT" -nobrowse -readonly -mountpoint "$DMG_MOUNT" >/dev/null 2>&1; then
-  if [ -d "$DMG_MOUNT/Sextant.app" ] && [ -L "$DMG_MOUNT/Applications" ]; then
-    echo "  ✓ 映像里有 Sextant.app"
+  if [ -d "$DMG_MOUNT/Lodestar.app" ] && [ -L "$DMG_MOUNT/Applications" ]; then
+    echo "  ✓ 映像里有 Lodestar.app"
     echo "  ✓ 映像里有「应用程序」快捷方式"
     echo "  ✓ 说明文件在：$([ -f "$DMG_MOUNT/请先读我.txt" ] && echo '有' || echo '缺')"
   else
@@ -376,7 +376,7 @@ echo
 echo "=== .app 结构 ==="
 # 【不用 `find | head`】—— head 先退出会让上游吃 SIGPIPE，
 #   `set -o pipefail` 下整条管道判为 141，脚本就此失败。
-app_tree="$(find "$APP" -maxdepth 3 -not -path '*/_up_/*' | sed "s|$APP|Sextant.app|")"
+app_tree="$(find "$APP" -maxdepth 3 -not -path '*/_up_/*' | sed "s|$APP|Lodestar.app|")"
 head -30 <<< "$app_tree"
 
 echo

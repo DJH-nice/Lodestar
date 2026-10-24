@@ -107,7 +107,7 @@ pub const OPEN_SYNTAX_CHEATSHEET_EVENT: &str = "open-syntax-cheatsheet";
 ///   → 必须在**应用里**有一处能看见这句话的地方，
 ///     不能只写在仓库 README 里（装到 /Applications 之后就没人看得到）。
 ///
-/// 【为什么不叫「关于」】macOS 的应用菜单里已经有系统的「关于 Sextant」
+/// 【为什么不叫「关于」】macOS 的应用菜单里已经有系统的「关于 Lodestar」
 ///   （由 `Menu::default()` 提供，显示版本号与版权）。
 ///   再来一个同名的项会让人以为是同一个东西。
 ///   → 叫「致谢与许可」，指向的是**法务信息**（引擎出处 + 许可证），
@@ -161,7 +161,7 @@ fn show_main_window<R: Runtime>(app: &AppHandle<R>) {
 
 /// 【为什么用 `Menu::default()`，不手写整套】
 /// 默认菜单在 macOS 上是：
-///   Sextant（关于 / 服务 / 隐藏 / 退出）+ File + Edit + View + Window + Help
+///   Lodestar（关于 / 服务 / 隐藏 / 退出）+ File + Edit + View + Window + Help
 /// 其中 **Edit 子菜单带 undo / redo / cut / copy / paste / select_all**。
 /// 手写一套的话几乎一定会漏掉 Edit ——
 /// 而 Edit 的复制/粘贴是搜索框的刚需
@@ -190,7 +190,7 @@ pub fn build_menu<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<Menu<R>> {
             help.append(&credits_item)?;
         }
         // 拿不到 Help 子菜单 —— 入口装不上，但应用其余部分照常用。
-        _ => eprintln!("[sextant] 默认菜单里没有 Help 子菜单，「完整手册」入口没装上"),
+        _ => eprintln!("[lodestar] 默认菜单里没有 Help 子菜单，「完整手册」入口没装上"),
     }
     Ok(menu)
 }
@@ -207,15 +207,15 @@ fn install_menu<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<()> {
     app.on_menu_event(|app, event| {
         if event.id() == OPEN_USER_GUIDE_ID {
             if let Err(e) = app.emit(OPEN_USER_GUIDE_EVENT, ()) {
-                eprintln!("[sextant] 通知前端打开手册失败: {e}");
+                eprintln!("[lodestar] 通知前端打开手册失败: {e}");
             }
         } else if event.id() == OPEN_SYNTAX_CHEATSHEET_ID {
             if let Err(e) = app.emit(OPEN_SYNTAX_CHEATSHEET_EVENT, ()) {
-                eprintln!("[sextant] 通知前端打开语法速查失败: {e}");
+                eprintln!("[lodestar] 通知前端打开语法速查失败: {e}");
             }
         } else if event.id() == OPEN_CREDITS_ID {
             if let Err(e) = app.emit(OPEN_CREDITS_EVENT, ()) {
-                eprintln!("[sextant] 通知前端打开致谢与许可失败: {e}");
+                eprintln!("[lodestar] 通知前端打开致谢与许可失败: {e}");
             }
         }
     });
@@ -255,7 +255,7 @@ fn install_menu<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<()> {
 fn install_tray_and_shortcut<R: Runtime>(app: &AppHandle<R>) {
     // 【装菜单栏图标】—— 装不上不许 panic。
     if let Err(e) = tray::build_tray(app) {
-        eprintln!("[sextant] 装菜单栏图标失败: {e}");
+        eprintln!("[lodestar] 装菜单栏图标失败: {e}");
     }
     // 【注册全局快捷键】——
     //   读设置里存的那个（没有就用默认值）。
@@ -270,7 +270,7 @@ fn install_tray_and_shortcut<R: Runtime>(app: &AppHandle<R>) {
         //   还多碰一次 muda 的主线程操作面。
         Ok(()) => {}
         Err(e) => {
-            eprintln!("[sextant] 注册全局快捷键失败: {e}");
+            eprintln!("[lodestar] 注册全局快捷键失败: {e}");
             // 【D5】注册失败必须**看得见** ——
             //   在托盘菜单顶部插一条禁用的警告项。
             //   （托盘是常驻的；设置面板可能正关着。）
@@ -315,7 +315,7 @@ fn save_window_geometry<R: Runtime>(win: &tauri::WebviewWindow<R>, handle: &AppH
         Ok(())
     });
     if let Err(e) = result {
-        eprintln!("[sextant] 保存窗口位置失败: {e}");
+        eprintln!("[lodestar] 保存窗口位置失败: {e}");
     }
 }
 
@@ -350,7 +350,7 @@ pub fn run() {
         .manage(Lifecycle::new())
         .setup(|app| {
             // 【设置迁移 —— 必须是 setup 的第一件事】
-            //   产品名从 FSearch 改成 Sextant → `identifier` 跟着变 →
+            //   产品名从 FSearch 改成 Lodestar → `identifier` 跟着变 →
             //   tauri-plugin-store 落在**以 identifier 命名**的目录里 →
             //   老用户的书签 / 最近搜索 / 索引目录 / 窗口位置全在新目录之外。
             //   → 这里先把旧目录里的 settings.json 拷过来。
@@ -373,7 +373,7 @@ pub fn run() {
             // 【装应用菜单】默认菜单 + Help 子菜单里的「完整手册」。
             // 装不上也不该让应用起不来 —— 记一句日志，继续跑。
             if let Err(e) = install_menu(app.handle()) {
-                eprintln!("[sextant] 装菜单失败: {e}");
+                eprintln!("[lodestar] 装菜单失败: {e}");
             }
             // 【托盘图标与全局快捷键 —— 不在这里建，见 `RunEvent::Ready`】
             //   这两样都要在「事件循环刚开跑」的那一刻建（理由见下面那段注释）。
@@ -421,7 +421,7 @@ pub fn run() {
                 //   实测踩过（探针日志）：
                 //     reindex(临时目录) → 索引就绪：2 项
                 //     search "marker"  → 1 条 ✓
-                //     [sextant] 索引就绪：57817 项   ← 启动线程把引擎换回 $HOME
+                //     [lodestar] 索引就绪：57817 项   ← 启动线程把引擎换回 $HOME
                 //     search "marker"  → 0 条 ✗      ← 同一句查询，结果凭空没了
                 //
                 //   现在：**只在全局槽位还空着时装** —— 若 reindex 抢先装上了，
@@ -439,7 +439,7 @@ pub fn run() {
                 //   （状态栏永远「正在扫描…」+ 索引就绪后不自动重搜）。
                 match settings::rebuild_engine_if_absent(&thread_handle, &path_strs, &state) {
                     Ok((indexed, true)) => {
-                        println!("[sextant] 索引就绪：{indexed} 项");
+                        println!("[lodestar] 索引就绪：{indexed} 项");
                     }
                     Ok((_indexed, false)) => {
                         // 已经有引擎了（reindex 抢先）—— 本次什么都不改：
@@ -447,13 +447,13 @@ pub fn run() {
                         // （① 预检放弃路径**什么都不动** —— 这一趟没 begin() 过，
                         //   没有自己的扫描标志可放；别人的 scanning 不归我们管。
                         //   详见 index_state.rs 的 ScanToken。）
-                        println!("[sextant] 启动索引已被换掉，跳过（以当前引擎为准）");
+                        println!("[lodestar] 启动索引已被换掉，跳过（以当前引擎为准）");
                     }
                     Err(e) => {
                         // fail() 已在 rebuild_engine_if_absent 里做过
                         // （它 begin() 过，失败时要自己把 scanning 放回去）
                         // —— 现在那一步由 run_scan_blocking 统一管。
-                        eprintln!("[sextant] 建索引失败: {e}");
+                        eprintln!("[lodestar] 建索引失败: {e}");
                     }
                 }
             });

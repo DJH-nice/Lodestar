@@ -1,10 +1,10 @@
-# AGENTS.md —— Sextant macOS
+# AGENTS.md —— Lodestar macOS
 
 > 面向任何 AI agent / 新会话。**先读这份。**
 
 ## 这是什么
 
-**Sextant** —— 一个 macOS / Apple Silicon 原生的**文件搜索工具**。
+**Lodestar** —— 一个 macOS / Apple Silicon 原生的**文件搜索工具**。
 
 - 菜单栏常驻（托盘图标）+ 全局快捷键唤起（默认 `⌥⌘Space`）
 - 输入即搜 → 虚拟滚动结果表 → 预览卡 / 右键菜单 → 访达中定位 / 打开
@@ -19,7 +19,7 @@
 ## 目录结构
 
 ```
-sextant/
+lodestar/
 ├── app/
 │   ├── src/                    Vue 前端：13 组件 + 15 个 lib 模块 ≈ 4,400 行
 │   ├── src-tauri/
@@ -102,7 +102,7 @@ sextant/
 > 2026-10-24 优化后重测。**A/B 是同进程交替跑改前/改后两个版本**（消除机器负载波动），
 > 探针在 `/tmp/abprobe`（改前版副本在 `/tmp/sc-before`）。
 
-| 指标 | 旧引擎（上游 C） | 优化前 | **Sextant 现在** | 备注 |
+| 指标 | 旧引擎（上游 C） | 优化前 | **Lodestar 现在** | 备注 |
 |---|---|---|---|---|
 | 热缓存全量扫描（8,550 项） | 74.6ms | 62.8ms | **21.1ms**（快 66%，2.98×） | 顶层子树分区 + 原子游标 |
 | 冷启动 → 可搜 | 300~450ms（每次全量扫描） | — | **2.7ms**（读索引档） | 达标 |
@@ -219,6 +219,6 @@ sextant/
 
 迁移在 `settings::migrate_legacy_store()`（`app/src-tauri/src/settings.rs`），
 跑在 `setup()` 的**第一件事**（必须早于任何一次 `settings::load()`）。
-它是**链式**的（`com.fsearch.macos` → `com.lodestar.macos` → `com.sextant.macos`），
+它是**链式**的（`com.fsearch.macos` → `com.lodestar.macos` → `com.lodestar.macos`），
 旧目录改名成 `.bak`（**不删** —— 万一迁移出问题还能找回）。
 **下次再改 identifier 时，照这个模式再加一条。**

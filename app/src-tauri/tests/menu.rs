@@ -26,7 +26,7 @@
 //! 自己写 `main()` —— 那就是进程的主线程，菜单建得出来。
 //! 断言失败 → panic → 退出码非 0 → cargo 把这条测试报成失败。
 
-use sextant_app_lib::{
+use lodestar_app_lib::{
     build_menu, OPEN_SYNTAX_CHEATSHEET_EVENT, OPEN_SYNTAX_CHEATSHEET_ID, OPEN_USER_GUIDE_EVENT,
     OPEN_USER_GUIDE_ID,
 };

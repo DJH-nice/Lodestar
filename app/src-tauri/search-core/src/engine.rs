@@ -139,7 +139,7 @@ impl Engine {
     fn persist(&self) {
         if let Some(sp) = &self.store_path {
             if let Err(e) = store::save(&self.entries.borrow(), &self.roots, sp) {
-                eprintln!("[sextant] 索引落盘失败（不影响使用）: {e}");
+                eprintln!("[lodestar] 索引落盘失败（不影响使用）: {e}");
             }
         }
     }
@@ -527,7 +527,7 @@ mod tests {
     fn fixture() -> PathBuf {
         static SEQ: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
         let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        let dir = std::env::temp_dir().join(format!("sextant-engine-{}-{}", std::process::id(), seq));
+        let dir = std::env::temp_dir().join(format!("lodestar-engine-{}-{}", std::process::id(), seq));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         for name in ["alpha.txt", "beta.txt", "gamma.log"] {
@@ -777,7 +777,7 @@ mod tests {
     fn store_makes_the_second_start_instant() {
         let dir = fixture();
         let store_path = std::env::temp_dir().join(format!(
-            "sextant-engine-store-{}.bin",
+            "lodestar-engine-store-{}.bin",
             std::process::id()
         ));
         let _ = std::fs::remove_file(&store_path);
@@ -803,7 +803,7 @@ mod tests {
         let dir_a = fixture();
         let dir_b = fixture();
         let store_path = std::env::temp_dir().join(format!(
-            "sextant-engine-store2-{}.bin",
+            "lodestar-engine-store2-{}.bin",
             std::process::id()
         ));
         let _ = std::fs::remove_file(&store_path);

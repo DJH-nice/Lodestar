@@ -1,11 +1,11 @@
-//! 菜单栏图标 —— 让用户不看 Dock 也能唤起 Sextant。
+//! 菜单栏图标 —— 让用户不看 Dock 也能唤起 Lodestar。
 //!
 //! 【左键 vs 右键】
 //!   `show_menu_on_left_click` 的**默认值是 `true`** ——
 //!   那样左键会直接弹菜单，唤起就没法做了。必须**显式关掉**：
 //!   左键 → 唤起/收起（`toggle`），右键 → 弹菜单。
 //!
-//! 【左键是 `toggle`，菜单里的「打开 Sextant」是 `wake`】
+//! 【左键是 `toggle`，菜单里的「打开 Lodestar」是 `wake`】
 //!   菜单项的文案是「**打开**」—— 窗口已经可见且聚焦时，
 //!   点「打开」应该把它**叫到前面来**，而不是「点了反而没了」。
 //!   → 菜单项走 `wake`（只唤起），`toggle`（会收起）只留给**左键图标**。
@@ -94,7 +94,7 @@ pub fn menu_entries(warning: Option<&str>) -> Vec<MenuEntry<'_>> {
     }
     entries.push(MenuEntry {
         id: TRAY_OPEN_ID,
-        text: "打开 Sextant",
+        text: "打开 Lodestar",
         enabled: true,
     });
     entries.push(MenuEntry {
@@ -149,7 +149,7 @@ pub fn build_tray<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<()> {
         .menu(&menu)
         .on_menu_event(|app, event| {
             match event.id().as_ref() {
-                // 【菜单项要「打开」，不是「切换」】文案写的是「打开 Sextant」——
+                // 【菜单项要「打开」，不是「切换」】文案写的是「打开 Lodestar」——
                 //   窗口已经可见且聚焦时，用户点它反而把窗口**收起**了（点了反而没了）。
                 //   → 菜单项走 `wake`（只唤起，不收起）；`toggle` 只留给**左键图标**。
                 TRAY_OPEN_ID => crate::lifecycle::wake(app),
@@ -196,12 +196,12 @@ pub fn set_warning<R: Runtime>(app: &AppHandle<R>, message: Option<&str>) {
     let menu = match build_menu(app, message) {
         Ok(m) => m,
         Err(e) => {
-            eprintln!("[sextant] 重建托盘菜单失败: {e}");
+            eprintln!("[lodestar] 重建托盘菜单失败: {e}");
             return;
         }
     };
     if let Err(e) = tray.set_menu(Some(menu)) {
-        eprintln!("[sextant] 更新托盘菜单失败: {e}");
+        eprintln!("[lodestar] 更新托盘菜单失败: {e}");
     }
 }
 
@@ -248,7 +248,7 @@ mod tests {
     #[test]
     fn without_a_warning_the_open_item_is_first() {
         let entries = menu_entries(None);
-        assert_eq!(entries[0].id, TRAY_OPEN_ID, "没有警告时第一项应该是「打开 Sextant」");
+        assert_eq!(entries[0].id, TRAY_OPEN_ID, "没有警告时第一项应该是「打开 Lodestar」");
     }
 
     #[test]

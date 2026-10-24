@@ -1,6 +1,6 @@
 <div align="center">
 
-# Sextant for macOS
+# Lodestar for macOS
 
 **一个 macOS 原生的文件搜索工具**
 
@@ -14,7 +14,7 @@
 
 ## 是什么
 
-Sextant 是一款 macOS / Apple Silicon 原生的文件搜索工具。
+Lodestar 是一款 macOS / Apple Silicon 原生的文件搜索工具。
 
 - **随时能叫醒** —— 菜单栏常驻图标，`⌥⌘Space`（可改）一键唤起
 - **输入即搜** —— 打字的同时就在搜，命中词直接高亮
@@ -25,11 +25,11 @@ Sextant 是一款 macOS / Apple Silicon 原生的文件搜索工具。
 
 ## 安装
 
-从 [Releases](https://github.com/YOUR_ACCOUNT/sextant/releases) 下载 `Sextant.dmg`，
-双击挂载后把 `Sextant.app` 拖进「应用程序」。
+从 [Releases](https://github.com/YOUR_ACCOUNT/lodestar/releases) 下载 `Lodestar.dmg`，
+双击挂载后把 `Lodestar.app` 拖进「应用程序」。
 
 > 首次打开如果 macOS 说「无法验证开发者」——
-> 对着 `Sextant.app` **右键 → 打开** → 再点「打开」。
+> 对着 `Lodestar.app` **右键 → 打开** → 再点「打开」。
 > （这个包没有付费的 Apple 开发者证书，只能 ad-hoc 签名。）
 
 装好后建议先做两件事：
@@ -88,8 +88,8 @@ Sextant 是一款 macOS / Apple Silicon 原生的文件搜索工具。
 
 ## 隐私
 
-Sextant **不联网**。没有遥测、没有崩溃上报、没有更新检查。
-索引只存在你自己的机器上（`~/Library/Application Support/com.sextant.macos/`）。
+Lodestar **不联网**。没有遥测、没有崩溃上报、没有更新检查。
+索引只存在你自己的机器上（`~/Library/Application Support/com.lodestar.macos/`）。
 
 ## 开发
 
@@ -128,7 +128,7 @@ app/src-tauri/search-core/
 
 ## 许可
 
-Sextant 采用 [MIT 许可](LICENSE)。第三方组件见
+Lodestar 采用 [MIT 许可](LICENSE)。第三方组件见
 [THIRD-PARTY-NOTICES.md](THIRD-PARTY-NOTICES.md)。
 
 应用内也可以看：菜单栏 → 帮助 → 致谢与许可。

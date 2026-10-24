@@ -1,6 +1,6 @@
 # 搜索引擎性能优化方案
 
-> 生成时间：2026-10-24 · 分支 `master` · 工作区 `/Users/dongjiahao/Projects/sextant`
+> 生成时间：2026-10-24 · 分支 `master` · 工作区 `/Users/dongjiahao/Projects/lodestar`
 > 关联设计：[`../specs/2026-10-23-self-owned-search-engine-design.md`](../specs/2026-10-23-self-owned-search-engine-design.md)
 > 本文**只有方案，没有代码改动**。所有数字都是实测（探针见 §6）。
 
@@ -12,7 +12,7 @@
 
 三条理由，任何一条都足以否掉：
 
-1. **上游已经不在链路上了。** Sextant 用的是自研 Rust 引擎
+1. **上游已经不在链路上了。** Lodestar 用的是自研 Rust 引擎
    （`app/src-tauri/search-core/`），上游 FSearch 的 C 代码**一行都没进来**。
    旧仓库 `/Users/dongjiahao/Downloads/fsearch-0.3.2` 只是**只读行为对照**。
 2. **就算在，也不许改。** 旧仓库的硬约束：`src/` 必须与原始 tarball **逐字节一致**
@@ -169,7 +169,7 @@ entries.push(make_entry(&path, &dir, depth + 1, is_dir));
 let (size, mtime) = match std::fs::symlink_metadata(path) { ... };  // 第 2 次
 ```
 
-**实测**（`/tmp/sextant_scan_probe`，8,548 项）：加第 2 次 stat = **+7.5ms**（约 11%）。
+**实测**（`/tmp/lodestar_scan_probe`，8,548 项）：加第 2 次 stat = **+7.5ms**（约 11%）。
 
 **改法**　把 `Metadata` 传进 `make_entry`，复用第 1 次的结果。
 **预期**　扫描省 ~7.5ms（热缓存 70.7 → 63ms）。
@@ -309,7 +309,7 @@ O(n·m)，且**每个字符都跑一遍完整的 NFD 流程**（92% 的折叠开
 `name` / `path` / `dir` / `extension` / `folded_name` / `folded_path`。
 其中 **`path` / `dir` / `folded_path` 三份都是全路径长度** → 每条目约 374 字节。
 
-**实测**　8,548 条目 → 2.67MB 字符串字节（`/tmp/sextant_scan_probe` 实测）。
+**实测**　8,548 条目 → 2.67MB 字符串字节（`/tmp/lodestar_scan_probe` 实测）。
 
 **改法**（设计文档 §4.1 已经规划好，只是还没做）：
 
@@ -405,7 +405,7 @@ O(n·m)，且**每个字符都跑一遍完整的 NFD 流程**（92% 的折叠开
 
 | 探针 | 位置 | 干什么 | 复现 |
 |---|---|---|---|
-| 扫描 IO 地板 | `/tmp/sextant_scan_probe.rs` | stat 次数 / 字符串构建 / 共享队列并行 的对照 | `rustc -O -o /tmp/p /tmp/sextant_scan_probe.rs && /tmp/p "$HOME"` |
+| 扫描 IO 地板 | `/tmp/lodestar_scan_probe.rs` | stat 次数 / 字符串构建 / 共享队列并行 的对照 | `rustc -O -o /tmp/p /tmp/lodestar_scan_probe.rs && /tmp/p "$HOME"` |
 | 子树分区并行 | `/tmp/partition_probe.rs` | 分区式 vs 共享队列式的真实加速比 | `rustc -O -o /tmp/p2 /tmp/partition_probe.rs && /tmp/p2 "$HOME"` |
 | stat 策略对比 | `/tmp/statprobe/` | 路径式 vs `fstatat(dir_fd)` | `cd /tmp/statprobe && cargo run --release` |
 | 折叠成本 | `/tmp/foldprobe/` | `fold(name)` / `fold(path)` / NFD 净增 | `cd /tmp/foldprobe && cargo run --release` |
@@ -413,7 +413,7 @@ O(n·m)，且**每个字符都跑一遍完整的 NFD 流程**（92% 的折叠开
 | 真实扫描器火焰图 | `/tmp/scanprobe2/` | `sample` 抓 30 轮真实扫描 | `cd /tmp/scanprobe2 && cargo build --release && ./target/release/scanprobe2 30 &` 然后 `sample <pid> 6` |
 
 > `queryprobe` / `scanprobe2` 通过 **path 依赖**引用 `search-core`：
-> `search-core = { path = "/Users/dongjiahao/Projects/sextant/app/src-tauri/search-core" }`
+> `search-core = { path = "/Users/dongjiahao/Projects/lodestar/app/src-tauri/search-core" }`
 > → **不改它一行**，只调它的公开 API。
 
 ---

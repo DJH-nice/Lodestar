@@ -1,6 +1,6 @@
 # Lodestar —— 项目交接文档（新会话必读）
 
-> 生成时间：2026-10-23 · 分支 `master` · 工作区 `/Users/dongjiahao/Projects/sextant`
+> 生成时间：2026-10-23 · 分支 `master` · 工作区 `/Users/dongjiahao/Projects/lodestar`
 > 配套设计：[`docs/superpowers/specs/2026-10-23-self-owned-search-engine-design.md`](superpowers/specs/2026-10-23-self-owned-search-engine-design.md)
 > 目标读者：**新会话的 AI agent / 接手的人**。读完这一份就能接着干。
 
@@ -8,7 +8,7 @@
 
 ## 1. 项目目标
 
-**Sextant** = 一个 macOS / Apple Silicon 原生的**文件搜索工具**。
+**Lodestar** = 一个 macOS / Apple Silicon 原生的**文件搜索工具**。
 
 **它长什么样**：菜单栏常驻（托盘图标）+ 全局快捷键唤起（默认 `⌥⌘Space`）→
 输入即搜 → 虚拟滚动结果表 → 预览卡 / 右键菜单 → 访达中定位 / 打开。
@@ -32,7 +32,7 @@
 ## 2. 当前目录结构
 
 ```
-sextant/                          ← 新仓库（git 已初始化，1 次提交）
+lodestar/                          ← 新仓库（git 已初始化，1 次提交）
 ├── app/                        主应用（Tauri v2 + Vue 3）
 │   ├── src/                    Vue 前端：13 组件 + 15 个 lib 工具模块 ≈ 4,400 行
 │   ├── src-tauri/
@@ -54,7 +54,7 @@ sextant/                          ← 新仓库（git 已初始化，1 次提交
 │   │   │   ├── src/worker.rs        串行搜索线程
 │   │   │   └── tests/cheatsheet_queries.rs  速查卡护栏
 │   │   ├── tests/              5 个护栏集成测试
-│   │   └── tauri.conf.json     productName=Sextant / identifier=com.sextant.macos
+│   │   └── tauri.conf.json     productName=Lodestar / identifier=com.lodestar.macos
 │   ├── shared/                 syntax-tables.json / cheatsheet.json（单一真相）
 │   └── scripts/                bundle-app.sh（打包唯一入口）等 12 个脚本
 ├── prototype/                  HTML 原型（1,679 行）—— ⌘K 命令面板的现成货源
@@ -86,7 +86,7 @@ sextant/                          ← 新仓库（git 已初始化，1 次提交
 | 实时更新（FSEvents + 去抖 800ms + 最小间隔 5s） | `watcher.rs` | ✅ 但**是全量重扫**（M3 改） |
 | 手动刷新 / 重建索引 / 在访达中定位 | `commands.rs` | ✅ |
 | **自研引擎**：并行扫描 / 索引落盘 / 查询语法 / 排序分页 / 高亮 | `search-core/` | ✅ 43 个用例 |
-| **设置迁移链**（fsearch → lodestar → sextant） | `settings.rs` | ✅ |
+| **设置迁移链**（fsearch → lodestar → lodestar） | `settings.rs` | ✅ |
 
 **测试规模**：264 个 vitest + 43 个 `search-core` 用例 + 20 项 Rust 护栏检查。
 
@@ -174,7 +174,7 @@ sextant/                          ← 新仓库（git 已初始化，1 次提交
 > **2026-10-24 优化后重测**。A/B 是**同进程交替跑改前/改后两个版本**
 > （消除机器负载波动）—— 探针 `/tmp/abprobe`，改前版副本在 `/tmp/sc-before`。
 
-| 指标 | 上游基线 | 优化前 | **Sextant 现在** | 对比上游 |
+| 指标 | 上游基线 | 优化前 | **Lodestar 现在** | 对比上游 |
 |---|---|---|---|---|
 | 冷启动：读索引档 | —（上游不落盘） | 2.6ms | **2.7ms** | 每次省 300ms |
 | **热缓存：全量扫描** | 74.6ms | 62.8ms | **21.1ms**（快 66%） | **3.5× 快** |
@@ -263,7 +263,7 @@ diff 后写回索引档。目标 <5ms，取代现在的全量重扫。
 2. **未经明确同意不得 `brew install`**。
 3. **改 `identifier` = 换设置目录，必须配迁移**：`settings::migrate_legacy_store()`
    （`app/src-tauri/src/settings.rs`），跑在 `setup()` 第一件事，幂等、只拷不删。
-   迁移链：`com.fsearch.macos` → `com.lodestar.macos` → `com.sextant.macos`。
+   迁移链：`com.fsearch.macos` → `com.lodestar.macos` → `com.lodestar.macos`。
 4. **打包只能用 `bash app/scripts/bundle-app.sh`** —— 它带 `tauri/custom-protocol` feature
    重编 + 自检。**看到 `✓ 前端已嵌进二进制` 才算成功。**
    ⚠️ `cargo build --release` 的产物**没有**该 feature → 前端不内嵌 → **白屏但引擎照跑**

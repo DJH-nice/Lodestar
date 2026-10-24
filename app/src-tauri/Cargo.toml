@@ -5,9 +5,9 @@ members = ["search-core"]
 resolver = "2"
 
 [package]
-name = "sextant-app"
+name = "lodestar-app"
 version = "0.1.0"
-description = "Sextant for macOS"
+description = "Lodestar for macOS"
 edition = "2021"
 # 【为什么是 1.90】`tauri-plugin-autostart 2.7.0` 声明 `rust-version = "1.90"`
 #   （还用了 edition 2024）—— 依赖的 MSRV 就是本 crate 的 MSRV。
@@ -15,7 +15,7 @@ edition = "2021"
 rust-version = "1.90"
 
 [lib]
-name = "sextant_app_lib"
+name = "lodestar_app_lib"
 # 【为什么没有 "staticlib"】staticlib 是给「C/C++ 宿主链接 Rust 代码」用的。
 # 本项目没有这种宿主 —— Rust 二进制自包含。
 # 留着 staticlib 只会让 cargo 多产出一份几百 MB 的 .a，纯浪费磁盘，

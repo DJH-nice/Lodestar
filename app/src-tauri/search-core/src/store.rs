@@ -276,7 +276,7 @@ mod tests {
 
     #[test]
     fn save_then_load_on_disk() {
-        let dir = std::env::temp_dir().join(format!("sextant-store-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("lodestar-store-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let path = dir.join("index.bin");
         let entries = sample();
@@ -303,6 +303,6 @@ mod tests {
 
     #[test]
     fn missing_file_returns_none() {
-        assert!(load(Path::new("/nonexistent/sextant/index.bin")).is_none());
+        assert!(load(Path::new("/nonexistent/lodestar/index.bin")).is_none());
     }
 }

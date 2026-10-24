@@ -39,7 +39,7 @@ fn main() {
     let home = std::env::var("HOME").unwrap_or_else(|_| "/".into());
     let home_path = PathBuf::from(&home);
     let store = PathBuf::from(&home)
-        .join("Library/Application Support/com.sextant.macos/index.bin");
+        .join("Library/Application Support/com.lodestar.macos/index.bin");
 
     println!("=== 1. 读档（冷启动的关键）===");
     if store.exists() {

@@ -110,7 +110,7 @@ onMounted(async () => {
     try {
       launchAtLogin.value = await invoke<boolean>("get_launch_at_login");
     } catch (e) {
-      console.warn("[sextant] 读开机自启状态失败，沿用设置里的值", e);
+      console.warn("[lodestar] 读开机自启状态失败，沿用设置里的值", e);
       /* 【要摆到界面上，不能只写日志】（终审 M-8）——
          读失败时开关显示的是**设置里的旧值**，可能与系统里的真值不符。
          只 `console.warn` 的话，用户看着一个**可能不准**的开关去改设置，
@@ -159,7 +159,7 @@ async function loadShortcutTruth(): Promise<void> {
   try {
     runtime = await invoke<ShortcutRuntimeState>("get_global_shortcut");
   } catch (e) {
-    console.warn("[sextant] 问不到快捷键的实际生效状态", e);
+    console.warn("[lodestar] 问不到快捷键的实际生效状态", e);
   }
   const view = shortcutRuntimeView(runtime, shortcutDesired.value);
   setShortcut(view.spec);
@@ -488,7 +488,7 @@ async function apply() {
         <section class="set-block">
           <h3>后台驻留与唤起</h3>
           <p class="set-hint">
-            关掉窗口后 Sextant 不会退出，而是在后台待命（菜单栏图标常驻）——
+            关掉窗口后 Lodestar 不会退出，而是在后台待命（菜单栏图标常驻）——
             按全局快捷键就能把它叫回来。
           </p>
 
@@ -497,7 +497,7 @@ async function apply() {
             <div class="set-row-text">
               <span class="set-row-label">全局快捷键</span>
               <p class="set-hint">
-                在任何软件里按这个组合键都能唤起 Sextant。
+                在任何软件里按这个组合键都能唤起 Lodestar。
                 点「录制」后，直接按下想要的组合键就行（Esc 取消）。
               </p>
             </div>
@@ -526,7 +526,7 @@ async function apply() {
             <div class="set-row-text">
               <span class="set-row-label">开机时自动在后台驻留</span>
               <p class="set-hint">
-                登录后 Sextant 会在后台待命，按全局快捷键即可唤起。
+                登录后 Lodestar 会在后台待命，按全局快捷键即可唤起。
               </p>
             </div>
             <button

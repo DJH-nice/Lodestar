@@ -135,7 +135,7 @@ fn user_guide_is_a_real_manual_not_a_stub() {
      * 但用户拿到的是一张没有「怎么用」的表。
      * 所以这里额外钉住：手册有【该有的章节】、而且不是空壳。 */
     const REQUIRED_SECTIONS: [&str; 10] = [
-        "# Sextant 使用手册",
+        "# Lodestar 使用手册",
         "## 快速上手",
         "## 界面一览",
         "## 搜索",

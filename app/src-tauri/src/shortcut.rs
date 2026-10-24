@@ -1,4 +1,4 @@
-//! 全局快捷键 —— 在任何 app 里按一下就能唤起 Sextant。
+//! 全局快捷键 —— 在任何 app 里按一下就能唤起 Lodestar。
 //!
 //! 【为什么注册失败必须让用户知道】
 //!   `⌥⌘Space` 很可能被别的软件占着。注册失败如果**静默**，
@@ -60,7 +60,7 @@ static RUNTIME: Mutex<ShortcutRuntime> = Mutex::new(ShortcutRuntime {
 ///   中毒只说明「某个持锁者 panic 过」，
 ///   而这里持锁期间只读写两个 `Option<String>` —— 数据本身是好的。
 ///   `.unwrap()` → 中毒时 panic → **整个快捷键路径死掉**
-///   （而这条路径正管着「唤起 Sextant」这个主入口）。
+///   （而这条路径正管着「唤起 Lodestar」这个主入口）。
 ///   → 取回内值继续跑。
 fn runtime() -> MutexGuard<'static, ShortcutRuntime> {
     match RUNTIME.lock() {
@@ -164,7 +164,7 @@ pub(crate) fn reset_runtime() {
 ///     换键（A→B，B 注册成功、注销 A 失败）→ 生效的是 **B**（A 也可能还在）
 ///     关掉（注销 A 失败）                    → 生效的是 **A**（它没被注销掉！）
 ///   两种情况只有 `apply` 知道 —— **让错误携带真相，而不是让调用方猜**。
-///   （猜错的后果：面板显示「未设置」，而 A 其实还在唤起 Sextant。）
+///   （猜错的后果：面板显示「未设置」，而 A 其实还在唤起 Lodestar。）
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ShortcutError {
     /// 规格非法（格式错 / 没有修饰键）—— 什么都没变
@@ -209,13 +209,13 @@ impl ShortcutError {
                 also_active,
             } => match (effective, also_active) {
                 (Some(eff), Some(also)) => format!(
-                    "旧快捷键「{also}」注销失败（它可能仍会唤起 Sextant，与新快捷键「{eff}」同时生效）：{detail}"
+                    "旧快捷键「{also}」注销失败（它可能仍会唤起 Lodestar，与新快捷键「{eff}」同时生效）：{detail}"
                 ),
                 (Some(eff), None) => format!(
-                    "快捷键「{eff}」注销失败（它仍会唤起 Sextant —— 快捷键**没有被关掉**）：{detail}"
+                    "快捷键「{eff}」注销失败（它仍会唤起 Lodestar —— 快捷键**没有被关掉**）：{detail}"
                 ),
                 (None, _) => {
-                    format!("快捷键注销失败（它可能仍会唤起 Sextant）：{detail}")
+                    format!("快捷键注销失败（它可能仍会唤起 Lodestar）：{detail}")
                 }
             },
         }
@@ -418,7 +418,7 @@ pub fn apply<R: Runtime>(
             }
             Step::Unregister(o) => {
                 if let Err(detail) = unregister(app, &o) {
-                    eprintln!("[sextant] 注销旧快捷键失败（旧的可能仍然生效）: {detail}");
+                    eprintln!("[lodestar] 注销旧快捷键失败（旧的可能仍然生效）: {detail}");
                     // 【为什么不回滚】回滚 = 把新键也注销掉 →
                     //   「既没新键也没旧键」→ 唤起入口全丢。
                     //   → 只**如实上报**，不动已经生效的新键。
@@ -460,7 +460,7 @@ pub fn apply<R: Runtime>(
 /// 注销失败时 —— **此刻真正生效的是哪个键**。
 ///
 /// 【为什么抽成纯函数】这是本模块最容易被改坏的一处：
-///   算错 → 面板显示「未设置」，而旧键其实**还在唤起 Sextant**（骗人）。
+///   算错 → 面板显示「未设置」，而旧键其实**还在唤起 Lodestar**（骗人）。
 ///   它必须**可测**，而且不能依赖 `AppHandle`（单测里没有真插件）。
 ///
 /// - `registered_now` —— 本次调用里**真的注册上了**的键
@@ -860,7 +860,7 @@ mod tests {
         //   生效的键还是原来那个（旧的键原封不动还在），
         //   只有「原因」变了。
         //   把 `effective` 也清掉 = 骗人说「现在一个键都不生效」，
-        //   而旧键其实还在唤起 Sextant。
+        //   而旧键其实还在唤起 Lodestar。
         let prev = ShortcutRuntime {
             effective: Some("Option+Cmd+Space".to_string()),
             error: None,
