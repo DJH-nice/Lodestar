@@ -65,7 +65,7 @@ pub struct Engine {
 ## 2. 方案总览
 
 ```
-        挂载表（getmntinfo）
+        挂载表（getfsstat）
                  │ 每 1s
                  ▼
     ┌────────────────────────────┐
@@ -108,9 +108,13 @@ pub struct Engine {
 pub fn mounted_local_volumes() -> Vec<PathBuf>
 ```
 
-实现（`libc::getmntinfo`，**零新增依赖**）：
+实现（`libc::getfsstat`，**零新增依赖**）：
 
-1. `getmntinfo(NULL, MNT_NOWAIT)` 取挂载点数量 → 分配 `Vec<statfs>` → 再调一次填内容。
+> ⚠️ **不要用 `getmntinfo`** —— 那是 FreeBSD 语义，在 macOS 上传 NULL 问个数会 **SIGSEGV**
+> （实测复现），且结果写进库自己的静态对象（非线程安全）。`getfsstat` 才是
+> 「两段式、缓冲区归调用方」的形态。
+
+1. `getfsstat(NULL, 0)` 取挂载点数量 → 分配 `Vec<statfs64>` → 再调一次填内容（缓冲区是我们自己的）。
 2. 逐个 `statfs`：
    - `f_mntonname` → 挂载点路径；`f_fstypename` → 文件系统类型。
    - **必须** `f_flags & MNT_LOCAL != 0` → 排除 smbfs / nfs / afpfs / webdav 等**网络盘**。
@@ -123,9 +127,9 @@ pub fn mounted_local_volumes() -> Vec<PathBuf>
 `NSFileManager.mountedVolumeURLs` 需要 objc 绑定（新增依赖 + 体积）；
 `Disk Arbitration`（`DARegisterDiskAppearedCallback`）是最「正宗」的做法，
 但它是**回调式**的，要挂到 `CFRunLoop` 上，在 Tauri 的生命周期里多一个活动源。
-`getmntinfo` 是一次系统调用、无回调、无依赖 —— 对「每 1s 轮询」这个形态是最省事的。
+`getfsstat` 是一次系统调用、无回调、无依赖 —— 对「每 1s 轮询」这个形态是最省事的。
 
-**为什么轮询而不是回调**：轮询周期 1s，`getmntinfo` 的开销在几十微秒量级，
+**为什么轮询而不是回调**：轮询周期 1s，`getfsstat` 的开销在几十微秒量级，
 换来的是「没有生命周期、没有回调重入、没有线程竞态」的简单性。
 （`Disk Arbitration` 留作将来需要「插上立刻（<100ms）响应」时的优化项。）
 
@@ -329,7 +333,7 @@ struct Signals {
 | 扫描在 worker 内 vs 外 | **在 worker 外** | 30 秒的卷扫描绝不能堵搜索；顺带修掉 $HOME 重扫堵搜索的既有毛病 |
 | 网络盘 | **不做** | `MNT_LOCAL` 一行排除；用户说的是「插硬盘」 |
 | 稳定卷标识（UUID） | **不做** | 要 `diskutil` 取 UUID（多一个子进程 + plist 解析）；用户在访达里改卷名是罕见场景，先按「新盘」处理（旧档成孤儿，暂不清理） |
-| 阻塞式「插上立刻响应」 | **1s 轮询** | `getmntinfo` 几十微秒；回调式（Disk Arbitration）要挂 RunLoop，收益小于复杂度 |
+| 阻塞式「插上立刻响应」 | **1s 轮询** | `getfsstat` 几十微秒；回调式（Disk Arbitration）要挂 RunLoop，收益小于复杂度 |
 | 卷的实时更新 | **做**（watcher 自动跟上 + 按根重扫） | 不做的话 U 盘上的新文件要等手动刷新才出现 |
 
 ---
@@ -384,7 +388,7 @@ struct Signals {
 | watcher 的脏根集合引入竞态 | 索引过期 | 「记根 + 置标志」与「取根 + 清标志」各自在同一把锁内；根不明时**退回全量扫**（宁可多扫不可漏扫） |
 | 卷的扫描吃满 CPU（后台常驻时） | 机器变卡 | 扫描用引擎自带的并行遍历；节流靠 watcher 的既有 5s 闸；实测后再调 |
 | 卷上文件极多（30 万） | 首扫很久、内存涨 | 首扫在后台；状态栏显示进度；索引内存按条目数线性增长（与 $HOME 同理） |
-| `getmntinfo` 在极老系统上不可用 | 功能缺失 | macOS 10.x 起一直是稳定 API；不可用时返回空列表 → 退化成「不索引卷」，不影响主功能 |
+| `getfsstat` 在极老系统上不可用 | 功能缺失 | macOS 10.x 起一直是稳定 API；不可用时返回空列表 → 退化成「不索引卷」，不影响主功能 |
 
 ---
 

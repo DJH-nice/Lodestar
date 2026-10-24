@@ -4,9 +4,9 @@
 
 **Goal:** 让 Lodestar 在插入外接盘（U 盘 / 移动硬盘）后自动把盘上的文件纳入索引，拔盘后立刻从索引里移除，重新插入时复用旧索引并后台刷新。
 
-**Architecture:** 把「索引根目录」从建引擎时定死的常量变成**运行时可增删**的一等公民 —— 引擎新增 `attach_root` / `detach_root`，索引档改成**每个根一个文件**（插拔卷不再作废 $HOME 的档），新增 `src/volumes.rs` 用 `getmntinfo` 每秒枚举 `/Volumes` 下的本地外接卷并驱动附加/分离。
+**Architecture:** 把「索引根目录」从建引擎时定死的常量变成**运行时可增删**的一等公民 —— 引擎新增 `attach_root` / `detach_root`，索引档改成**每个根一个文件**（插拔卷不再作废 $HOME 的档），新增 `src/volumes.rs` 用 `getfsstat` 每秒枚举 `/Volumes` 下的本地外接卷并驱动附加/分离。
 
-**Tech Stack:** Rust 1.90 · `libc`（`getmntinfo`，已在 lock 文件里，不新增下载）· Tauri v2 · Vue 3 + TypeScript · `cargo test` / `vitest`
+**Tech Stack:** Rust 1.90 · `libc`（`getfsstat`，已在 lock 文件里，不新增下载）· Tauri v2 · Vue 3 + TypeScript · `cargo test` / `vitest`
 
 **配套设计文档：** [`docs/superpowers/specs/2026-10-24-external-volume-indexing-design.md`](../specs/2026-10-24-external-volume-indexing-design.md)
 
@@ -1025,7 +1025,7 @@ git commit -m "feat(worker): 支持附加/分离根目录 + 落盘改成 per 根
 `app/src-tauri/Cargo.toml` 的 `[dependencies]` 里加一行：
 
 ```toml
-# 【为什么加它】枚举挂载点要用 `getmntinfo`（macOS 的标准系统调用）。
+# 【为什么加它】枚举挂载点要用 `getfsstat`（macOS 的标准系统调用）。
 # `libc` 已经在 lock 文件里（search-core 用了）→ **不新增下载**。
 libc = "0.2"
 ```
@@ -1037,11 +1037,17 @@ libc = "0.2"
 ```rust
 //! 外接卷的枚举与监控 —— **插上 U 盘就能搜到里面的文件**。
 //!
-//! 【为什么用 `getmntinfo` 而不是别的】
-//!   macOS 的外接盘挂在 `/Volumes/<卷名>`。系统调用 `getmntinfo` 能一次列出
+//! 【为什么用 `getfsstat` 而不是别的】
+//!   macOS 的外接盘挂在 `/Volumes/<卷名>`。系统调用 `getfsstat` 能一次列出
 //!   **所有**挂载点 + 它们的标志位 —— 一次调用、零依赖、不需要回调。
 //!   （`NSFileManager` 要 objc 绑定；`Disk Arbitration` 是回调式的，
 //!   要挂 RunLoop —— 对「每秒轮询」这个形态都不划算。）
+//!
+//!   ⚠️ **为什么不是 `getmntinfo`** —— 那是 **FreeBSD 语义**，在 macOS 上**必崩**：
+//!   ① 第一次调用传 NULL 问个数 → 直接 **SIGSEGV**（实测复现）；
+//!   ② 它把结果写进**库自己的静态对象**（不是我们的缓冲区）→ 不是线程安全的。
+//!   `getfsstat` 是**两段式、缓冲区归调用方**：第一次问个数、第二次填我们自己的
+//!   `Vec` → 下面那段 unsafe 的安全理由**字面成立**。
 
 use std::path::{Path, PathBuf};
 
@@ -1059,15 +1065,16 @@ const MNT_LOCAL: u32 = libc::MNT_LOCAL as u32;
 ///   2. 挂载点是 `/Volumes` 的**直接子目录**（排除 `/` 与 `/System/Volumes/*`）
 ///   3. 不是 `/Volumes/Macintosh HD` 那个指向 `/` 的符号链接
 pub fn mounted_local_volumes() -> Vec<PathBuf> {
-    // 【getmntinfo 的两段式调用】第一次只问「有多少个」，
-    // 第二次才把内容填进我们给的数组里。
+    // 【getfsstat 的两段式调用】第一次只问「有多少个」，
+    // 第二次才把内容填进我们给的数组里（缓冲区是**我们自己的** Vec → 线程安全）。
     unsafe {
-        let count = libc::getmntinfo(std::ptr::null_mut(), libc::MNT_NOWAIT);
+        let count = libc::getfsstat(std::ptr::null_mut(), 0);
         if count <= 0 {
             return Vec::new();
         }
-        let mut buf = vec![std::mem::zeroed::<libc::statfs>(); count as usize];
-        let count = libc::getmntinfo(buf.as_mut_ptr() as *mut *mut libc::statfs, libc::MNT_NOWAIT);
+        let mut buf = vec![std::mem::zeroed::<libc::statfs64>(); count as usize];
+        let mut size = std::mem::size_of::<libc::statfs64>() as libc::c_int;
+        let count = libc::getfsstat(buf.as_mut_ptr() as *mut libc::statfs64, &mut size);
         if count <= 0 {
             return Vec::new();
         }
@@ -1193,7 +1200,7 @@ Expected: 6 条全绿。
 
 ```bash
 git add app/src-tauri/src/volumes.rs app/src-tauri/src/lib.rs app/src-tauri/Cargo.toml app/src-tauri/Cargo.lock
-git commit -m "feat(volumes): 用 getmntinfo 枚举本地外接卷
+git commit -m "feat(volumes): 用 getfsstat 枚举本地外接卷
 
 - 判据三条：MNT_LOCAL（排除网络盘）+ /Volumes 的直接子目录 + 不是符号链接
 - 纯函数 filter_local_volumes 拆出来 → 6 条单测覆盖各种挂载表
