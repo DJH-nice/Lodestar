@@ -243,9 +243,9 @@ fn parse(buf: &[u8]) -> Option<(Vec<IndexEntry>, Vec<PathBuf>)> {
 ///   哈希是定长十六进制 → 永远是合法文件名。
 ///
 /// 【碰撞了会怎样】
-///   哈希吃的是**原始字节**（见 [`fnv1a64`]）→ 两个**字节不同**的根
-///   哈希不同 → 落到**不同的档文件** → 「两个根共用一份档」不会发生
-///   （真正的 FNV-1a 碰撞是另一回事：理论上可被构造出来，但概率极低）。
+///   哈希吃的是**原始字节**（见 [`fnv1a64`]）→ 字节不同的根**几乎总是**
+///   落到不同的档文件（FNV-1a **不是单射** —— 理论上可被构造出碰撞，
+///   概率极低，但不是零）。
 ///   万一撞了，档里**记着自己的根路径**（见 [`parse_root`]）→ 读出来对不上
 ///   就当没有档（退回全量扫描）→ 最多浪费一次扫描，**不会读错数据**。
 pub fn root_archive_path(dir: &Path, root: &Path) -> PathBuf {
@@ -262,7 +262,9 @@ pub fn root_archive_path(dir: &Path, root: &Path) -> PathBuf {
 ///   lossy 会把**非法 UTF-8 字节**统一替换成 U+FFFD →
 ///   两个**字节不同**的路径会算出**同一个哈希**、落到**同一个档文件**上，
 ///   而档里记的 lossy 路径又「对得上」→ **读到别的根的档**。
-///   吃原始字节就没这个问题：字节不同 → 哈希不同 → 档文件不同。
+///   吃原始字节就**基本**解决了这个问题：字节不同的路径**几乎总是**落到
+///   不同的档文件（FNV-1a **不是单射** —— 碰撞理论上可被构造出来，
+///   概率极低，但不是零）。
 fn fnv1a64(bytes: &[u8]) -> u64 {
     let mut h: u64 = 0xcbf2_9ce4_8422_2325;
     for b in bytes {
@@ -278,12 +280,18 @@ fn fnv1a64(bytes: &[u8]) -> u64 {
 ///   v2：MAGIC + 版本 + **roots 列表** + 全部条目（所有根混在一起）。
 ///   v3：MAGIC + 版本 + **这个根的路径** + 这个根的条目。
 pub fn serialize_root(root: &Path, entries: &[IndexEntry]) -> Vec<u8> {
-    // 容量估算与 v2 共用 `entries_bytes` —— 两套格式的条目部分完全一样。
-    let cap = 64usize + entries_bytes(entries);
+    // 【为什么按头部实际字节算，别靠一个固定的常数蒙】
+    //   头 = 魔数(4) + 版本(4) + 根路径的长度前缀(4) + 根路径 + 条目数前缀(4)
+    //       = 16 + 根路径长度。
+    //   拿固定的 64 蒙的话，根路径**超过 48 字节**就会蒙穿 → 多一次 Vec 扩容
+    //   （整 buf memcpy，量级 0.1~1ms，每次 save 一次）。
+    //   条目部分继续用 `entries_bytes`（v2/v3 共用一份真相）。
+    let root_str = root.to_string_lossy();
+    let cap = 16 + root_str.len() + entries_bytes(entries);
     let mut buf: Vec<u8> = Vec::with_capacity(cap);
     buf.extend_from_slice(MAGIC);
     buf.extend_from_slice(&VERSION.to_le_bytes());
-    write_str(&mut buf, &root.to_string_lossy());
+    write_str(&mut buf, &root_str);
     buf.extend_from_slice(&(entries.len() as u32).to_le_bytes());
     for e in entries {
         write_entry(&mut buf, e);
@@ -753,6 +761,32 @@ mod tests {
             entries_bytes(&[e]),
             MIN_ENTRY_BYTES,
             "单条条目的最小字节数必须与 entries_bytes 一致"
+        );
+    }
+
+    #[test]
+    fn the_capacity_estimate_covers_the_whole_archive() {
+        // 【为什么要钉住】`serialize_root` 的容量估算必须**按头实际占的字节算**
+        //   （魔数 4 + 版本 4 + 根路径长度前缀 4 + 根路径 + 条目数前缀 4
+        //     = 16 + 根路径长度）。
+        //   靠一个固定的常数蒙的话，根路径**超过 48 字节**就会蒙穿
+        //   → 多一次 Vec 扩容（整 buf memcpy，0.1~1ms，每次 save 一次）。
+        //   这里断言「估算公式 == 实际产出的字节数」→ 公式与实现绑死。
+        let root = Path::new("/this/index/root/path/is/definitely/longer/than/forty/eight/bytes");
+        let entries = sample();
+        let buf = serialize_root(root, &entries);
+        // 估算公式 == 实际产出的字节数
+        assert_eq!(
+            buf.len(),
+            16 + root.to_string_lossy().len() + entries_bytes(&entries),
+            "容量估算公式必须与实际产出的字节数一致"
+        );
+        // **一次分配就够** → 没发生扩容。
+        //   估算蒙穿时 Vec 会被撑大（容量翻倍）→ 这里立刻变红。
+        assert_eq!(
+            buf.capacity(),
+            buf.len(),
+            "容量估算必须一次就够，不该发生 Vec 扩容"
         );
     }
 
