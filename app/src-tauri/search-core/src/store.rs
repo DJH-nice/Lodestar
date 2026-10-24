@@ -73,6 +73,34 @@ fn write_entry(buf: &mut Vec<u8>, e: &IndexEntry) {
     buf.extend_from_slice(&e.child_folder_count.to_le_bytes());
 }
 
+/// 所有条目的字节数（**不含头**）—— 落盘前的容量估算。
+///
+/// 【为什么要抽出来】v2 的 `serialize` 与 v3 的 `serialize_root` 都要先算
+///   「这份档大概多大」→ 一次分配、零拷贝。抄两份的话，其中一份迟早会漏字段
+///   —— v2 那份就漏了 `child_file_count` / `child_folder_count` 各 4 字节
+///   （今天只是多一次 Vec 扩容，不影响正确性，但它证明这段逻辑没有单一真相）。
+///
+/// 【必须与 `write_entry` 逐字段对齐】这里算的每个字段，
+///   `write_entry` 都必须真的写出去。**估小了**只是多一次扩容；
+///   **估大了**是白占内存。真正要防的是两边**不一致**——
+///   所以下面每一项都要跟 `write_entry` 里的字段一一对得上。
+fn entries_bytes(entries: &[IndexEntry]) -> usize {
+    let mut total = 0usize;
+    for e in entries {
+        // 6 个字符串：每个是「4 字节长度前缀 + 内容」（`write_str` 的写法）
+        total += 4 + e.name.len();
+        total += 4 + e.path.len();
+        total += 4 + e.dir.len();
+        total += 4 + e.extension.len();
+        total += 4 + e.folded_name.len();
+        total += 4 + e.folded_path.len();
+        // size(8) + mtime(8) + flags(1) + depth(4)
+        // + child_count(4) + child_file_count(4) + child_folder_count(4)
+        total += 8 + 8 + 1 + 4 + 4 + 4 + 4;
+    }
+    total
+}
+
 /// 读一条条目（`write_entry` 的逆操作）。
 fn read_entry(r: &mut Reader<'_>) -> Option<IndexEntry> {
     let name = r.string()?;
@@ -114,26 +142,8 @@ pub fn serialize(entries: &[IndexEntry], roots: &[PathBuf]) -> Vec<u8> {
     // 【为什么先算准大小】估小了会让 Vec **扩容时拷贝**整个缓冲区 ——
     //   3MB 的档要拷两三次，实测多花约 1ms（序列化总耗时的一半）。
     //   先扫一遍把大小算准 → 一次分配、零拷贝。
-    let mut cap = 64usize + roots.len() * 32;
-    for e in entries {
-        cap += 4
-            + e.name.len()
-            + 4
-            + e.path.len()
-            + 4
-            + e.dir.len()
-            + 4
-            + e.extension.len()
-            + 4
-            + e.folded_name.len()
-            + 4
-            + e.folded_path.len()
-            + 8
-            + 8
-            + 1
-            + 4
-            + 4;
-    }
+    //   （条目部分的大小由 `entries_bytes` 统一算 —— v2/v3 共用一份真相。）
+    let cap = 64usize + roots.len() * 32 + entries_bytes(entries);
 
     let mut buf: Vec<u8> = Vec::with_capacity(cap);
     buf.extend_from_slice(MAGIC);
@@ -213,6 +223,10 @@ fn parse(buf: &[u8]) -> Option<(Vec<IndexEntry>, Vec<PathBuf>)> {
         roots.push(PathBuf::from(r.string()?));
     }
     let entry_count = r.u32()? as usize;
+    // 档里的条目数不可信 → 先看剩下的字节装不装得下（见 `count_fits`）。
+    if !count_fits(r.buf, r.pos, entry_count) {
+        return None;
+    }
     let mut entries = Vec::with_capacity(entry_count);
     for _ in 0..entry_count {
         entries.push(read_entry(&mut r)?);
@@ -229,11 +243,11 @@ fn parse(buf: &[u8]) -> Option<(Vec<IndexEntry>, Vec<PathBuf>)> {
 ///   哈希是定长十六进制 → 永远是合法文件名。
 ///
 /// 【碰撞了会怎样】
-///   哈希吃的是**原始字节**（见 [`fnv1a64`]）→ 字节不同的路径**必然**落到
-///   不同的档文件 → 「两个根共用一份档」这件事根本不会发生。
-///   万一还是撞了（FNV-1a 理论上仍能被构造出碰撞），档里**记着自己的根路径**
-///   （见 [`parse_root]`）→ 读出来对不上就当没有档（退回全量扫描）
-///   → 最多浪费一次扫描，**不会读错数据**。
+///   哈希吃的是**原始字节**（见 [`fnv1a64`]）→ 两个**字节不同**的根
+///   哈希不同 → 落到**不同的档文件** → 「两个根共用一份档」不会发生
+///   （真正的 FNV-1a 碰撞是另一回事：理论上可被构造出来，但概率极低）。
+///   万一撞了，档里**记着自己的根路径**（见 [`parse_root`]）→ 读出来对不上
+///   就当没有档（退回全量扫描）→ 最多浪费一次扫描，**不会读错数据**。
 pub fn root_archive_path(dir: &Path, root: &Path) -> PathBuf {
     dir.join(format!(
         "{:016x}.bin",
@@ -264,16 +278,8 @@ fn fnv1a64(bytes: &[u8]) -> u64 {
 ///   v2：MAGIC + 版本 + **roots 列表** + 全部条目（所有根混在一起）。
 ///   v3：MAGIC + 版本 + **这个根的路径** + 这个根的条目。
 pub fn serialize_root(root: &Path, entries: &[IndexEntry]) -> Vec<u8> {
-    let mut cap = 64usize + entries.len() * 96;
-    for e in entries {
-        cap += 4 + e.name.len()
-            + 4 + e.path.len()
-            + 4 + e.dir.len()
-            + 4 + e.extension.len()
-            + 4 + e.folded_name.len()
-            + 4 + e.folded_path.len()
-            + 8 + 8 + 1 + 4 + 4 + 4 + 4;
-    }
+    // 容量估算与 v2 共用 `entries_bytes` —— 两套格式的条目部分完全一样。
+    let cap = 64usize + entries_bytes(entries);
     let mut buf: Vec<u8> = Vec::with_capacity(cap);
     buf.extend_from_slice(MAGIC);
     buf.extend_from_slice(&VERSION.to_le_bytes());
@@ -309,6 +315,28 @@ pub fn load_root(dir: &Path, root: &Path) -> Option<Vec<IndexEntry>> {
     Some(entries)
 }
 
+/// 一条条目的**最小**字节数（字符串内容长度可以为 0）。
+///
+/// 【怎么算出来的】6 个字符串的长度前缀（6 × 4 = 24）
+///   + size(8) + mtime(8) + flags(1) + depth(4)
+///   + child_count(4) + child_file_count(4) + child_folder_count(4) = **57**。
+///   （这跟 `write_entry` / `entries_bytes` 是同一份字段表 —— 三处必须一致。）
+const MIN_ENTRY_BYTES: usize = 57;
+
+/// 档里声称的条目数，这段剩余字节**装不装得下**。
+///
+/// 【为什么要有它】档里的条目数是 u32 → 最大 42.9 亿。直接拿它去
+///   `Vec::with_capacity` → 分配失败会**直接 abort**（而不是返回 `None`），
+///   违反「读不出来 → 重扫」的承诺；在开了 overcommit 的系统上还会先占掉
+///   几百 GB 虚拟内存。坏档应该走「重新扫一遍」，不是让应用起不来。
+///
+/// 【怎么判】一条条目最少也要 [`MIN_ENTRY_BYTES`] 字节
+///   → 装不下就说明这份档在说谎 → 当没有档。
+fn count_fits(buf: &[u8], pos: usize, count: usize) -> bool {
+    let remaining = buf.len().saturating_sub(pos);
+    count <= remaining / MIN_ENTRY_BYTES
+}
+
 /// 解析 v3 档 → (根路径, 条目)。
 fn parse_root(buf: &[u8]) -> Option<(String, Vec<IndexEntry>)> {
     let mut r = Reader { buf, pos: 0 };
@@ -320,6 +348,10 @@ fn parse_root(buf: &[u8]) -> Option<(String, Vec<IndexEntry>)> {
     }
     let root = r.string()?;
     let count = r.u32()? as usize;
+    // 档里的条目数不可信 → 先看剩下的字节装不装得下（见 `count_fits`）。
+    if !count_fits(r.buf, r.pos, count) {
+        return None;
+    }
     let mut entries = Vec::with_capacity(count);
     for _ in 0..count {
         entries.push(read_entry(&mut r)?);
@@ -419,9 +451,37 @@ mod tests {
             write_str(&mut buf, &r.to_string_lossy());
         }
         buf.extend_from_slice(&(entries.len() as u32).to_le_bytes());
+        // 【这里为什么要手写字节，不能调 `write_entry`】
+        //   这份手写布局是 **v2 落盘格式的规格（golden）** —— 用户磁盘上
+        //   已经有 v2 老档，它**不能变**。
+        //   如果这里改成调 `write_entry`，这个测试就只证明
+        //   「`write_entry` 与 `read_entry` 互逆」→ 将来有人给
+        //   `write_entry` 加了字段却忘了 bump 版本号 → 两个 helper 一起变
+        //   → 这个测试**照样全绿**，而**老档会被静默读成错值**。
+        //   独立于实现的期望字节才能立刻把这类改动顶红。
         for e in &entries {
-            write_entry(&mut buf, e);
+            write_str(&mut buf, &e.name);
+            write_str(&mut buf, &e.path);
+            write_str(&mut buf, &e.dir);
+            write_str(&mut buf, &e.extension);
+            write_str(&mut buf, &e.folded_name);
+            write_str(&mut buf, &e.folded_path);
+            buf.extend_from_slice(&e.size.to_le_bytes());
+            buf.extend_from_slice(&e.mtime.to_le_bytes());
+            buf.push(if e.is_folder { 1 } else { 0 });
+            buf.extend_from_slice(&e.depth.to_le_bytes());
+            buf.extend_from_slice(&e.child_count.to_le_bytes());
+            buf.extend_from_slice(&e.child_file_count.to_le_bytes());
+            buf.extend_from_slice(&e.child_folder_count.to_le_bytes());
         }
+
+        // v2 的落盘字节必须与这份手写期望**逐字节相同** ——
+        //   用户磁盘上已经有 v2 老档，它**不能变**。
+        assert_eq!(
+            serialize(&entries, &roots),
+            buf,
+            "v2 的落盘字节必须逐字节不变（跨版本契约）"
+        );
 
         let (got_entries, got_roots) = parse(&buf).expect("应该能解析");
         assert_eq!(got_roots, roots);
@@ -570,5 +630,199 @@ mod tests {
             "原始字节不同 → 必须落到不同的档文件"
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ───────────────────── 落盘布局的规格（golden） ─────────────────────
+
+    /// 一条**手写**的条目字节期望 —— v3 落盘布局的**规格**。
+    ///
+    /// 【为什么测试里要手写一份】
+    ///   `write_entry` / `read_entry` 是**一对互逆的实现** → 只测它们互相能读通，
+    ///   证明不了「落盘的字节布局没变」。而落盘布局是**跨版本契约**
+    ///   （用户磁盘上已经有老档）：将来有人给 `write_entry` 加了字段却忘了
+    ///   bump 版本号 → 两个 helper 一起变 → 只测互逆性的测试**照样全绿**，
+    ///   而**老档会被静默读成错值**。
+    ///   所以这里手写一份**期望字节**（连 4 字节长度前缀都用**字面量**写死，
+    ///   不调 `write_str`）→ 布局一变立刻变红。
+    ///
+    /// 【覆盖了全部 13 个字段】name / path / dir / extension / folded_name /
+    ///   folded_path / size / mtime / is_folder / depth / child_count /
+    ///   child_file_count / child_folder_count。
+    fn golden_entry() -> (IndexEntry, Vec<u8>) {
+        let e = IndexEntry {
+            name: "sub".into(),
+            path: "/r/sub".into(),
+            dir: "/r".into(),
+            extension: String::new(),
+            folded_name: "sub".into(),
+            folded_path: "/r/sub".into(),
+            size: 11,
+            mtime: 12,
+            is_folder: true,
+            depth: 1,
+            child_count: 2,
+            child_file_count: 3,
+            child_folder_count: 4,
+        };
+        let mut b: Vec<u8> = Vec::new();
+        // name（3 字节）+ 4 字节长度前缀
+        b.extend_from_slice(&3u32.to_le_bytes());
+        b.extend_from_slice(b"sub");
+        // path（6 字节）
+        b.extend_from_slice(&6u32.to_le_bytes());
+        b.extend_from_slice(b"/r/sub");
+        // dir（2 字节）
+        b.extend_from_slice(&2u32.to_le_bytes());
+        b.extend_from_slice(b"/r");
+        // extension（空字符串 → 只有 4 字节长度前缀）
+        b.extend_from_slice(&0u32.to_le_bytes());
+        // folded_name（3 字节）
+        b.extend_from_slice(&3u32.to_le_bytes());
+        b.extend_from_slice(b"sub");
+        // folded_path（6 字节）
+        b.extend_from_slice(&6u32.to_le_bytes());
+        b.extend_from_slice(b"/r/sub");
+        // size(8) + mtime(8)
+        b.extend_from_slice(&11i64.to_le_bytes());
+        b.extend_from_slice(&12i64.to_le_bytes());
+        // flags（is_folder → 1）
+        b.push(1);
+        // depth(4) + child_count(4) + child_file_count(4) + child_folder_count(4)
+        b.extend_from_slice(&1u32.to_le_bytes());
+        b.extend_from_slice(&2u32.to_le_bytes());
+        b.extend_from_slice(&3u32.to_le_bytes());
+        b.extend_from_slice(&4u32.to_le_bytes());
+        (e, b)
+    }
+
+    #[test]
+    fn the_v3_entry_layout_is_byte_for_byte_stable() {
+        let (e, expected_entry) = golden_entry();
+        let buf = serialize_root(Path::new("/r"), std::slice::from_ref(&e));
+
+        // 条目部分：与手写期望逐字节相同
+        let at = buf.len() - expected_entry.len();
+        assert_eq!(
+            &buf[at..],
+            expected_entry.as_slice(),
+            "v3 的条目字节布局必须逐字节不变（跨版本契约）"
+        );
+
+        // 整份档（头 + 条目）：逐字节相同
+        let mut expected: Vec<u8> = Vec::new();
+        expected.extend_from_slice(b"SXTX");
+        expected.extend_from_slice(&3u32.to_le_bytes());
+        expected.extend_from_slice(&2u32.to_le_bytes());
+        expected.extend_from_slice(b"/r");
+        expected.extend_from_slice(&1u32.to_le_bytes());
+        expected.extend_from_slice(&expected_entry);
+        assert_eq!(buf, expected, "v3 的落盘字节必须逐字节不变");
+
+        // 容量估算必须与 `write_entry` 实际写出的字节数一致 ——
+        //   这两个数一旦漂移（有人给 write_entry 加字段却忘了改估算），
+        //   就要在这里被抓住，而不是等到「多一次 Vec 扩容」才被发现。
+        assert_eq!(
+            entries_bytes(std::slice::from_ref(&e)),
+            expected_entry.len(),
+            "容量估算必须与 write_entry 写出的字节数一致"
+        );
+    }
+
+    #[test]
+    fn the_minimum_entry_size_matches_the_sanity_check() {
+        // 【为什么要钉住】`count_fits` 拿「剩余字节 ÷ 单条最小字节数」判
+        //   「这份档在说谎」。这个最小值必须**恰好**等于一条空条目的字节数 ——
+        //   估大了 → 明明装得下的档被误判成坏的（白扫一遍）；
+        //   估小了 → 坏档能骗过检查（又回到「分配失败直接 abort」）。
+        let e = IndexEntry {
+            name: String::new(),
+            path: String::new(),
+            dir: String::new(),
+            extension: String::new(),
+            folded_name: String::new(),
+            folded_path: String::new(),
+            size: 0,
+            mtime: 0,
+            is_folder: false,
+            depth: 0,
+            child_count: 0,
+            child_file_count: 0,
+            child_folder_count: 0,
+        };
+        assert_eq!(
+            entries_bytes(&[e]),
+            MIN_ENTRY_BYTES,
+            "单条条目的最小字节数必须与 entries_bytes 一致"
+        );
+    }
+
+    #[test]
+    fn a_hash_collision_is_detected_and_the_archive_is_rejected() {
+        // 【为什么要钉住】这是全局约束「档里记着自己的根路径 → 碰撞能检出」
+        //   的**唯一实现**（`load_root` 里那句 `saved_root != root.to_string_lossy()`）。
+        //   其它测试走的都是「文件不存在」分支 → 覆盖不到它。
+        //   以后被改坏（例如那句比对被删掉）不会有任何测试变红。
+        let dir = std::env::temp_dir().join(format!("lodestar-store-collide-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let root = PathBuf::from("/Volumes/U盘");
+        let other = PathBuf::from("/Volumes/别的盘");
+
+        // 造一份「档里记的是**别的根**」的 v3 字节流
+        let bytes = serialize_root(&other, &sample());
+
+        // 前提校验：这份字节流本身是**好的** —— 能解析出「别的根」。
+        //   少了这一步，「load_root 返回 None」可能只是因为字节流坏了
+        //   → 就没测到「根对不上」那条分支。
+        let parsed = parse_root(&bytes).expect("前提：这份字节流必须是好的");
+        assert_eq!(parsed.0, other.to_string_lossy());
+
+        // 把它写进**请求的根**该在的那个文件（= 模拟哈希碰撞）
+        save_bytes(&bytes, &root_archive_path(&dir, &root), true).expect("应该能写档");
+
+        assert!(
+            load_root(&dir, &root).is_none(),
+            "档里记的是别的根 → 必须当没有档（重扫），不能读到别人的条目"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn an_archive_that_claims_too_many_entries_is_rejected() {
+        // 【为什么要钉住】档里的条目数是 u32 → 坏档可以随便写一个 42.9 亿。
+        //   直接拿它 `Vec::with_capacity` → 分配失败会**直接 abort**
+        //   （而不是返回 None）→ 一个坏档能把应用**炸掉**。
+        //   坏档应该走「读不出来 → 重扫」，不是让应用起不来。
+        let mut buf = Vec::from(MAGIC);
+        buf.extend_from_slice(&VERSION.to_le_bytes());
+        buf.extend_from_slice(&2u32.to_le_bytes());
+        buf.extend_from_slice(b"/r");
+        buf.extend_from_slice(&u32::MAX.to_le_bytes()); // 条目数：42.9 亿
+        assert!(parse_root(&buf).is_none(), "在说谎的档必须被拒");
+
+        // v2 那边同理（v2 的档也还在用）
+        let mut buf2 = Vec::from(MAGIC);
+        buf2.extend_from_slice(&VERSION_V2.to_le_bytes());
+        buf2.extend_from_slice(&0u32.to_le_bytes());
+        buf2.extend_from_slice(&u32::MAX.to_le_bytes());
+        assert!(parse(&buf2).is_none(), "在说谎的 v2 档必须被拒");
+    }
+
+    #[test]
+    fn the_entry_count_gate_rejects_what_does_not_fit() {
+        // 【为什么要有这条】上面那条端到端测试走的是「分支被走到」，
+        //   但**抓不住「闸门被删掉」** —— 因为 macOS 开着 overcommit，
+        //   `Vec::with_capacity(42.9 亿)` 那 790GB **虚拟内存**居然申请成功，
+        //   于是「有闸门」与「没闸门」两种情况**结果都是 None**。
+        //   所以这里直接测**闸门本身的算术**（白盒）——
+        //   公式被改坏（比如把 57 写成 61、或把比较号反过来）立刻变红。
+        //   剩下「闸门有没有被调用」由上面那条端到端测试覆盖分支。
+        // 装不下：剩 0 字节，却说有 42.9 亿条
+        assert!(!count_fits(&[0u8; 16], 16, u32::MAX as usize));
+        // 装不下：剩 56 字节（差 1 字节就够一条）却说有 1 条
+        assert!(!count_fits(&[0u8; 56], 0, 1));
+        // 刚好装下：57 字节 = 1 条
+        assert!(count_fits(&[0u8; 57], 0, 1));
+        // 空档 + 0 条 → 合法
+        assert!(count_fits(&[0u8; 16], 16, 0));
     }
 }
