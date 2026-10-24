@@ -1068,13 +1068,17 @@ pub fn mounted_local_volumes() -> Vec<PathBuf> {
     // 【getfsstat 的两段式调用】第一次只问「有多少个」，
     // 第二次才把内容填进我们给的数组里（缓冲区是**我们自己的** Vec → 线程安全）。
     unsafe {
-        let count = libc::getfsstat(std::ptr::null_mut(), 0);
+        // ⚠️ **macOS 的签名是 3 参数**：`getfsstat(buf, bufsize, flags)`
+        //   —— 第二个参数是**字节数**（不是元素个数，也不是 `&mut size`）。
+        //   （BSD/Linux 那边才是 `getfsstat64(buf, &mut bufsize)` 那个 2 参数形式 ——
+        //   在 macOS 上照抄会编译不过，或者更糟：传错语义。）
+        let count = libc::getfsstat(std::ptr::null_mut(), 0, libc::MNT_NOWAIT);
         if count <= 0 {
             return Vec::new();
         }
-        let mut buf = vec![std::mem::zeroed::<libc::statfs64>(); count as usize];
-        let mut size = std::mem::size_of::<libc::statfs64>() as libc::c_int;
-        let count = libc::getfsstat(buf.as_mut_ptr() as *mut libc::statfs64, &mut size);
+        let mut buf = vec![std::mem::zeroed::<libc::statfs>(); count as usize];
+        let bytes = std::mem::size_of::<libc::statfs>() * count as usize;
+        let count = libc::getfsstat(buf.as_mut_ptr(), bytes as libc::c_int, libc::MNT_NOWAIT);
         if count <= 0 {
             return Vec::new();
         }
