@@ -55,7 +55,7 @@ pub struct Engine {
 
 - **watcher 监听的是「引擎实际在索引的目录」**（`src/watcher.rs:771` `desired_watch_dirs`
   读 `IndexState::engine_snapshot().1`）→ **卷一进索引，watcher 自动跟上**；拔卷自动摘掉。
-  这一点很关键：意味着 watcher 侧**不需要**为卷写任何特殊代码（除 §5 的按根重扫）。
+  这一点很关键：意味着 watcher 侧**不需要**为卷写任何特殊代码（【回填 2026-10-25】原计划的「按根重扫」没做 —— 见 §3.6；watcher 走的是**增量更新**）。
 - **排除规则是目录级剪枝**，对卷上的目录一视同仁（`search-core/src/exclude.rs`）→ 无需改动。
 - **前端已有「索引变了就重搜」的机制**（`App.vue:360` `onReindexed` → `refreshKey++`）→ 复用。
 - **应用没有 App Sandbox**（ad-hoc 签名，无 entitlements）→ 读 `/Volumes` **无权限障碍**。
@@ -105,7 +105,12 @@ pub struct Engine {
 
 ```rust
 /// 当前挂载的【本地外接卷】—— /Volumes 下的直接子目录。
-pub fn mounted_local_volumes() -> Vec<PathBuf>
+///
+/// 【回填 2026-10-25】返回 `Result` —— 「这一轮没拿到挂载表」**不是**「没有外接卷」。
+///   调用方靠集合变化判断卷出现/消失；系统调用失败**也是**空列表 →
+///   会被误判成「所有卷都被拔了」→ 触发不必要的拆索引 + 全量重扫。
+///   → 失败走 `Err`（带 errno）+ 一条 warn 日志；调用方**这一轮什么都不做**。
+pub fn mounted_local_volumes() -> Result<Vec<PathBuf>, String>
 ```
 
 实现（`libc::getfsstat`，**零新增依赖**）：
@@ -121,6 +126,9 @@ pub fn mounted_local_volumes() -> Vec<PathBuf>
    - **必须**是 `/Volumes` 的**直接子目录**（`path.parent() == "/Volumes"`）→
      排除 `/`（根卷）与 `/System/Volumes/*`（系统卷）。
    - 排除指向 `/` 的符号链接（`Macintosh HD -> /`）。
+   - **【回填 2026-10-25】**排除**命中排除规则名字**的卷（`Library`、`.隐藏`…）→
+     它们会被扫描**整棵**剪掉 → 索引里 0 条目 → 状态栏显示「Library · 就绪 · 0 项」。
+     判据走 `search_core::exclude::path_is_excluded`（**排除规则只有一份真相**）。
 3. 结果排序（保证顺序稳定 → 附加顺序可复现）。
 
 **为什么不用 `NSFileManager` / `Disk Arbitration`**：
@@ -148,11 +156,18 @@ pub struct Engine {
 pub fn attach_root(&self, root: &Path, entries: Vec<IndexEntry>) -> u32;
 
 /// 分离一个根目录 —— 条目**立即**从索引里消失；它的档**留着**（供插回时复用）。
+/// 【回填 2026-10-25】**只摘挂过的根**：没挂过 → 原样返回、一条条目都不删
+///   （这条不变式已**下沉到引擎层**守住 —— 它是 `pub` API，不能当脚枪使）。
 pub fn detach_root(&self, root: &Path) -> u32;
-
-/// 用【外部算好的】条目替换指定根的条目。
-pub fn replace_roots(&self, roots: &[PathBuf], new_entries: Vec<IndexEntry>) -> u32;
 ```
+
+> **【回填 2026-10-25】`replace_roots` 没有实现，也不打算实现。**
+> 「按根替换」这个语义最后被拆成了两件事：
+> - **换一批根**（换索引目录）→ 整个引擎重建（`settings::rebuild_engine`）；
+> - **换某一个根的内容**（卷重新扫描）→ `attach_root` 的**幂等替换**语义。
+>
+> 另加一条引擎层的**落盘**隔离（每根一个档 → 只重写变了的根），
+> 见 §3.3 与 §3.4 的落盘段。
 
 **归属判定用 `Path::starts_with`（组件级），不是字符串前缀** ——
 字符串前缀会让 `/a/bc` 被 `/a/b` 命中 → **漏索引**（AGENTS.md 记过这个坑）。
@@ -201,28 +216,36 @@ pub fn save_root(dir: &Path, root: &Path, entries: &[IndexEntry]) -> io::Result<
 ```rust
 enum Job {
     Search { .. }, Page { .. },
-    AttachRoot { root, entries, reply },    // 新增：附加一个根（带扫好的条目）
-    DetachRoot { root, reply },             // 新增：分离一个根
-    ReplaceRoots { roots, entries, reply }, // 新增：按根替换（重扫用）
+    Rescan { .. },                             // 仍然在（见下面的回填）
+    AttachRoot { root, entries, reply },      // 新增：附加一个根（带扫好的条目）
+    DetachRoot { root, reply },               // 新增：分离一个根
+    ApplyChanges { changes, reply },          // 增量更新（watcher 用）
     Shutdown,
 }
 ```
 
-**`Job::Rescan` 被 `Job::ReplaceRoots` 取代** —— 旧的那个在 worker 里**扫**，
-新的只**替换**。扫描一律由调用方做（`search_core::scan::scan` 已经是 `pub mod`，
-调用方直接调）。
-
-**「扫描在 worker 之外」怎么落地**：
+> **【回填 2026-10-25】`Job::ReplaceRoots` 没有实现；`Job::Rescan` 仍在。**
+>
+> - `Job::Rescan` 之所以留着：它是**引擎内部**的全量重扫（`Engine::rescan` → `scan::scan(roots)`），
+>   服务于「用户点刷新」这条路径 —— 那条路径本来就在 worker 之外扫不出「半成品」，
+>   保留原样最省事。**卷的扫描不走它**（卷的扫描在卷任务线程上，结果由 `AttachRoot` 带进来）。
+> - `Job::ReplaceRoots` 被**两样东西**取代了：
+>   「换某一个根的内容」→ `AttachRoot` 的幂等替换；
+>   「换一批根」→ 整个引擎重建（`settings::rebuild_engine`）。
+>
+> **「扫描在 worker 之外」怎么落地**：
 
 | 谁要重扫 | 扫描在哪跑 | 怎么进 worker |
 |---|---|---|
 | 卷首次附加 | 卷任务线程 | `AttachRoot`（带扫好的条目） |
 | 卷插回后的后台刷新 | 卷任务线程 | `AttachRoot`（替换） |
-| watcher 自动重扫 | **watcher 线程** | `ReplaceRoots`（带扫好的条目） |
-| 前端「刷新」按钮 | `spawn_blocking` 线程 | `ReplaceRoots`（带扫好的条目） |
+| watcher 自动重扫 | **watcher 线程** | `ApplyChanges`（增量，不重扫） |
+| 前端「刷新」按钮 | `spawn_blocking` 线程 | `Rescan`（引擎内部全量扫） |
 
-`ReplaceRoots` 的 `new_entries` 可以直接是 `scan::scan(roots)` 的**合并结果** ——
-引擎按**组件级路径前缀**把它分派到各个根（分派规则是引擎的事，不外泄给调用方）。
+> **【回填 2026-10-25】watcher 那一行变了**：它现在走**增量更新**（`ApplyChanges`），
+> 不再是「按根重扫」（§3.6 那一节整节删掉了，理由见那里）。
+> 落盘那一侧另加了一条隔离：**每个根只要最新的那一份**（`PersistSlot`），
+> 且只重写**真的变了**的根（`dirty_roots`）→ 插拔卷不牵连 $HOME 那份档。
 
 worker 内的临界区只剩「整份替换 + 视图作废」→ **微秒级** → 搜索不再被堵。
 C3 那条不变式（替换与搜索串行）**保持**。
@@ -235,14 +258,18 @@ pub struct VolumeStatus {
     pub path: String,        // /Volumes/U盘
     pub label: String,       // U盘
     pub phase: VolumePhase,  // Indexing | Ready | Failed(String)
-    pub indexed: u32,
+    pub indexed: u32,        // 【回填 2026-10-25】**这个卷自己**的条目数（不是引擎总数）
 }
 ```
 
 监控线程（每 1s 一轮）：
 
-1. `mounted_local_volumes()` → 当前挂载的卷集合。
-2. 与「已附加集合」求差：
+1. `mounted_local_volumes()` → 当前挂载的卷集合（**失败就这一轮什么都不做**）。
+2. **对账**（【回填 2026-10-25】）：`known` 里不在「引擎实际在索引的根」里的卷 → 剔除
+   → 它重新变成「新出现的」→ 下一轮重新附加。
+   （换索引目录时若枚举失败 → 新引擎里没有那个卷 → `known` 却还留着它 →
+    差分看到「没变化」→ 永远不会重新附加。这条对账是**通用不变式**。）
+3. 与「已附加集合」求差：
    - **消失** → `detach_root` → 条目立即消失 → 档保留 → 状态里移除该卷。
    - **出现** → 起一个**卷任务线程**（不阻塞监控循环），一个卷一个任务，任务内三步：
      1. **读档**：`load_root(dir, volume)`；
@@ -255,16 +282,59 @@ pub struct VolumeStatus {
      4. **附加前复查**：盘可能已经被拔了 → 复查挂载表 → 不在了就**丢弃结果**，不附加。
      5. 附加成功后：更新 `IndexState`（paths + indexed）→ 发事件通知前端重搜。
 
+> **【回填 2026-10-25】第 1 步与第 2 步之间不能早退。**
+> 第一版把「命中旧档」写成了 `return` → 「插回来后台刷新」**根本没实现**，
+> 而且是**静默**的：插上刚在别的机器上拷过文件的 U 盘 → 搜不到那个文件 →
+> 没有报错、状态栏还显示「U盘 · N 项 · 就绪」，而且**不自愈**
+> （FSEvents 不会补发拔插期间的历史事件）。
+> → 现在这两段由 `volumes::volume_attach_phases` 编排（纯函数 + 护栏测试钉住顺序）。
+
+> **【回填 2026-10-25】状态栏在刷新期间保持 `Indexing`。**
+> 否则「插回来立刻能搜」与「内容是最新的」这两件事在界面上分不开
+> （以前是「秒开 → 直接 Ready」，用户完全看不出后台正在刷新）。
+> 秒开之后 → 仍然是 `Indexing`；刷新完成 → `Ready`。
+
+> **【回填 2026-10-25】附加的结果是**异步**回传的。**
+> 扫描要几十秒 → 监控线程**绝不能**等它（等它就检测不到拔盘了）→
+> 卷线程把「挂上了吗」经 channel 回传；监控线程**收到成功**才把它记进 `known`。
+> 失败**不记** `known` → 下一轮会再试（重试有节流：30 秒一次，
+> 否则失败重试会每秒重扫一遍几十万文件的大盘）。
+
 **为什么「扫描在任务线程、附加在 worker」**：
 worker 是搜索的热路径，30 秒的扫描绝不能进去；而「把条目并进表」是微秒级的，
 放 worker 里能保证与搜索串行、视图状态自洽。
 
-**启动路径也要带上卷**：
-`effective_roots(settings)` = 配置的索引目录（空 → `$HOME`）+ **当前已挂载的卷**。
-→ 启动时 U 盘已插 → 直接从各自的档读 → **毫秒级**，不必等监控线程。
-→ 同时 `rebuild_engine`（用户手动换目录）也要带上卷 → 否则手动重索引会把卷踢掉。
+**启动路径**：
+> **【回填 2026-10-25】这一段与实现相反 —— 实现是「启动路径**不带**卷」。**
+> `rebuild_engine_if_absent`（启动路径）只用 `effective_paths`（配置目录，空 → `$HOME`），
+> **不带**当前已挂载的卷 → 启动时 U 盘已插也不会从它的档里秒开，
+> 而是等监控线程那一轮（≤ 1 秒）再挂上。
+>
+> **取舍**：评审认为**现状更好** —— 启动线程不必等 30 秒的大盘首扫
+> （带着卷启动 = 启动要等那个盘扫完）。
+> 代价：启动后那一秒内搜不到盘上的文件（可接受）。
+>
+> `rebuild_engine`（用户手动换目录）**要**带上卷 → 否则手动重索引会把卷踢掉。
+> 枚举失败时保持原根列表（宁可少索引一个卷，也不能把用户正在用的根踢掉）。
 
-### 3.6 watcher：按根重扫（`src/watcher.rs`）
+### 3.6 watcher：按根重扫（`src/watcher.rs`）—— **【回填 2026-10-25】整节作废**
+
+> **【回填 2026-10-25】这一节整节作废 —— 「按根重扫」没有实现，也不再打算实现。**
+>
+> 实施计划里已经把它标成偏差（见计划文档的偏差表：「删掉这一节」），但设计文档没跟上 → 这次回填。
+>
+> **实际做法**：watcher 收到变化 → 走**增量更新**（`Job::ApplyChanges`）→
+> 只把变了的条目就地反映进索引，**根本不重扫**。
+> → §3.4 表里那一行也跟着改了。
+>
+> 为什么不按根重扫：增量更新（M3）已经把「变一个文件」的代价降到几毫秒，
+> 按根重扫是**在增量到位之前**的过渡方案 —— 两者重复。
+>
+> **【回填 2026-10-25】落盘那一侧另做了一条隔离**（与本节无关，但同样重要）：
+> `PersistSlot` 是「每根覆盖最新字节流」+ 只重写**真的变了**的根（`dirty_roots`）
+> → 插拔卷不牵连 $HOME 那份档（$HOME 量级 3.4MB）。
+>
+> 下面这段保留作为**历史设计**（实现里没有它）：
 
 **问题**：现在 watcher 一收到「会被索引的路径变了」就触发**全量重扫**
 （`searcher.rescan()` → 扫所有根）。插着 U 盘时，U 盘上的一次保存 →
@@ -334,7 +404,7 @@ struct Signals {
 | 网络盘 | **不做** | `MNT_LOCAL` 一行排除；用户说的是「插硬盘」 |
 | 稳定卷标识（UUID） | **不做** | 要 `diskutil` 取 UUID（多一个子进程 + plist 解析）；用户在访达里改卷名是罕见场景，先按「新盘」处理（旧档成孤儿，暂不清理） |
 | 阻塞式「插上立刻响应」 | **1s 轮询** | `getfsstat` 几十微秒；回调式（Disk Arbitration）要挂 RunLoop，收益小于复杂度 |
-| 卷的实时更新 | **做**（watcher 自动跟上 + 按根重扫） | 不做的话 U 盘上的新文件要等手动刷新才出现 |
+| 卷的实时更新 | **做**（watcher 自动跟上，走**增量更新**） | 不做的话 U 盘上的新文件要等手动刷新才出现（【回填 2026-10-25】原方案里的「按根重扫」没做，见 §3.6） |
 
 ---
 
@@ -345,7 +415,7 @@ struct Signals {
 | 扫描期间拔盘 | 任务线程在附加前复查挂载表 → 没了就**丢弃结果**，不附加 |
 | 附加完成后立刻拔盘 | 下一轮监控（≤1s）发现挂载点消失 → 走分离路径 → 条目移除 |
 | 拔盘与重扫同时发生 | 重扫在 worker 外做；进 worker 时若根已不在 → 该根的条目被丢弃 |
-| 用户在卷插着时手动换索引目录 | `rebuild_engine` 带上「当前挂载的卷」→ 卷不丢 |
+| 用户在卷插着时手动换索引目录 | `rebuild_engine` 带上「当前挂载的卷」→ 卷不丢；【回填 2026-10-25】枚举失败时**新引擎里没有那个卷** → 监控线程的**对账**会把它剔除 → 下一轮重新附加（见 §3.5 第 2 步） |
 | 卷改名（访达里改） | macOS 会卸载并以新名挂载 → 监控线程看到「旧的消失 + 新的出现」→ 当新盘重扫；旧档成孤儿（**暂不清理**） |
 | 同一块盘挂出多个卷（分区） | 每个分区一个挂载点 → 各自成一个根 ✓ |
 | 卷里有不可读目录 | `scan::scan` 已有「跳过不可读目录」的行为（见其单元测试）→ 不中断整趟扫描 |
@@ -360,7 +430,7 @@ struct Signals {
 |---|---|---|
 | **M1** | 引擎支持根目录增删 + 按根分档（`search-core`） | `cargo test -p search-core` 全绿；新增单测：附加/分离/替换后条目数与搜索结果正确；档的往返 |
 | **M2** | 卷枚举 + 监控线程 + 附加/分离编排 | 插 U 盘 → 3s 内状态出现该卷且标「正在索引」；拔盘 → 2s 内条目消失 |
-| **M3** | watcher 按根重扫 | U 盘变动**不**触发 $HOME 重扫（日志里 $HOME 的扫描次数不变） |
+| **M3** | watcher 增量更新（**【回填 2026-10-25】**原计划的「按根重扫」没做，见 §3.6） | U 盘变动**不**触发 $HOME 重扫（日志里 $HOME 的扫描次数不变） |
 | **M4** | 状态与前端（状态栏 + 事件 + 重搜） | 卷变化后前端自动重搜；状态栏显示卷状态 |
 | **M5** | 真机验收 | 下表全部通过 |
 
@@ -370,7 +440,7 @@ struct Signals {
 |---|---|---|
 | 1 | 插入 U 盘（首次） | 3s 内状态栏出现「U 盘 · 正在索引…」；扫完后搜得到盘上的文件 |
 | 2 | 拔掉 U 盘 | 2s 内该卷的条目从搜索结果消失（**不留幽灵**）；本机搜索照常 |
-| 3 | 重新插入 | 1s 内可搜到（**旧索引复用**）；随后后台刷新完成，内容最新 |
+| 3 | 重新插入 | 1s 内可搜到（**旧索引复用**）；随后后台刷新完成，内容最新（【回填 2026-10-25】这一条**曾经没实现** —— 命中旧档就早退了；现在由 `volumes::volume_attach_phases` 编排两段，并有护栏测试钉住） |
 | 4 | 插拔各一次 | $HOME **未发生全量重扫**（日志核对） |
 | 5 | 插着 U 盘搜本机文件 | 延迟与不插时一致（不被卷的扫描拖累） |
 | 6 | 冷启动（U 盘已插） | 启动读档 ≤ 15ms（与现在持平） |
@@ -385,7 +455,7 @@ struct Signals {
 | 风险 | 影响 | 对策 |
 |---|---|---|
 | 引擎数据结构改动引入回归 | 搜索结果错乱 | 改动集中在「增删根」三个方法；`search-core` 有 5 个护栏集成测试 + 新增单测 |
-| watcher 的脏根集合引入竞态 | 索引过期 | 「记根 + 置标志」与「取根 + 清标志」各自在同一把锁内；根不明时**退回全量扫**（宁可多扫不可漏扫） |
+| watcher 的脏根集合引入竞态 | 索引过期 | **【回填 2026-10-25】这一条作废** —— 「按根重扫」没做（见 §3.6），watcher 走的是**增量更新**。增量那边的不变式是「变化集合与更新在同一把锁内取走」 |
 | 卷的扫描吃满 CPU（后台常驻时） | 机器变卡 | 扫描用引擎自带的并行遍历；节流靠 watcher 的既有 5s 闸；实测后再调 |
 | 卷上文件极多（30 万） | 首扫很久、内存涨 | 首扫在后台；状态栏显示进度；索引内存按条目数线性增长（与 $HOME 同理） |
 | `getfsstat` 在极老系统上不可用 | 功能缺失 | macOS 10.x 起一直是稳定 API；不可用时返回空列表 → 退化成「不索引卷」，不影响主功能 |
@@ -412,7 +482,7 @@ struct Signals {
 | 1 | 插入外接盘后索引怎么处理 | **自动检测并自动索引** |
 | 2 | 拔盘后条目怎么办 | **立刻移除，不留幽灵条目** |
 | 3 | 插回来要不要复用旧索引 | **复用旧索引，后台再刷一遍** |
-| 4 | watcher 要不要做按根重扫 | **一起做** |
+| 4 | watcher 要不要做按根重扫 | **一起做**（【回填 2026-10-25】最终**没做** —— 走增量更新，见 §3.6） |
 
 ---
 
@@ -420,14 +490,14 @@ struct Signals {
 
 | 文件 | 改动 |
 |---|---|
-| `app/src-tauri/search-core/src/engine.rs` | 根目录增删、按根替换、档目录化 |
+| `app/src-tauri/search-core/src/engine.rs` | 根目录增删（`attach_root` / `detach_root`）、档目录化 |
 | `app/src-tauri/search-core/src/store.rs` | 每根一个档（v3 格式） |
-| `app/src-tauri/search-core/src/worker.rs` | 新增三个 Job |
+| `app/src-tauri/search-core/src/worker.rs` | 新增 `AttachRoot` / `DetachRoot` 两个 Job + 按根落盘 |
 | `app/src-tauri/search-core/src/lib.rs` | 导出新增 API |
-| `app/src-tauri/src/volumes.rs` | **新增**：枚举 + 监控 + 卷任务 |
-| `app/src-tauri/src/settings.rs` | `effective_roots` = 配置目录 + 已挂载卷 |
-| `app/src-tauri/src/index_state.rs` | 卷状态字段 + 附加后提交 paths |
+| `app/src-tauri/src/volumes.rs` | **新增**：枚举 + 监控 + 卷任务（秒开 + 后台刷新两段） |
+| `app/src-tauri/src/settings.rs` | `rebuild_engine` 带上已挂载的卷（**启动路径不带**，见 §3.5） |
+| `app/src-tauri/src/index_state.rs` | 引擎代次 + 条件提交（`commit_if_current`） |
 | `app/src-tauri/src/commands.rs` | `IndexStatus.volumes` |
 | `app/src-tauri/src/event_names.rs` | 新事件名 + 数量断言 |
-| `app/src-tauri/src/watcher.rs` | 脏根集合 + 按根重扫 |
+| `app/src-tauri/src/watcher.rs` | 增量更新（**不做**按根重扫，见 §3.6） |
 | `app/src/` | `App.vue` 监听事件、`StatusBar.vue` 显示卷、`lib/types.ts` 类型 |

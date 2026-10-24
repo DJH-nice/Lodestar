@@ -263,9 +263,23 @@ impl Engine {
     ///   → **静默无效** → 条目留着 = **幽灵条目**（用户最不能接受的那种）。
     ///   → 摘根时要用与挂载时**完全一样**的那个字符串。
     ///
+    /// 【不变式：只摘挂过的根】
+    ///   **挂过** → 摘；**没挂过** → 原样返回、**一条条目都不删**。
+    ///   （以前是无条件按路径前缀删 → 传一个没挂过的路径，
+    ///     就会连带删掉**别的根**的条目 —— 这把枪一直架在这个公开 API 上。
+    ///     现在这条不变式**下沉到引擎层**守住，
+    ///     worker 侧那个「查不到就不去摘」的检查就变成双保险而不是唯一防线。）
+    ///
     /// 【它的档不删】—— 插回来时要复用（用户要的是「插回来立刻能搜」）。
     /// 档不动是因为落盘只写「当前在索引里的根」→ 拔掉的卷那份文件原地不动 ✓。
     pub fn detach_root(&self, root: &Path) -> u32 {
+        // 【先问一句「它挂过吗」】——
+        //   没挂过就**什么都不做**（连别的根的条目都不能碰）。
+        //   判定口径与下面删根时用的**同一份**（组件级前缀，见 `path_in_root`）。
+        let attached = self.roots.borrow().iter().any(|r| path_in_root(r, root));
+        if !attached {
+            return self.entries.borrow().len() as u32;
+        }
         let mut all = self.entries.borrow_mut();
         // 【组件级前缀】字符串前缀会让 `/a/bc` 被 `/a/b` 命中 → 漏索引
         all.retain(|e| !path_in_root(Path::new(&e.path), root));
@@ -1249,5 +1263,98 @@ mod tests {
         let _ = std::fs::remove_dir_all(&store_dir);
         let _ = std::fs::remove_dir_all(&dir_a);
         let _ = std::fs::remove_dir_all(&dir_b);
+    }
+
+    /// 摘一个**从来没挂过**的根 → **一条条目都不能删**。
+    ///
+    /// 【为什么要有这条】`detach_root` 是 `pub` API ——
+    ///   以前它**无条件**按路径前缀删条目 →
+    ///   将来任何直接调它的调用点传一个没挂过的路径，
+    ///   就会连带删掉**别的根**的条目（误伤，且很难查）。
+    ///   → 这条不变式现在**下沉到引擎层**守住。
+    #[test]
+    fn detaching_a_root_that_was_never_attached_does_not_delete_anything() {
+        let dir = fixture();
+        let (engine, indexed) = Engine::new(&[dir.as_path()]).unwrap();
+
+        // 摘一个**没挂过**的根（它连路径前缀都不沾）→ 什么都不该变
+        let after = engine.detach_root(Path::new("/Volumes/从没挂过的盘"));
+        assert_eq!(
+            after, indexed,
+            "摘一个没挂过的根不该动索引里的任何条目"
+        );
+        let res = engine.search(&request("*", 0, 50)).unwrap();
+        assert_eq!(
+            res.total_entries, indexed,
+            "索引里的条目一个都不该少"
+        );
+
+        // 摘一个**路径前缀沾上**、但同样没挂过的根 → 同样什么都不该变
+        // （这条最容易误伤：以前它会把那个前缀下的条目全删掉。）
+        let nested = dir.join("alpha.txt");
+        let after2 = engine.detach_root(nested.as_path());
+        assert_eq!(
+            after2, indexed,
+            "摘一个没挂过的根（哪怕路径前缀沾上了）也不该删条目"
+        );
+        let res2 = engine.search(&request("*", 0, 50)).unwrap();
+        assert_eq!(res2.total_entries, indexed, "条目一个都不该少");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 挂过的根照旧能摘掉（不变式不能把正常路径也堵死）。
+    #[test]
+    fn detaching_an_attached_root_still_removes_its_entries() {
+        let dir = fixture();
+        let (engine, indexed) = Engine::new(&[dir.as_path()]).unwrap();
+        let after = engine.detach_root(dir.as_path());
+        assert!(
+            after < indexed,
+            "挂过的根照旧能摘掉（{after} 应该小于 {indexed}）"
+        );
+        assert!(
+            engine.roots().is_empty(),
+            "摘掉的根要从根列表里消失"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 摘根之后，**那个根的档还在** —— 插回来才能秒开。
+    ///
+    /// 【为什么要有这条】「拔盘留档」是本特性明确要的行为
+    ///   （用户要的是「插回来立刻能搜」）→ 摘根**不许**删档。
+    ///   落盘只写「当前在索引里的根」→ 拔掉的卷那份文件原地不动 ✓。
+    #[test]
+    fn detaching_a_root_keeps_its_archive() {
+        let dir = fixture();
+        let store_dir = std::env::temp_dir().join(format!(
+            "lodestar-engine-keep-{}-{}",
+            std::process::id(),
+            SEQ.fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+        ));
+        let _ = std::fs::remove_dir_all(&store_dir);
+        let (engine, indexed) =
+            Engine::new_with_store(&[dir.as_path()], Some(store_dir.clone())).unwrap();
+        assert!(
+            store::load_root(&store_dir, &dir).is_some(),
+            "建引擎时就要落档"
+        );
+
+        engine.detach_root(dir.as_path());
+
+        let after = store::load_root(&store_dir, &dir);
+        assert!(
+            after.is_some(),
+            "摘根之后那个根的档必须还在 —— 插回来要靠它**秒开**"
+        );
+        assert_eq!(
+            after.unwrap().len() as u32,
+            indexed,
+            "档里的条目要完整（不能被清空）"
+        );
+
+        let _ = std::fs::remove_dir_all(&store_dir);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

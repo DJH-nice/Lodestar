@@ -117,18 +117,6 @@ impl PersistSlot {
         g.insert(path, bytes);
         self.cv.notify_one();
     }
-
-    /// 丢掉某个根**还没写**的那份快照（摘根时用）。
-    ///
-    /// 【为什么摘根要丢掉它】
-    ///   落盘槽是「每根覆盖最新字节流」—— 摘根**之前**提交的那份快照
-    ///   还在排队 → 摘完根它仍会落盘 → 把那个根的档重写成**摘根前**的内容
-    ///   （陈旧档）。那个根已经不在索引里 → 档不会被读 → 不致命，
-    ///   但它属于同一族「陈旧档」问题 → 顺手修掉。
-    fn discard(&self, path: &Path) {
-        let mut g = self.jobs.lock().unwrap();
-        g.remove(path);
-    }
 }
 
 impl Persister {
@@ -288,12 +276,16 @@ impl Searcher {
                                 if known {
                                     let count = engine.detach_root(&root);
                                     current_query = None; // 视图已被替换
-                                    // 摘掉的根**不该**再写档 → 从待写名单里去掉；
-                                    // 也把落盘槽里**已经排着**的那份丢掉（否则会落一份陈旧档）。
+                                    // 摘掉的根**不该**再写档 → 从待写名单里去掉。
+                                    //
+                                    // ⚠️ **不要**把落盘槽里**已经排着**的那份快照丢掉 ——
+                                    //   那份快照正是这个根**最后一份好档**（含它的条目）：
+                                    //   摘根后如果让它落盘，档里就是卷拔走前的完整内容 ——
+                                    //   正是「插回来复用旧索引」要的那份。
+                                    //   （真正要防的「用空档覆盖好档」已经被落盘段里的
+                                    //     `let live: HashSet<PathBuf> = engine.roots()…` 挡住了 ——
+                                    //     死根不会进 `wanted`，不会被序列化成空 part。）
                                     dirty_roots.remove(&root);
-                                    if let Some(dir) = engine.store_dir() {
-                                        persist_slot.discard(&store::root_archive_path(&dir, &root));
-                                    }
                                     let _ = reply.send(Ok(count));
                                 } else {
                                     // 没挂过（或拼写与 attach 时不同）→ 什么都没摘掉
@@ -516,53 +508,6 @@ impl Drop for Searcher {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    /// 摘根时丢掉的那个快照，**真的不会再被写出去**（要求 ④）。
-    ///
-    /// 【为什么要有这条】`PersistSlot` 是「每根覆盖最新字节流」——
-    ///   摘根**之前**提交的那份快照还在排队 → 摘完根它仍会落盘 →
-    ///   把那个根的档重写成**摘根前**的内容（陈旧档）。
-    ///   → 摘根要把那份快照丢掉。
-    ///
-    /// 【为什么用白盒】这个状态在**落盘线程**手里 —— 想在端到端里稳定地
-    ///   观测到「提交了但还没写」那个窗口，得跟落盘线程赛跑（会 flaky）。
-    ///   → 直接测落盘槽本身：提交 → 丢掉 → 槽里空了 ✓。
-    #[test]
-    fn a_discarded_snapshot_is_not_written_anymore() {
-        let slot = PersistSlot {
-            jobs: Mutex::new(HashMap::new()),
-            stopped: AtomicBool::new(false),
-            cv: Condvar::new(),
-        };
-        let path = PathBuf::from("/Volumes/U盘/archive.bin");
-        slot.submit(path.clone(), vec![1, 2, 3]);
-        assert_eq!(slot.jobs.lock().unwrap().len(), 1, "提交后槽里有一份");
-
-        slot.discard(&path);
-        assert!(
-            slot.jobs.lock().unwrap().is_empty(),
-            "丢掉之后槽里不该还留着它（否则会落一份陈旧档）"
-        );
-    }
-
-    /// 丢掉**别的**根的快照，不该影响这一个。
-    #[test]
-    fn discarding_one_root_keeps_the_others() {
-        let slot = PersistSlot {
-            jobs: Mutex::new(HashMap::new()),
-            stopped: AtomicBool::new(false),
-            cv: Condvar::new(),
-        };
-        let a = PathBuf::from("/a.bin");
-        let b = PathBuf::from("/b.bin");
-        slot.submit(a.clone(), vec![1]);
-        slot.submit(b.clone(), vec![2]);
-
-        slot.discard(&a);
-        let jobs = slot.jobs.lock().unwrap();
-        assert_eq!(jobs.len(), 1);
-        assert!(jobs.contains_key(&b), "别的根的快照不该被丢掉");
-    }
 
     /// 变化路径 → 它所属的根（**索引空间**写法）。
     ///

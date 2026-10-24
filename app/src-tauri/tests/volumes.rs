@@ -24,6 +24,12 @@
 //!   ⑤ 拔盘竞态：扫完复查挂载表；枚举失败时保守当「还在」
 //!   ⑥ 重建引擎时带上已挂载的卷；枚举失败时保持原根列表
 //!   ⑦ `setup()` 里起了监控线程 + 注册了卷状态；`volumes` 是**私有** `mod`
+//!   ⑧ 插回来要「秒开 + 后台刷新」**两段**（承诺的一半，不能被删掉）
+//!   ⑨ 状态栏的条数是**这个卷自己的**（不是引擎总数）
+//!   ⑩ 引擎换代要对账（`known` 与引擎实际在索引的根对齐）
+//!   ⑪ 附加失败**不记** `known` → 会重试（记了就永远不再试）
+//!   ⑫ 摘根的 `Err` 分支也要清状态（否则状态栏留着幽灵行）
+//!   ⑬ 摘根**不许**丢落盘槽里那份「最后的好档」
 //!
 //! 【为什么要先去掉注释再断言】
 //!   这些契约在源码里都有**大段解释性注释** ——
@@ -38,6 +44,8 @@ const VOLUMES_SRC: &str = include_str!("../src/volumes.rs");
 const SETTINGS_SRC: &str = include_str!("../src/settings.rs");
 /// 应用入口的源码（`setup()` 与模块声明在里头）。
 const LIB_SRC: &str = include_str!("../src/lib.rs");
+/// 搜索线程的源码（落盘槽在里头）。
+const WORKER_SRC: &str = include_str!("../search-core/src/worker.rs");
 
 /// 去掉行注释后的源码（`//` 之后的部分）。
 fn code_only(src: &str) -> String {
@@ -54,6 +62,12 @@ fn code_only(src: &str) -> String {
 fn volumes_code() -> &'static str {
     static CODE: OnceLock<String> = OnceLock::new();
     CODE.get_or_init(|| code_only(VOLUMES_SRC))
+}
+
+/// 搜索线程的**代码**（去注释）。
+fn worker_code() -> &'static str {
+    static CODE: OnceLock<String> = OnceLock::new();
+    CODE.get_or_init(|| code_only(WORKER_SRC))
 }
 
 /// 设置的**代码**（去注释）。
@@ -158,11 +172,23 @@ fn attaching_and_detaching_use_the_very_same_path() {
 fn the_watched_paths_are_updated_on_attach_and_on_detach() {
     let attach = fn_body(volumes_code(), "attach_volume");
     let detach = fn_body(volumes_code(), "detach_volume");
+    // 附加成功后必须更新 `IndexState.paths` ——
+    // `watcher::desired_watch_dirs` 读的就是它，不更新 → 新卷不会被 FSEvents 监听。
+    //
+    // 【为什么中间多了一层 `commit_attached`】
+    //   提交状态时要用**两个**数（卷自己的条数 / 引擎总数）→ 抽成了一个函数
+    //   （顺便把「状态栏显示卷自己的条数」这条不变式钉住，见 `the_status_bar_shows_the_volumes_own_count`）。
+    //   → 这里顺着那一层往下查：附件 → `commit_attached` → `commit_paths`。
+    let commit = fn_body(volumes_code(), "commit_attached");
     assert!(
-        attach.contains("commit_paths("),
-        "附加成功后必须更新 `IndexState.paths` —— \
-         `watcher::desired_watch_dirs` 读的就是它，不更新 → 新卷不会被 FSEvents 监听。\n\
+        attach.contains("commit_attached("),
+        "附加成功后必须提交状态 —— \
+         `watcher::desired_watch_dirs` 读的就是 `IndexState.paths`，不更新 → 新卷不会被 FSEvents 监听。\n\
          附加函数：\n{attach}"
+    );
+    assert!(
+        commit.contains("commit_paths("),
+        "`commit_attached` 必须更新 `IndexState.paths`。\n提交函数：\n{commit}"
     );
     assert!(
         detach.contains("remove_path("),
@@ -222,5 +248,144 @@ fn the_monitor_is_started_and_the_state_is_registered() {
         "`volumes` 必须是**私有** `mod` —— \
          `pub mod` 会让 `dead_code` 护栏失效（私有 `mod` 里的 `pub` 项 \
          没有 crate 内调用点时编译器会报出来）。"
+    );
+}
+
+// ── ⑧ 插回来要「秒开 + 后台刷新」两段 ──
+//
+// 【为什么这条最要紧】「插回来立刻能搜 + 后台刷一遍」是本特性**承诺的一半**
+//   （设计文档 §6 M5 验收 #3）。第一版实现把「命中旧索引档」写成了**早退**
+//   → 承诺的那一半**根本没实现**，而且是**静默**的：
+//   插上刚在别的机器上拷过文件的 U 盘 → 搜不到那个文件 →
+//   没有报错、状态栏还显示「U盘 · N 项 · 就绪」，而且**不自愈**
+//   （FSEvents 不会补发拔插期间的历史事件）。
+//   → 这条护栏就是为了「下次重构也删不掉它」。
+
+#[test]
+fn a_reinserted_volume_is_refreshed_in_the_background() {
+    let phases = fn_body(volumes_code(), "volume_attach_phases");
+    let instant = phases
+        .find("attach(AttachPhase::Instant")
+        .expect("命中旧档时必须**先秒开**（挂旧档 → 用户马上能搜）");
+    // 【为什么只看秒开之后那一段】函数里**先**出现的是「没有旧档」那条分支的扫描
+    //   （那一条本来就该先扫再挂）—— 要钉的是**秒开之后**的那一次扫描。
+    let after_instant = &phases[instant..];
+    let scan = after_instant
+        .find("scan()?")
+        .expect("命中旧档时必须**再扫一遍**（拔插期间的变化只有这条路径能进来）");
+    let last = after_instant
+        .find("attach(AttachPhase::Final")
+        .expect("必须把新扫出来的挂上去（替换掉秒开那份）");
+    assert!(
+        scan < last,
+        "秒开之后必须**先扫描、再挂新的** —— 反过来就退化成「等扫完才能搜」→ 承诺作废。\n编排函数：\n{phases}"
+    );
+    // 【为什么还要钉「不许早退」】第一版的 bug 就是「命中旧档就 `return`」——
+    //   只看「有没有 scan()」会被**不可达代码**骗过去（把扫描写在 return 后面也照样有那个词）。
+    //   → 秒开与扫描之间**不许**有 `return`。
+    let between = &after_instant[..scan];
+    assert!(
+        !between.contains("return"),
+        "秒开与扫描之间**不许**早退 —— 那正是第一版的 bug（命中旧档就返回 → \
+         「插回来后台刷新」根本没实现，而且静默：搜不到新文件还不报错）。\n编排函数：\n{phases}"
+    );
+    // 附加线程必须真的走这个编排（不是各写各的）。
+    let attach = fn_body(volumes_code(), "attach_volume");
+    assert!(
+        attach.contains("volume_attach_phases("),
+        "附加线程必须走「秒开 + 刷新」那个编排 —— \
+         各写各的就会出现「只秒开不刷新」或「两次都扫描」。\n附加函数：\n{attach}"
+    );
+    // 「刷新完成」要有日志（否则界面上与日志里都看不出后台发生过什么）。
+    assert!(
+        attach.contains("刷新完成"),
+        "刷新完成要有一行日志 —— 没有它就无法区分「秒开」与「刷新完了」。\n附加函数：\n{attach}"
+    );
+}
+
+#[test]
+fn the_status_bar_shows_the_volumes_own_count() {
+    let commit = fn_body(volumes_code(), "commit_attached");
+    assert!(
+        commit.contains("counts.own"),
+        "状态栏的条数必须是**这个卷自己的** —— \
+         `attach_root` 返回的是**整个引擎**的条目总数（含 $HOME），\
+         拿它去填状态栏 → 「U盘 · 8,150 项」（$HOME 8,000 + U 盘 150）。\n提交函数：\n{commit}"
+    );
+    assert!(
+        commit.contains("counts.total"),
+        "索引状态（`IndexState.indexed`）的条数才是**引擎总数**。\n提交函数：\n{commit}"
+    );
+}
+
+#[test]
+fn the_monitor_reconciles_known_with_the_engine() {
+    let monitor = fn_body(volumes_code(), "spawn_volume_monitor");
+    assert!(
+        monitor.contains("reconcile_known("),
+        "监控循环必须做**对账** —— `known` 与引擎换代是解耦的：\
+         换索引目录时若卷枚举失败（新引擎里没有那个卷），\
+         `known` 里还留着它 → 差分看到「没变化」→ **永远不会重新附加**。\n监控函数：\n{monitor}"
+    );
+}
+
+#[test]
+fn a_failed_attach_is_not_remembered_and_gets_retried() {
+    let monitor = fn_body(volumes_code(), "spawn_volume_monitor");
+    assert!(
+        monitor.contains("apply_attach_results("),
+        "附加结果必须回传给监控线程 —— \
+         以前 `attach_volume` 的 `true` 只表示「线程起动了」，\
+         附加失败（扫描出错 / 被判重叠）的卷**永远不再试**。\n监控函数：\n{monitor}"
+    );
+    assert!(
+        monitor.contains("should_attach("),
+        "重试要有节流 —— 失败重试会**重新扫一遍那个盘**，\
+         每秒重试一次 = 机器被扫描烤着。\n监控函数：\n{monitor}"
+    );
+}
+
+#[test]
+fn detaching_also_clears_the_state_when_the_root_was_never_attached() {
+    let detach = fn_body(volumes_code(), "detach_volume");
+    let err_at = detach
+        .find("Err(e) =>")
+        .expect("分离函数里要有 `Err` 分支（没挂过）");
+    let err_branch = &detach[err_at..];
+    assert!(
+        err_branch.contains("remove_volume_state("),
+        "摘根的 `Err` 分支**也要清状态** —— \
+         任何「附加没成功」的卷在状态栏上都留下一行（「U盘 · 索引失败」）→ \
+         拔掉之后那一行**永远留着** → 用户看到的是一个已经不存在的盘。\n分离函数：\n{detach}"
+    );
+    assert!(
+        err_branch.contains("notify_frontend("),
+        "前端那一行也要清掉 → 必须发一次通知。\n分离函数：\n{detach}"
+    );
+}
+
+#[test]
+fn a_volume_that_vanished_during_the_refresh_is_detached() {
+    let attach = fn_body(volumes_code(), "attach_volume");
+    let at = attach
+        .find("AttachError::Vanished")
+        .expect("附加线程里要有「盘被拔掉了」这一支");
+    let branch = &attach[at..];
+    assert!(
+        branch.contains("detach_volume("),
+        "盘在后台刷新期间被拔掉 → **秒开那一份必须一起摘掉** —— \
+         否则用户还能搜到**已经拔掉的**盘上的文件（最不能接受的那种幽灵）。\n附加函数：\n{attach}"
+    );
+}
+
+#[test]
+fn detaching_a_root_keeps_the_last_good_archive() {
+    let worker = worker_code();
+    assert!(
+        !worker.contains("discard("),
+        "摘根时**不许**把落盘槽里已经排着的那份快照丢掉 —— \
+         那份正是这个卷**最后一份好档**（含卷的条目）：\
+         丢掉它，下次插回来就要全量重扫（慢，不是错，\
+         但违背「插回来复用旧索引」的承诺）。\n搜索线程源码：\n{worker}"
     );
 }

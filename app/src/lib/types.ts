@@ -77,7 +77,14 @@ export interface VolumeStatus {
     | { state: "Indexing" }
     | { state: "Ready" }
     | { state: "Failed"; detail: string };
-  /** 已经索引进去多少条。 */
+  /** **这个卷自己**的条目数。
+   *
+   *  【与 Rust 侧一一对应】`volumes::VolumeStatus::indexed`。
+   *
+   *  ⚠️ **不是整个索引的条目总数** —— 那个数在 `IndexStatus.indexed` 里。
+   *   以前两处用的是同一个数 → $HOME 8,000 项 + U 盘 150 个文件 →
+   *   状态栏显示「U盘 · 8,150 项」（这个数字是错的）。
+   */
   indexed: number;
 }
 

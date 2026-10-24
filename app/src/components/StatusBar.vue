@@ -26,10 +26,26 @@ function volumeText(v: VolumeStatus): string {
     case "Indexing":
       return `${v.label} · 正在索引…`;
     case "Failed":
-      return `${v.label} · 索引失败`;
+      // 【为什么要把原因显示出来】
+      //   Rust 侧已经把原因传过来了（`detail`），以前前端把它扔了 →
+      //   用户只看到「坏盘 · 索引失败」，鼠标悬停看到的还是**路径**而不是原因。
+      //   这与项目自己的约定相悖（`.sb-error` 那条注释写着
+      //   「索引出错的原因必须显示出来」）。
+      return `${v.label} · 索引失败：${v.phase.detail}`;
     default:
       return `${v.label} · ${v.indexed.toLocaleString()} 项`;
   }
+}
+
+/** 悬停提示 —— 失败时要把**原因**也带上（路径只是「哪个盘」）。
+ *
+ *  【为什么要单独一个函数】模板里的三元表达式对 `v.phase` 的**收窄**
+ *   在 `vue-tsc` 下不一定成立 → 放在脚本里写，类型一定收得住。
+ */
+function volumeTitle(v: VolumeStatus): string {
+  return v.phase.state === "Failed"
+    ? `${v.path} · ${v.phase.detail}`
+    : v.path;
 }
 </script>
 
@@ -46,7 +62,7 @@ function volumeText(v: VolumeStatus): string {
         :key="v.path"
         class="sb-volume"
         :class="{ 'is-failed': v.phase.state === 'Failed' }"
-        :title="v.path"
+        :title="volumeTitle(v)"
         >{{ volumeText(v) }}</span
       >
       <span v-if="status?.scanning">正在扫描索引…</span>
