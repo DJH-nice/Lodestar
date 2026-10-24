@@ -9,6 +9,7 @@
 //!   公式一变，界面上的分隔线就会错位。
 
 use std::cell::RefCell;
+use std::cmp::Ordering;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
@@ -51,9 +52,18 @@ pub struct Engine {
 struct View {
     /// 这次搜索用的查询串（翻页时必须一致）。
     query: String,
-    /// 命中的**目录**下标（升序排好）。
+    /// 这次搜索**已经解析好**的查询 —— 存下来，翻页时不用再解析一遍
+    /// （解析一次约 0.3µs，但每页都解析就是白花）。
+    parsed: query::Query,
+    /// 命中的**目录**下标 —— **未排序**。
+    ///
+    /// 【为什么不在这里就排好】
+    ///   一页只看得到 `page_size` 条（默认 500），
+    ///   而命中可能有几万个 → 把全部排一遍是纯浪费。
+    ///   实测（n=8,948，探针）：全排序 0.56ms vs 只排当前页需要的 500 条 0.089ms
+    ///   → **6.3×**。排序因此推迟到 `build_page` 里按需做。
     folders: Vec<u32>,
-    /// 命中的**文件**下标（升序排好）。
+    /// 命中的**文件**下标 —— 未排序（同上）。
     files: Vec<u32>,
     /// 排序维度（翻页时必须一致 —— 换了维度就是另一套顺序）。
     sort: SortField,
@@ -157,6 +167,12 @@ impl Engine {
         // 解析 —— **不会失败**：查询还没写完时解析器给的是「已解析的部分 + 一句提示」
         //   （见 query::parse 的说明）。所以这里没有「语法错误」这条错误路径。
         let q = query::parse(&req.query);
+        // 警告要在把 q 移进视图**之前**取出来（Query 是自有数据，move 之后就不能再读）
+        let warning = if q.warnings.is_empty() {
+            None
+        } else {
+            Some(q.warnings.join("；"))
+        };
 
         // 匹配
         let entries = self.entries.borrow();
@@ -171,18 +187,14 @@ impl Engine {
                 }
             }
         }
-
-        // 排序
-        let cmp = comparator(req.sort);
-        folders.sort_by(|a, b| cmp(&entries[*a as usize], &entries[*b as usize]));
-        files.sort_by(|a, b| cmp(&entries[*a as usize], &entries[*b as usize]));
-        drop(entries); // 放掉借用，后面要写 view
+        drop(entries); // 放掉借用（排序已推迟到出页时）
 
         let total_folders = folders.len() as u32;
         let total_files = files.len() as u32;
 
         let view = View {
             query: req.query.clone(),
+            parsed: q,
             folders,
             files,
             sort: req.sort,
@@ -199,9 +211,7 @@ impl Engine {
         let mut result = self.build_page(req, view_guard.as_ref().expect("刚写进去的视图"), total_files, total_folders);
         drop(view_guard);
         result.elapsed_ms = started.elapsed().as_millis() as u64;
-        if !q.warnings.is_empty() {
-            result.warning = Some(q.warnings.join("；"));
-        }
+        result.warning = warning;
         Ok(result)
     }
 
@@ -241,18 +251,50 @@ impl Engine {
         let size = req.page_size.max(1) as usize;
         let offset = req.page as usize * size;
 
-        // 扁平空间：先目录后文件（升序）；降序是整体镜像。
-        let mut flat: Vec<u32> = Vec::with_capacity(view.folders.len() + view.files.len());
-        match req.kind {
+        let lf = view.folders.len();
+        let lfi = view.files.len();
+
+        // ── 算出本页要取的是哪一小段 ────────────────────────────
+        //
+        // 【扁平空间的形状】（前端 `paging.ts` 依赖它，**不能改**）
+        //   升序：目录段 ++ 文件段
+        //   降序：整个扁平空间镜像 → 文件段在前
+        //
+        // 【不再重建整个 flat】
+        //   以前每次翻页都 `Vec::with_capacity(命中总数)` + 全量拷贝 + 全量 reverse
+        //   → 8,948 命中 = 36KB/页，10 万命中 = 400KB/页。
+        //   现在只取**本页需要的那一段**，代价 O(页大小)。
+        let (f_lo, f_hi, x_lo, x_hi) = match req.kind {
             ListKind::All => {
-                flat.extend_from_slice(&view.folders);
-                flat.extend_from_slice(&view.files);
+                let (lo, hi) = page_window(offset, size, lf + lfi, req.order);
+                (
+                    lo.min(lf),
+                    hi.min(lf),
+                    lo.saturating_sub(lf),
+                    hi.saturating_sub(lf),
+                )
             }
-            ListKind::Files => flat.extend_from_slice(&view.files),
-            ListKind::Folders => flat.extend_from_slice(&view.folders),
+            ListKind::Files => {
+                let (lo, hi) = page_window(offset, size, lfi, req.order);
+                (0, 0, lo, hi)
+            }
+            ListKind::Folders => {
+                let (lo, hi) = page_window(offset, size, lf, req.order);
+                (lo, hi, 0, 0)
+            }
+        };
+
+        let entries = self.entries.borrow();
+        let mut page_ids: Vec<u32> = Vec::with_capacity(size);
+        if f_lo < f_hi {
+            page_ids.extend(sorted_window(&entries, &view.folders, view.sort, f_lo, f_hi));
+        }
+        if x_lo < x_hi {
+            page_ids.extend(sorted_window(&entries, &view.files, view.sort, x_lo, x_hi));
         }
         if req.order == SortOrder::Desc {
-            flat.reverse();
+            // 降序 = 整个窗口镜像（升序窗口取出来再反转）
+            page_ids.reverse();
         }
 
         let total_entries = match req.kind {
@@ -261,22 +303,14 @@ impl Engine {
             ListKind::Folders => total_folders,
         };
 
-        let page_items: &[u32] = if offset >= flat.len() {
-            &[]
-        } else {
-            let end = (offset + size).min(flat.len());
-            &flat[offset..end]
-        };
-
         // 高亮：只对**本页**的条目算（不是全表）
-        let entries = self.entries.borrow();
-        let mut out_entries: Vec<Entry> = Vec::with_capacity(page_items.len());
-        // 查询串解析一次就够（同一页里所有条目共用）
-        let parsed = query::parse(&view.query);
-        for id in page_items {
+        let mut out_entries: Vec<Entry> = Vec::with_capacity(page_ids.len());
+        // 查询**已经解析好了**（存在视图里）—— 同一页里所有条目共用
+        let parsed = &view.parsed;
+        for id in &page_ids {
             let e = &entries[*id as usize];
             let mut out = e.to_entry();
-            let q = &parsed;
+            let q = parsed;
             let (name_ranges, path_ranges) = query::highlight_ranges(q, e);
             out.highlights = name_ranges
                 .iter()
@@ -383,14 +417,106 @@ fn validate_paths(paths: &[&Path]) -> Result<Vec<PathBuf>, EngineError> {
     Ok(out)
 }
 
-/// 排序比较器。
-fn comparator(sort: SortField) -> impl Fn(&IndexEntry, &IndexEntry) -> std::cmp::Ordering {
-    move |a: &IndexEntry, b: &IndexEntry| match sort {
-        SortField::Name => a.folded_name.cmp(&b.folded_name).then_with(|| a.name.cmp(&b.name)),
-        SortField::Path => a.folded_path.cmp(&b.folded_path),
-        SortField::Size => a.size.cmp(&b.size),
-        SortField::Mtime => a.mtime.cmp(&b.mtime),
+/// 排序比较器（**全序** —— 任意两个不同条目都不相等）。
+///
+/// 【为什么要做成全序】
+///   `select_nth_unstable_by` 是**不稳定**的 —— 如果比较器允许「相等」，
+///   分区后的相对次序就不确定 → 同一份索引可能给出两种顺序。
+///   → 最后一级用条目 id 兜底 → 顺序唯一 ✓。
+///
+/// 【比较顺序 = 主键 → 二级键 → path → id】
+///   - 主键 / 二级键沿用旧语义（名字 = 折叠名 + 原名；路径 = 折叠路径）——
+///     **不能丢**，丢了同名条目的相对顺序就会变。
+///   - `path` 让结果**只由内容决定**：
+///     并行扫描之后索引顺序是不确定的 → 不加 path 的话，
+///     同样的磁盘内容重扫一次，列表的相对顺序可能变 → 界面上的列表会「跳」。
+///   - `id` 只是兜底（理论上同 path 不会出现两次，除非索引目录互相重叠）。
+fn entry_cmp(sort: SortField, entries: &[IndexEntry]) -> impl Fn(&u32, &u32) -> Ordering + '_ {
+    move |a: &u32, b: &u32| {
+        let ea = &entries[*a as usize];
+        let eb = &entries[*b as usize];
+        match sort {
+            SortField::Name => ea
+                .folded_name
+                .cmp(&eb.folded_name)
+                .then_with(|| ea.name.cmp(&eb.name))
+                .then_with(|| ea.path.cmp(&eb.path))
+                .then_with(|| a.cmp(b)),
+            SortField::Path => ea
+                .folded_path
+                .cmp(&eb.folded_path)
+                .then_with(|| ea.path.cmp(&eb.path))
+                .then_with(|| a.cmp(b)),
+            SortField::Size => ea
+                .size
+                .cmp(&eb.size)
+                .then_with(|| ea.path.cmp(&eb.path))
+                .then_with(|| a.cmp(b)),
+            SortField::Mtime => ea
+                .mtime
+                .cmp(&eb.mtime)
+                .then_with(|| ea.path.cmp(&eb.path))
+                .then_with(|| a.cmp(b)),
+        }
     }
+}
+
+/// 本页在「升序扁平空间」里对应的窗口 [lo, hi)。
+///
+/// 【降序为什么要换算】
+///   降序 = 整个扁平空间的镜像 → 镜像空间的第 p 页 [offset, end)
+///   对应升序空间的 [len-end, len-offset) → 取出来再整体反转即可。
+fn page_window(offset: usize, size: usize, len: usize, order: SortOrder) -> (usize, usize) {
+    match order {
+        SortOrder::Asc => (offset.min(len), (offset + size).min(len)),
+        SortOrder::Desc => (
+            len.saturating_sub(offset + size),
+            len.saturating_sub(offset),
+        ),
+    }
+}
+
+/// 取「按 sort 排好序」的 [lo, hi) 窗口。
+///
+/// 【为什么不整个排】
+///   一页只看得到 `page_size` 条（默认 500），而命中可能有几万个。
+///   实测（n=8,948，探针）：全排序 0.56ms vs 只排前 500 条 0.089ms → **6.3×**。
+///   翻到很深的页时窗口变大，代价才接近全排序。
+///
+/// 【为什么结果与「全排序取同一段」逐条相同】
+///   比较器是**全序**（见 [`entry_cmp`]）→ 谁在前完全由内容决定，
+///   不依赖排序算法稳不稳定 → 部分排序与全排序给出**同一个**顺序 ✓。
+///   护栏：`partial_window_matches_a_full_sort` 专门盯这一点。
+///
+/// 【⚠️ 分区必须作用在子切片上】
+///   第一次分区把 `[0, hi)` 变成「最小的 hi 个」；
+///   第二次分区**只能在这 hi 个里面**做（`head[..lo]` 与 `head[lo..hi]`）——
+///   如果分区整个数组，hi 之外的元素会被换进窗口，窗口的**元素集合**就错了。
+fn sorted_window(
+    entries: &[IndexEntry],
+    ids: &[u32],
+    sort: SortField,
+    lo: usize,
+    hi: usize,
+) -> Vec<u32> {
+    let hi = hi.min(ids.len());
+    if lo >= hi {
+        return Vec::new();
+    }
+    let cmp = entry_cmp(sort, entries);
+    let mut v = ids.to_vec();
+    // 先分区到 hi：[0, hi) 就是「最小的 hi 个」
+    if hi < v.len() {
+        v.select_nth_unstable_by(hi, &cmp);
+    }
+    // 再在 hi 以内的头段里分区到 lo
+    let head = &mut v[..hi];
+    if lo > 0 {
+        head.select_nth_unstable_by(lo, &cmp);
+    }
+    // 窗口内部还没排 → 排一下（窗口 ≤ 页大小，很便宜）
+    head[lo..hi].sort_by(&cmp);
+    v[lo..hi].to_vec()
 }
 
 #[cfg(test)]
@@ -453,6 +579,166 @@ mod tests {
         let res = engine.search(&request("   ", 0, 2)).unwrap();
         assert_eq!(res.entries.len(), 0);
         assert_eq!(res.total_entries, 0);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ── 排序护栏 ──────────────────────────────────────────────
+
+    /// 造一条索引条目（测试用）。
+    ///
+    /// 【刻意造出「等值」】
+    ///   同名、同大小的条目会很多 → 才能盯住排序的等值处理
+    ///   （比较器是全序：主键 → 二级键 → path → id）。
+    fn entry_at(id: u32, name: &str, size: i64) -> IndexEntry {
+        let path = format!("/tmp/dir{}/{}", id % 3, name);
+        IndexEntry {
+            name: name.to_string(),
+            path: path.clone(),
+            dir: "/tmp".to_string(),
+            extension: String::new(),
+            size,
+            mtime: 1_700_000_000 + id as i64,
+            is_folder: false,
+            depth: 1,
+            child_count: 0,
+            child_file_count: 0,
+            child_folder_count: 0,
+            folded_name: name.to_lowercase(),
+            folded_path: path.to_lowercase(),
+        }
+    }
+
+    /// 200 条含大量等值的条目。
+    fn tie_heavy_entries() -> Vec<IndexEntry> {
+        const NAMES: [&str; 5] = ["alpha.txt", "beta.txt", "gamma.log", "alpha.txt", "delta.bin"];
+        (0..200u32)
+            .map(|i| entry_at(i, NAMES[(i % 5) as usize], (i % 3) as i64 * 100))
+            .collect()
+    }
+
+    #[test]
+    fn partial_window_matches_a_full_sort() {
+        // 【部分排序的核心不变量】
+        //   引擎现在只排「本页需要的那一段」，而不是把全部命中排一遍。
+        //   → 窗口结果必须与「全排序后取同一段」**逐条相同**。
+        //   任何一条对不上 → 界面上的排序就会和以前不一样。
+        let entries = tie_heavy_entries();
+        let ids: Vec<u32> = (0..entries.len() as u32).collect();
+        for sort in [
+            SortField::Name,
+            SortField::Path,
+            SortField::Size,
+            SortField::Mtime,
+        ] {
+            let cmp = entry_cmp(sort, &entries);
+            let mut full = ids.clone();
+            full.sort_by(&cmp);
+            for (lo, hi) in [
+                (0usize, 10usize),
+                (0, 200),
+                (7, 23),
+                (50, 150),
+                (190, 200),
+                (0, 0),
+                (100, 100),
+                (200, 200),
+            ] {
+                let got = sorted_window(&entries, &ids, sort, lo, hi);
+                let want: Vec<u32> = full[lo.min(full.len())..hi.min(full.len())].to_vec();
+                assert_eq!(
+                    got, want,
+                    "sort={sort:?} 窗口[{lo},{hi}) 与全排序结果不一致"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn equal_keys_are_ordered_by_path_then_id() {
+        // 【等值条目的顺序必须是确定的】
+        //   并行扫描之后索引顺序是不确定的 → 排序必须自己给出确定顺序，
+        //   否则同样的磁盘内容重扫一次，列表顺序会「跳」。
+        let entries = tie_heavy_entries();
+        let ids: Vec<u32> = (0..entries.len() as u32).collect();
+        let got = sorted_window(&entries, &ids, SortField::Name, 0, ids.len());
+        // 同名（同折叠名、同原名）的条目之间 → path 必须递增；
+        // path 也相同 → id 递增。
+        for w in got.windows(2) {
+            let (a, b) = (w[0] as usize, w[1] as usize);
+            let (ea, eb) = (&entries[a], &entries[b]);
+            let key = (ea.folded_name.as_str(), ea.name.as_str());
+            let key_b = (eb.folded_name.as_str(), eb.name.as_str());
+            if key == key_b {
+                assert!(
+                    (ea.path.as_str(), a) < (eb.path.as_str(), b),
+                    "等值条目没有按 (path, id) 排：{ea:?} 出现在 {eb:?} 之前"
+                );
+            } else {
+                assert!(key < key_b, "排序键不对：{key:?} 出现在 {key_b:?} 之前");
+            }
+        }
+    }
+
+    #[test]
+    fn page_window_mirrors_the_flat_space() {
+        // 降序 = 整个扁平空间镜像 → 第 p 页(降序) = 第 (n-1-p) 页(升序) 反过来。
+        let len = 7usize;
+        let size = 3usize;
+        let asc: Vec<(usize, usize)> = (0..3)
+            .map(|p| page_window(p * size, size, len, SortOrder::Asc))
+            .collect();
+        let desc: Vec<(usize, usize)> = (0..3)
+            .map(|p| page_window(p * size, size, len, SortOrder::Desc))
+            .collect();
+        // 升序第 2 页 = [6,7) → 降序第 0 页 = [7-3, 7-0) = [4,7) → 反过来 = [6,4)
+        assert_eq!(asc[2], (6, 7));
+        assert_eq!(desc[0], (4, 7));
+        // 越界时不能 panic，窗口必须夹在 [0, len) 内
+        assert_eq!(page_window(100, size, len, SortOrder::Asc), (len, len));
+        assert_eq!(page_window(100, size, len, SortOrder::Desc), (0, 0));
+    }
+
+    #[test]
+    fn descending_pages_mirror_the_ascending_pages() {
+        // 端到端：降序的第 p 页 = 升序的第 (n-1-p) 页反过来。
+        let dir = fixture();
+        let (engine, _) = Engine::new(&[dir.as_path()]).unwrap();
+
+        let size = 2u32;
+        let total = engine.search(&request("*", 0, size)).unwrap().total_entries as usize;
+        let pages = total.div_ceil(size as usize);
+        assert!(pages >= 2, "fixture 至少要两页才测得出镜像关系");
+
+        let fetch = |desc: bool| -> Vec<Vec<String>> {
+            (0..pages)
+                .map(|p| {
+                    let mut req = request("*", p as u32, size);
+                    req.order = if desc {
+                        SortOrder::Desc
+                    } else {
+                        SortOrder::Asc
+                    };
+                    engine
+                        .search(&req)
+                        .unwrap()
+                        .entries
+                        .iter()
+                        .map(|e| e.path.clone())
+                        .collect()
+                })
+                .collect()
+        };
+        let asc_pages = fetch(false);
+        let desc_pages = fetch(true);
+
+        for p in 0..pages {
+            let mirrored: Vec<String> = asc_pages[pages - 1 - p].iter().rev().cloned().collect();
+            assert_eq!(
+                desc_pages[p], mirrored,
+                "降序第 {p} 页与升序第 {} 页不是镜像关系",
+                pages - 1 - p
+            );
+        }
         let _ = std::fs::remove_dir_all(&dir);
     }
 

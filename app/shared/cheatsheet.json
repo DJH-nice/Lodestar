@@ -1,6 +1,6 @@
 {
   "version": 1,
-  "note": "Sextant macOS 的「搜索语法速查卡」。每条 query 都用真实引擎实跑验证过（2026-10-22）。改这个文件前请先看 app/src-tauri/fsearch-core/tests/cheatsheet_queries.rs —— 里面的测试会拿每条 query 去问引擎，语法写错会直接红。",
+  "note": "Sextant macOS 的「搜索语法速查卡」。每条 query 都用真实引擎实跑验证过（2026-10-24）。改这个文件前请先看 app/src-tauri/search-core/tests/cheatsheet_queries.rs —— 里面的测试会拿每条 query 去问引擎，语法写错会直接红。",
   "groups": [
     {
       "key": "daily",
@@ -21,6 +21,11 @@
           "intent": "找大文件",
           "query": "size:>10M",
           "note": "大于 10 MB。单位是十进制（1M = 1 000 000），不能写 1MiB —— 那样一条都搜不到。"
+        },
+        {
+          "intent": "找小文件（或者某个大小区间）",
+          "query": "size:<=1M",
+          "note": "小于等于 1 MB。也支持 > >= <，还有区间：size:1M..10M（1 MB 到 10 MB，含两端）。"
         },
         {
           "intent": "在某个目录里找",
@@ -56,12 +61,17 @@
         {
           "intent": "某一类文件（图片 / 文档 / 视频…）",
           "query": "pic:",
-          "note": "内置的一组扩展名简称：app: archive: audio: doc: pic: video:。冒号后面「不要写值」，写了会被当成另一个条件。"
+          "note": "内置的一组扩展名简称：app: archive: audio: doc: pic: video:。冒号后面「不要写值」—— 写成 pic:png 的话 png 会被忽略（引擎会给警告），要按扩展名筛请用 ext:png。"
         },
         {
           "intent": "按系统类型（文本 / 图片…）",
           "query": "contenttype:text",
-          "note": "按 MIME 类型筛，比如 text、image、video。"
+          "note": "按 MIME 类型筛：text（文本类）、image（图片）、video（视频）、audio（音频），也可以写单个类型比如 contenttype:pdf。目录算 directory。也认 pic: / doc: 这些内置组名。"
+        },
+        {
+          "intent": "文件和目录都要（取消「只要文件」）",
+          "query": "nofileonly:报告",
+          "note": "file: 是「只要文件」，nofileonly: 把它取消掉。nofilesonly: 是同一种写法；nofolderonly: / nofoldersonly: 则是取消「只要目录」。"
         }
       ]
     },
@@ -108,6 +118,16 @@
           "intent": "最近的那个星期一改过的",
           "query": "dm:mon",
           "note": "星期：mon tue wed thu fri sat sun（sunday 用 sun）。月份同理：dm:jan、dm:january。"
+        },
+        {
+          "intent": "精确到某一分钟",
+          "query": "dm:\"2026-10-22 12:00\"",
+          "note": "值里有空格，所以要加双引号。也能精确到秒：dm:\"2026-10-22 12:00:30\"。"
+        },
+        {
+          "intent": "某年之前 / 之后",
+          "query": "dm:..2026",
+          "note": "开区间：dm:..2026 = 2026 年之前（含 2026），dm:2026.. = 2026 年之后（含 2026）。"
         }
       ]
     },
@@ -123,7 +143,7 @@
         {
           "intent": "最外层 / 下一层",
           "query": "depth:1",
-          "note": "depth:0 是索引根目录本身，depth:1 是根的下一层，depth:2 再下一层。"
+          "note": "depth:0 是索引根目录本身，depth:1 是根的下一层，depth:2 再下一层。parents: 是 depth: 的别名（同一个意思）。"
         },
         {
           "intent": "空文件夹",
@@ -133,7 +153,17 @@
         {
           "intent": "某个目录里有几个东西",
           "query": "childcount:1",
-          "note": "子项总数（文件+目录）。只要子文件用 childfilecount:，只要子目录用 childfoldercount:。"
+          "note": "子项总数（文件+目录）。也支持区间：childcount:2..5。"
+        },
+        {
+          "intent": "目录里有几个文件",
+          "query": "childfilecount:1",
+          "note": "只数子**文件**（不含子目录）。childfilecount:2..5 是「2 到 5 个子文件」。"
+        },
+        {
+          "intent": "目录里有几个子目录",
+          "query": "childfoldercount:0",
+          "note": "只数子**目录**。childfoldercount:0 = 没有任何子目录（只有文件的那种目录）。"
         }
       ]
     },
@@ -234,6 +264,12 @@
           "query": "path:Downloads",
           "wrong": "Downloads",
           "note": "不加 path: 只搜「文件名」，不搜路径 —— 名字里没「Downloads」的文件就找不到。"
+        },
+        {
+          "intent": "内置宏后面别写值",
+          "query": "pic:",
+          "wrong": "pic:png",
+          "note": "pic: / doc: / video: 这些内置宏冒号后面不能写值 —— 写了会被**忽略**（引擎会给警告），结果还是「所有图片」。要按扩展名筛请用 ext:png。"
         }
       ]
     }

@@ -62,3 +62,41 @@ describe("StatusBar 的索引错误提示", () => {
     app.unmount();
   });
 });
+
+/**
+ * 查询的警告（`result.warning`）—— 这条链是「还没写完的查询不报错」的出口。
+ *
+ *  【为什么要有这个测试】引擎解析「还没写完」的查询时，不再报错，
+ *  而是返回「已解析的部分 + 一句中文提示」——
+ *  如果状态栏不显示这个提示，用户就会看到一份**看起来正常**的结果，
+ *  完全不知道自己少写了一半（静默错答比报错更糟）。
+ */
+describe("StatusBar 的查询警告", () => {
+  function resultWithWarning(warning: string): SearchResult {
+    return {
+      entries: [],
+      total_entries: 3,
+      total_files: 3,
+      total_folders: 0,
+      complete: true,
+      elapsed_ms: 1,
+      warning,
+      group_boundary: null,
+    };
+  }
+
+  it("有警告时把警告显示出来", () => {
+    const { app, host } = mountStatusBar(
+      null,
+      resultWithWarning("AND 后面还没有条件（还没写完）"),
+    );
+    expect(host.textContent).toContain("AND 后面还没有条件");
+    app.unmount();
+  });
+
+  it("没有警告时显示命中数", () => {
+    const { app, host } = mountStatusBar(null, resultWithWarning(""));
+    expect(host.textContent).toContain("3 项");
+    app.unmount();
+  });
+});

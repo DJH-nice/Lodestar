@@ -99,35 +99,106 @@ sextant/
 
 ## 性能基线（实测，探针方法见设计文档 §2）
 
-| 指标 | 旧引擎（上游 C） | Sextant 自研 | 备注 |
-|---|---|---|---|
-| 热缓存全量扫描（8,352 项） | 74.6ms | **16~25ms** | 自研用 4 线程并行 |
-| 冷启动 → 可搜 | 300~450ms（每次全量扫描） | **≤15ms**（读索引档） | 目标值 |
-| 查询（8,352 项，命中 55%） | 2.6ms | ≤1ms | 目标值 |
-| 查询（100,002 项） | 0.99ms | ≤1ms | 线性匹配，**不要造倒排索引** |
-| 索引内存 | 4.3MB / 8,119 项 | ≤1.5MB | 目标值 |
-| `.app` 体积 | 60M | **≤12M** | ICU 34M + GPL 源码包 13M 都消失了 |
-| 后台常驻 CPU | 0.04% | 0.04% | 已达标 |
+> 2026-10-24 优化后重测。**A/B 是同进程交替跑改前/改后两个版本**（消除机器负载波动），
+> 探针在 `/tmp/abprobe`（改前版副本在 `/tmp/sc-before`）。
+
+| 指标 | 旧引擎（上游 C） | 优化前 | **Sextant 现在** | 备注 |
+|---|---|---|---|---|
+| 热缓存全量扫描（8,550 项） | 74.6ms | 62.8ms | **21.1ms**（快 66%，2.98×） | 顶层子树分区 + 原子游标 |
+| 冷启动 → 可搜 | 300~450ms（每次全量扫描） | — | **2.7ms**（读索引档） | 达标 |
+| 查询（8,948 项，命中 55%） | 2.6ms | 1.43ms | **0.38ms**（快 73%） | 只排当前页需要的那一段 |
+| 查询（全量匹配 `*`） | 2.06ms | 1.00ms | **0.47ms**（快 53%） | 同上 |
+| 查询（`ext:pdf` / `size:>1M`） | ~1.08ms | 0.06ms | **0.05ms** | 字段索引期算好 |
+| 查询（100,002 项） | 0.99ms | — | ≤1ms | 线性匹配，**不要造倒排索引** |
+| 索引内存 | 4.3MB / 8,119 项 | 3.2MB | **3.2MB** | ⚠️ 目标 ≤1.5MB **未达标** |
+| `.app` 体积 | 60M | 5.8M | **5.8M** | ICU 34M + GPL 源码包 13M 都消失了 |
+| 后台常驻 CPU | 0.04% | 0.04% | 0.04% | 已达标 |
+
+**⚠️ 这张表以前有个错数字**：优化前写的「热缓存全量扫描 16~25ms，自研用 4 线程并行」是**错的** ——
+并行**从来没生效过**（扫描器按「根目录之间」并行，而默认索引根就是 `$HOME` 这一个 → 线程数被压成 1）。
+真实值是 62.8ms。现在改成「顶层子树分区 + 原子游标」才真的并行起来（21.1ms）。
+
+**两条实测结论，别再走回头路**：
+
+1. **分区赢，窃取输** —— 子树分区 2.4~3.2×；共享目录队列（工作窃取式）**零收益**。
+2. **别抄上游的 `fstatat(dir_fd)`** —— 实测比 std 的路径式 stat **慢 34%**（69.5ms vs 51.8ms）。
 
 **量 CPU 只有 `ps -o time` 的增量法可信**：`top -l N -pid <pid>` 的过滤模式不可信
 （实测对真值 20% 占空比的 burner 连续 6 个采样点全报 0.0%），
 `ps -o %cpu` 是衰减均值会严重低估。解析 `ps -o time` 要**按冒号个数分支**
 （`MM:SS.ss` vs `HH:MM:SS`），否则会算出离谱的值。
 
+## 引擎内部的三条不变量（2026-10-24 优化后新增，改引擎前先读）
+
+1. **排序只排「当前页需要的窗口」，不是全排**
+   → `View` 里存的是**未排序**的命中 id；`build_page` 里用 `sorted_window()`
+   取 `[lo, hi)` 这一段（`select_nth_unstable_by` 分区 + 小窗口排序）。
+   实测：全排序 0.56ms vs 只排 500 条 0.089ms → **6.3×**。
+   ⚠️ **分区必须作用在子切片上**（`head[..lo]` / `head[lo..hi]`）——
+   分区整个数组会把窗口外的元素换进窗口，**窗口的元素集合就错了**。
+   护栏：`engine::tests::partial_window_matches_a_full_sort`。
+
+2. **排序比较器必须是「全序」**
+   → 顺序 = 主键 → 二级键 → **path** → id。
+   - 二级键不能丢（名字 = 折叠名 + 原名）—— 丢了同名条目的相对顺序就变；
+   - `path` 是为了**确定性**：并行扫描之后索引顺序是不确定的，
+     不加 path 的话同样的磁盘内容重扫一次列表顺序会「跳」；
+   - `id` 兜底（`select_nth_unstable_by` 不稳定 → 比较器必须让顺序唯一）。
+   护栏：`engine::tests::equal_keys_are_ordered_by_path_then_id`。
+
+3. **`find_folded` 的 needle 必须是「已折叠」的**
+   → 调用方传的是 `Pattern::Plain.folded`，**不是**原样查询串。
+   本函数只折叠 haystack（逐字符），不折叠 needle → 传原串进来，
+   非 ASCII 的 needle 永远匹配不上。
+   护栏：`fold::tests::find_folded_needs_a_folded_needle`。
+
+**翻页的成本 100% 在高亮计算**（实测：翻一页 0.19ms，flat 重建几乎为 0）
+→ 想再快要优化 `find_folded` 的 O(n·m)，不是去动分页逻辑。
+
 ## 正在做的工作
 
-**M2/M3 还没做完**，具体清单见 [`docs/PROJECT-HANDOFF.md`](docs/PROJECT-HANDOFF.md)：
+**M3/M4 还没做完**，具体清单见 [`docs/PROJECT-HANDOFF.md`](docs/PROJECT-HANDOFF.md)：
 
-- 查询语法只实现了常用子集；`childcount`/`contenttype` 等字段还在表里但**未实现**
-  （引擎会给「暂未实现」的警告，不会静默返回 0 条）。
 - **实时更新还是全量重扫** → M3 要改成「脏目录重扫 + diff」（目标 <5ms）。
 - UX 缺口：⌘K 命令面板、浅色主题、QuickLook、`~` 展开、MiB/GiB、可配置排除规则。
+
+（M2 的「补齐查询语法」已完成 —— 见下面的「语法表 = 实现」。）
+
+## 语法表 = 实现（2026-10-24 起）
+
+前端判断「引擎认不认某项语法」的**唯一依据**是「它在这张表里」
+（`app/src/lib/syntax-help.ts` 的 `isRowSupported`）→ **表里有 = 引擎必须真认**。
+
+- `search-core/src/syntax.rs` 的 `FIELD_TABLE` / `MODIFIER_TABLE`
+  **既是实现、也是导出的表** —— 表里不可能出现没实现的项（结构上防漂移）。
+- 以前这里是两份名单（`FIELDS` 常量 + `field_supported()` 名单），
+  两份会漂移 → 表里有、实现没有 → 前端说「支持」、引擎报警告。
+- 护栏：`app/src-tauri/tests/syntax_tables.rs` 会拿**真引擎**去问表里的每一项
+  （字段挨个试候选值，修饰符挨个试 `<mod>:probe`）。
+- **加一个语法要同步三处**：`syntax.rs` 的表 → `app/shared/cheatsheet.json`
+  → `docs/USER-GUIDE.md`。速查卡的每条 query 会被真引擎验一遍
+  （`search-core/tests/cheatsheet_queries.rs`），写错直接红。
+
+## 查询语法**永远不会**让引擎报错（2026-10-24 起）
+
+用户**打字过程中**的输入天然不完整（`alpha AND`、单独一个 `(`、括号没闭合）。
+以前这些会让 `query::parse()` 返回 `None` → 引擎 `Err(SearchFailed)` →
+界面只显示一句英文 "search failed"，用户既不知道发生了什么也不知道怎么改。
+
+- 现在 `query::parse()` **永不失败**：缺条件就**结束当前分支 + 给一句中文提示**，
+  已经写好的条件照常出结果（`alpha AND` 仍然显示 alpha 的结果）。
+- 提示走 `Query.warnings` → `SearchResult.warning` → 状态栏左下角（`StatusBar.vue`）。
+- 护栏：`search-core/tests/incomplete_queries.rs` 钉住
+  「不完整 → 不报错 + 有提示」「合法 → 不报错 + 无提示」两边。
+- ⚠️ **别再引入 `?` 把「缺一个 term」升级成整条查询失败** —— 那就是根因本身。
 
 ## 关键文件
 
 | 文件 | 作用 |
 |---|---|
 | `app/src-tauri/search-core/src/query.rs` | 查询引擎（**最容易改坏的地方**，改完必须跑速查卡护栏） |
+| `app/src-tauri/search-core/src/syntax.rs` | 语法表（**表 = 实现**，改它等于改引擎能力） |
+| `app/src-tauri/search-core/src/mime.rs` | 扩展名 → MIME（`contenttype:` 字段用） |
 | `app/src-tauri/search-core/src/scan.rs` | 并行遍历器 + 排除剪枝 |
 | `app/src-tauri/search-core/src/engine.rs` | 索引 + 排序 + 分页 + **分组边界公式**（前端 `paging.ts` 依赖它） |
 | `app/src-tauri/src/commands.rs` | 17 个 command —— 换引擎只改这里 3 个函数 |
@@ -135,6 +206,9 @@ sextant/
 | `app/src-tauri/src/settings.rs` | 设置读写 + **identifier 迁移链** |
 | `app/src-tauri/src/lifecycle.rs` | 窗口可见性真相 / ack 驱动事件 |
 | `app/scripts/bundle-app.sh` | 打包 + 自检（唯一入口） |
+| `app/scripts/make-icon-master.swift` | 生成**母版** `assets/icon-1024.png`（六分仪图形，程序绘制） |
+| `app/scripts/make-icon.swift` | 母版 → macOS squircle（吃白边 + 投影） |
+| `app/scripts/gen-icons.sh` | 母版 → `icons/` 下全部成品（32 / 128 / 256 / .icns） |
 | `docs/USER-GUIDE.md` | 用户手册（改界面要同步改） |
 
 ## 改 identifier = 换设置目录，必须配迁移

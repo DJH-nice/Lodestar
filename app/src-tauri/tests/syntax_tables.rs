@@ -17,7 +17,8 @@
 //! 【判据】往 `search-core/src/syntax.rs` 的表里加一个词 →
 //! 本测试必须变红（然后把 fixture 一起更新）。
 
-use search_core::Engine;
+use search_core::engine::Engine;
+use search_core::types::{ListKind, SearchRequest, SortField, SortOrder};
 use serde::Deserialize;
 use std::collections::HashSet;
 
@@ -80,6 +81,105 @@ fn fixture_matches_engine_syntax_tables() {
     check_table("modifiers", &Engine::syntax_modifiers(), &fixture.modifiers);
     check_table("fields", &Engine::syntax_fields(), &fixture.fields);
     check_table("operators", &Engine::syntax_operators(), &fixture.operators);
+}
+
+/// 造一棵小树 —— 让引擎有东西可搜。
+///
+/// 【为什么需要内容】空索引也能解析查询，但我们要验的是
+///   「这个写法引擎**认**不认」—— 认 = 不给警告。
+fn make_tree() -> std::path::PathBuf {
+    static SEQ: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+    let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    let root = std::env::temp_dir().join(format!(
+        "sextant-syntax-tables-{}-{}",
+        std::process::id(),
+        seq
+    ));
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(&root).expect("造目录");
+    for name in ["a.txt", "b.png", "c.pdf"] {
+        std::fs::write(root.join(name), b"x").expect("造文件");
+    }
+    root
+}
+
+fn request(query: &str) -> SearchRequest {
+    SearchRequest {
+        query: query.to_string(),
+        sort: SortField::Name,
+        order: SortOrder::Asc,
+        kind: ListKind::All,
+        page: 0,
+        page_size: 50,
+    }
+}
+
+/// 字段的候选值 —— 挨个试，只要**有一个**写法不报警告就算「引擎真认」。
+///
+/// 【为什么不写死每个字段该配什么值】
+///   那样加字段时得同步改这张表，忘了改就变成「测试变绿、实际没人验」。
+///   → 这里给一组通用候选值，让引擎自己回答「我认不认」。
+const FIELD_CANDIDATES: &[&str] = &["", "1", "pdf", "text", "today", "1M", "/tmp"];
+
+/// 【护栏的核心】表里的每一项，**真引擎都必须认**。
+///
+/// 【为什么要有这道护栏】
+///   前端判断「引擎认不认某项语法」的唯一依据是**它在这张表里**
+///   （`app/src/lib/syntax-help.ts` 的 `isRowSupported`）。
+///   → 表里有、引擎不认 = 前端显示「支持」、引擎却报警告 → 用户照抄搜不到。
+///   这正是「表与实现必须一致」这条规则要防的事。
+///
+/// 【判据】往 `search-core/src/syntax.rs` 的表里加一个**没实现**的词 → 本测试变红。
+#[test]
+fn every_field_in_the_engine_table_is_really_accepted() {
+    let root = make_tree();
+    let (engine, _) = Engine::new(&[root.as_path()]).expect("建引擎");
+
+    let mut failures: Vec<String> = Vec::new();
+    for field in split_table(&Engine::syntax_fields()) {
+        let accepted = FIELD_CANDIDATES.iter().any(|v| {
+            let q = format!("{field}:{v}");
+            let res = engine.search(&request(&q)).expect("查询不该失败");
+            res.warning.is_none()
+        });
+        if !accepted {
+            failures.push(format!(
+                "{field}: 引擎对它的所有写法都报警告（候选值 {FIELD_CANDIDATES:?}）"
+            ));
+        }
+    }
+
+    let _ = std::fs::remove_dir_all(&root);
+    assert!(
+        failures.is_empty(),
+        "字段表里有引擎不认的项 —— 前端会把它显示成「支持」，用户照抄却搜不到：\n  {}",
+        failures.join("\n  ")
+    );
+}
+
+/// 同上，但验的是**修饰符**。
+///
+/// 修饰符的写法统一是 `<修饰符>:<值>` —— 值取一个普通词即可。
+#[test]
+fn every_modifier_in_the_engine_table_is_really_accepted() {
+    let root = make_tree();
+    let (engine, _) = Engine::new(&[root.as_path()]).expect("建引擎");
+
+    let mut failures: Vec<String> = Vec::new();
+    for modifier in split_table(&Engine::syntax_modifiers()) {
+        let q = format!("{modifier}:probe");
+        let res = engine.search(&request(&q)).expect("查询不该失败");
+        if let Some(w) = res.warning {
+            failures.push(format!("{modifier}: → {w}"));
+        }
+    }
+
+    let _ = std::fs::remove_dir_all(&root);
+    assert!(
+        failures.is_empty(),
+        "修饰符表里有引擎不认的项 —— 前端会把它显示成「支持」：\n  {}",
+        failures.join("\n  ")
+    );
 }
 
 #[test]
