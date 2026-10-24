@@ -21,7 +21,7 @@
 | C1 | **删文件必须用 `mavis-trash <绝对路径>`** —— `rm -rf` / glob 删除会被安全网关拦 |
 | C2 | **未经明确同意不得 `brew install`** |
 | C3 | **Rust 侧搜索线程必须串行**（`search-core/src/worker.rs` 单线程 + 单 mpsc 通道）—— 视图有状态，排队是**正确性**要求 |
-| C4 | **扫描绝不在搜索 worker 上做** —— worker 只做「整份替换」这种微秒级操作。30 万文件的盘扫一次要几十秒，堵在 worker 上 = 几十秒搜不动 |
+| C4 | **卷的扫描绝不在搜索 worker 上做** —— worker 只做「整份替换」这种微秒级操作。30 万文件的盘扫一次要几十秒，堵在 worker 上 = 几十秒搜不动。（$HOME 的**全量重扫**例外：M2 已把它优化到 21.1ms，留在 worker 上不值得再挪 —— 见开头「与设计文档的偏差」第 ④ 条） |
 | C5 | **路径归属判定必须用 `Path::starts_with`（组件级）** —— 字符串前缀会让 `/a/bc` 被 `/a/b` 命中 → 漏索引 |
 | C6 | **CSS 颜色只能用 `:root` 里已有的令牌**（`--fg-3` / `--warn` / `--success` / `--accent` …）；`z-index` 走 `--z-*` 那一族 |
 | C7 | **打包只能用 `bash app/scripts/bundle-app.sh`** —— 自检里看到 `✓ 前端已嵌进二进制` 才算成功 |
@@ -155,7 +155,61 @@ Expected: 编译错误 —— `cannot find function save_root in this scope`（�
 
 - [ ] **Step 3: 实现**
 
-在 `app/src-tauri/search-core/src/store.rs` 里，**保留**现有的 `serialize` / `save` / `load`（Task 2 才会切过去），**新增**下面这些：
+在 `app/src-tauri/search-core/src/store.rs` 里，**保留**现有的 `serialize` / `save` / `load`（Task 2 才会切过去），**新增**下面这些。
+
+⚠️ **不要把条目读写逻辑抄两遍** —— v2 的 `serialize` 与新的 `serialize_root`
+都要写同样的字段。**先抽出两个共享 helper**，两套格式各自调用它们：
+
+```rust
+/// 写一条条目（v2 / v3 两种格式的**条目部分完全一样**）。
+fn write_entry(buf: &mut Vec<u8>, e: &IndexEntry) {
+    write_str(buf, &e.name);
+    write_str(buf, &e.path);
+    write_str(buf, &e.dir);
+    write_str(buf, &e.extension);
+    write_str(buf, &e.folded_name);
+    write_str(buf, &e.folded_path);
+    buf.extend_from_slice(&e.size.to_le_bytes());
+    buf.extend_from_slice(&e.mtime.to_le_bytes());
+    let mut flags = 0u8;
+    if e.is_folder {
+        flags |= 1;
+    }
+    buf.push(flags);
+    buf.extend_from_slice(&e.depth.to_le_bytes());
+    buf.extend_from_slice(&e.child_count.to_le_bytes());
+    buf.extend_from_slice(&e.child_file_count.to_le_bytes());
+    buf.extend_from_slice(&e.child_folder_count.to_le_bytes());
+}
+
+/// 读一条条目（`write_entry` 的逆操作）。
+fn read_entry(r: &mut Reader<'_>) -> Option<IndexEntry> {
+    let name = r.string()?;
+    let path = r.string()?;
+    let dir = r.string()?;
+    let extension = r.string()?;
+    let folded_name = r.string()?;
+    let folded_path = r.string()?;
+    let size = r.i64()?;
+    let mtime = r.i64()?;
+    let flags = r.u8()?;
+    let depth = r.u32()?;
+    let child_count = r.u32()?;
+    let child_file_count = r.u32()?;
+    let child_folder_count = r.u32()?;
+    Some(IndexEntry {
+        name, path, dir, extension, folded_name, folded_path,
+        size, mtime,
+        is_folder: flags & 1 != 0,
+        depth, child_count, child_file_count, child_folder_count,
+    })
+}
+```
+
+然后 `serialize`（v2）与 `serialize_root`（v3）各自只写自己的**头**，
+条目部分都调 `write_entry`；`parse`（v2）与 `parse_root`（v3）同理用 `read_entry`。
+
+**新增这些**：
 
 ```rust
 /// 格式版本。
@@ -213,23 +267,7 @@ pub fn serialize_root(root: &Path, entries: &[IndexEntry]) -> Vec<u8> {
     write_str(&mut buf, &root.to_string_lossy());
     buf.extend_from_slice(&(entries.len() as u32).to_le_bytes());
     for e in entries {
-        write_str(&mut buf, &e.name);
-        write_str(&mut buf, &e.path);
-        write_str(&mut buf, &e.dir);
-        write_str(&mut buf, &e.extension);
-        write_str(&mut buf, &e.folded_name);
-        write_str(&mut buf, &e.folded_path);
-        buf.extend_from_slice(&e.size.to_le_bytes());
-        buf.extend_from_slice(&e.mtime.to_le_bytes());
-        let mut flags = 0u8;
-        if e.is_folder {
-            flags |= 1;
-        }
-        buf.push(flags);
-        buf.extend_from_slice(&e.depth.to_le_bytes());
-        buf.extend_from_slice(&e.child_count.to_le_bytes());
-        buf.extend_from_slice(&e.child_file_count.to_le_bytes());
-        buf.extend_from_slice(&e.child_folder_count.to_le_bytes());
+        write_entry(&mut buf, e);
     }
     buf
 }
@@ -271,25 +309,7 @@ fn parse_root(buf: &[u8]) -> Option<(String, Vec<IndexEntry>)> {
     let count = r.u32()? as usize;
     let mut entries = Vec::with_capacity(count);
     for _ in 0..count {
-        let name = r.string()?;
-        let path = r.string()?;
-        let dir = r.string()?;
-        let extension = r.string()?;
-        let folded_name = r.string()?;
-        let folded_path = r.string()?;
-        let size = r.i64()?;
-        let mtime = r.i64()?;
-        let flags = r.u8()?;
-        let depth = r.u32()?;
-        let child_count = r.u32()?;
-        let child_file_count = r.u32()?;
-        let child_folder_count = r.u32()?;
-        entries.push(IndexEntry {
-            name, path, dir, extension, folded_name, folded_path,
-            size, mtime,
-            is_folder: flags & 1 != 0,
-            depth, child_count, child_file_count, child_folder_count,
-        });
+        entries.push(read_entry(&mut r)?);
     }
     Some((root, entries))
 }
