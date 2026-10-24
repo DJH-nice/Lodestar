@@ -13,6 +13,8 @@
 //!   症状是「数字显示很快，但感觉很慢」，很容易误判成搜索算法慢。
 //!   → 这正是 M3 要治的病：**增量更新**只要几毫秒，堵不住谁。
 
+use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{channel, RecvTimeoutError, Sender};
 use std::sync::{Arc, Condvar, Mutex};
@@ -58,20 +60,19 @@ enum Job {
     Shutdown,
 }
 
-/// 落盘线程的活儿：一份已经序列化好的索引字节流 + 目标路径。
-struct PersistJob {
-    bytes: Vec<u8>,
-    path: std::path::PathBuf,
-}
-
-/// 落盘槽 —— **只要最新的那一份**。
+/// 落盘槽 —— **每个根只要最新的那一份**。
 ///
 /// 【为什么是「覆盖」而不是「排队」】
 ///   变化来得比落盘快时（比如一次 `git checkout` 触几百个事件），
 ///   排队的写法会写好几次**内容几乎一样**的档 —— 白白烧 I/O。
 ///   覆盖掉旧的 → 只写最后那一份 ✓（内容是最新的 ✓）。
+///
+/// 【为什么是 map 而不是一份】
+///   索引档改成**每根一个文件** → 挂载的根不止一个（\$HOME + 若干外接卷）
+///   → 每个根各要一份最新快照。
 struct PersistSlot {
-    job: Mutex<Option<PersistJob>>,
+    /// 根的档路径 → 该根最新的字节流。
+    jobs: Mutex<HashMap<PathBuf, Vec<u8>>>,
     /// 【为什么用原子量而不是 Mutex】
     ///   落盘线程等在条件变量上时**不能**再持有别的锁 ——
     ///   `Condvar::wait` 只释放它自己那个 Mutex。
@@ -94,10 +95,10 @@ struct Persister {
 }
 
 impl PersistSlot {
-    /// 交出一份快照（**覆盖**掉还没写的那份 —— 只要最新的）。
-    fn submit(&self, job: PersistJob) {
-        let mut g = self.job.lock().unwrap();
-        *g = Some(job);
+    /// 交出一个根的快照（**覆盖**掉那个根还没写的那份）。
+    fn submit(&self, path: PathBuf, bytes: Vec<u8>) {
+        let mut g = self.jobs.lock().unwrap();
+        g.insert(path, bytes);
         self.cv.notify_one();
     }
 }
@@ -105,7 +106,7 @@ impl PersistSlot {
 impl Persister {
     fn new() -> Persister {
         let slot = Arc::new(PersistSlot {
-            job: Mutex::new(None),
+            jobs: Mutex::new(HashMap::new()),
             stopped: AtomicBool::new(false),
             cv: Condvar::new(),
         });
@@ -114,16 +115,20 @@ impl Persister {
             .name("sextant-persist".into())
             .spawn(move || {
                 loop {
-                    let job = {
-                        let mut g = thread_slot.job.lock().unwrap();
-                        while g.is_none() && !thread_slot.stopped.load(Ordering::Relaxed) {
+                    let jobs = {
+                        let mut g = thread_slot.jobs.lock().unwrap();
+                        while g.is_empty() && !thread_slot.stopped.load(Ordering::Relaxed) {
                             g = thread_slot.cv.wait(g).unwrap();
                         }
-                        g.take()
+                        std::mem::take(&mut *g)
                     };
-                    let Some(job) = job else { break };
-                    if let Err(e) = store::save_bytes(&job.bytes, &job.path, true) {
-                        eprintln!("[sextant] 索引落盘失败（不影响使用）: {e}");
+                    if jobs.is_empty() {
+                        break;
+                    }
+                    for (path, bytes) in jobs {
+                        if let Err(e) = store::save_bytes(&bytes, &path, true) {
+                            eprintln!("[sextant] 索引落盘失败（不影响使用）: {e}");
+                        }
                     }
                 }
             })
@@ -224,9 +229,10 @@ impl Searcher {
                     //   【为什么还要「至少隔 2s」】写一次 3MB 的档要 9.6ms ——
                     //   不设闸的话，持续小改动会把后台线程刷爆。
                     if store_dirty && last_persist_at.elapsed() >= PERSIST_INTERVAL {
-                        if let Some(bytes) = engine.serialize_for_store() {
-                            if let Some(path) = engine.store_path() {
-                                persist_slot.submit(PersistJob { bytes, path });
+                        let jobs = engine.serialize_for_store();
+                        if !jobs.is_empty() {
+                            for (path, bytes) in jobs {
+                                persist_slot.submit(path, bytes);
                             }
                             store_dirty = false;
                             last_persist_at = Instant::now();

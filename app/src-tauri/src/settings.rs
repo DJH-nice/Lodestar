@@ -423,13 +423,16 @@ fn build_engine<R: Runtime>(
     resolved: &[String],
 ) -> Result<(search_core::Searcher, u32), String> {
     let refs: Vec<&Path> = resolved.iter().map(|p| Path::new(p)).collect();
-    let store_path = app
+    // 索引档现在是「**每根一个文件**」的目录（见 search-core/src/store.rs 的 v3 格式）。
+    // ⚠️ 不能叫 index.bin —— 磁盘上那个 3.4MB 的旧 v2 档还占着这个名字，
+    // 建目录会失败 → 档永远写不进去 → 每次冷启动都静默地全量重扫。
+    let store_dir = app
         .path()
         .app_config_dir()
         .ok()
-        .map(|dir| dir.join("index.bin"));
+        .map(|dir| dir.join("index"));
     let (engine, indexed) =
-        search_core::Engine::new_with_store(&refs, store_path).map_err(|e| e.to_string())?;
+        search_core::Engine::new_with_store(&refs, store_dir).map_err(|e| e.to_string())?;
     Ok((search_core::Searcher::new(engine), indexed))
 }
 
