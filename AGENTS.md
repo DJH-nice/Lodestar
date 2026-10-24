@@ -32,6 +32,7 @@ lodestar/
 │   │   │   ├── exclude.rs        排除规则（唯一真相，watcher 也问它）
 │   │   │   ├── syntax.rs         语法三张表（前端共用同一份）
 │   │   │   ├── engine.rs         索引 + 排序 + 分页 + 高亮
+│   │   │   ├── incremental.rs    ★ 增量更新（脏路径 → 就地改索引）
 │   │   │   └── worker.rs         串行搜索线程
 │   │   └── tests/              5 个护栏集成测试
 │   ├── shared/                 syntax-tables.json / cheatsheet.json
@@ -71,6 +72,14 @@ lodestar/
    （例：统计索引里有哪些目录要遍历整棵树，不能只看三个就说「只剩这三个」）。
 10. **同一台机器可能有并发会话在跑自己的冒烟测试**：别用 `pkill -f`（会杀掉执行它的那条命令自己），
     用 `pkill -x`；验收实例要**改名 + 换 bundle id**。
+11. **增量更新不能被记成「一趟全量扫描」**：`watcher` 的「覆盖」闸靠
+    `IndexState::last_scan_completed_at` 判断「这次变化是不是已经被扫过了」。
+    增量更新**只覆盖它处理的那几个路径**，不是整棵树 ——
+    把它记进那个时刻 → 之后的文件变化会被误判成「已覆盖」→ **被跳过** →
+    索引悄悄过期、用户搜不到新文件。
+    → 全量重扫走 `index_state::run_scan_blocking`，
+      增量更新走 `index_state::run_incremental_blocking`（**刻意不记**完成时刻）。
+    护栏：`index_state.rs` 的 `an_incremental_update_does_not_count_as_a_completed_scan`。
 
 ## 动手前先知道的几件事
 
@@ -96,6 +105,15 @@ lodestar/
 - **正则用 Rust 的 `regex` 不用 PCRE2** —— 它保证线性时间，没有灾难性回溯。
   用户能直接输入查询串，必须防这一手。
 - **别用 `cargo build --release` 的产物去覆盖 bundle**（见硬约束 3）。
+- **索引落盘很贵，写盘那一段尤其贵**（实测 8,541 项 / 3MB）：
+  序列化（纯 CPU）**1.8ms** + 写盘（fsync + rename）**13.3ms**。
+  → 落盘**不能**放在增量更新的关键路径上（会把「几毫秒」毁掉）→
+    由 `worker.rs` 的**后台落盘线程**做（搜索线程只负责交出字节流）。
+  → 顺带一提：不 fsync 的话写盘只要 **1.3ms** —— fsync 一个人占掉 12ms。
+- **FSEvents 给的是「每个文件」的事件，不是「某个目录变了」**（实测，2026-10-24）。
+  → 这正是能做增量更新的前提：单个文件的变化可以精确到那一条。
+  → 但它**会丢事件**（队列满时）→ notify 把它翻译成 `Flag::Rescan` 事件
+    → 收到它必须**全量重扫**兜底（增量更新依赖「事件没丢」）。
 
 ## 性能基线（实测，探针方法见设计文档 §2）
 
@@ -106,6 +124,9 @@ lodestar/
 |---|---|---|---|---|
 | 热缓存全量扫描（8,550 项） | 74.6ms | 62.8ms | **21.1ms**（快 66%，2.98×） | 顶层子树分区 + 原子游标 |
 | 冷启动 → 可搜 | 300~450ms（每次全量扫描） | — | **2.7ms**（读索引档） | 达标 |
+| **实时更新（改 1 个文件）** | 300ms+（上游 inotify 增量） | — | **0.01~0.05ms**（增量更新本身） | M3 |
+| **实时更新（改 100 个文件）** | 300ms+ × N | — | **0.5~2.7ms**（**一次**更新） | M3 |
+| **实时更新（端到端可见）** | — | — | **407ms**（含事件投递与去抖） | M3 |
 | 查询（8,948 项，命中 55%） | 2.6ms | 1.43ms | **0.38ms**（快 73%） | 只排当前页需要的那一段 |
 | 查询（全量匹配 `*`） | 2.06ms | 1.00ms | **0.47ms**（快 53%） | 同上 |
 | 查询（`ext:pdf` / `size:>1M`） | ~1.08ms | 0.06ms | **0.05ms** | 字段索引期算好 |
@@ -159,7 +180,9 @@ lodestar/
 
 **M3/M4 还没做完**，具体清单见 [`docs/PROJECT-HANDOFF.md`](docs/PROJECT-HANDOFF.md)：
 
-- **实时更新还是全量重扫** → M3 要改成「脏目录重扫 + diff」（目标 <5ms）。
+- **实时更新还是全量重扫** → ~~M3 要改成「脏目录重扫 + diff」~~ → **M3 已完成**：
+  改成「脏路径 → 就地改索引」（`search-core/src/incremental.rs`）。
+  实测改 1 个文件 **0.01~0.05ms**、100 个文件 **0.5~2.7ms**（一次更新）、端到端可见 **407ms**。
 - UX 缺口：⌘K 命令面板、浅色主题、QuickLook、`~` 展开、MiB/GiB、可配置排除规则。
 
 （M2 的「补齐查询语法」已完成 —— 见下面的「语法表 = 实现」。）
@@ -202,7 +225,8 @@ lodestar/
 | `app/src-tauri/search-core/src/scan.rs` | 并行遍历器 + 排除剪枝 |
 | `app/src-tauri/search-core/src/engine.rs` | 索引 + 排序 + 分页 + **分组边界公式**（前端 `paging.ts` 依赖它） |
 | `app/src-tauri/src/commands.rs` | 17 个 command —— 换引擎只改这里 3 个函数 |
-| `app/src-tauri/src/watcher.rs` | FSEvents 监控 + 排除判断缓存 |
+| `app/src-tauri/search-core/src/incremental.rs` | **增量更新内核**（脏路径 → 就地改索引）—— M3 新增 |
+| `app/src-tauri/src/watcher.rs` | FSEvents 监控 + 排除判断缓存 + **脏路径集合** |
 | `app/src-tauri/src/settings.rs` | 设置读写 + **identifier 迁移链** |
 | `app/src-tauri/src/lifecycle.rs` | 窗口可见性真相 / ack 驱动事件 |
 | `app/scripts/bundle-app.sh` | 打包 + 自检（唯一入口） |

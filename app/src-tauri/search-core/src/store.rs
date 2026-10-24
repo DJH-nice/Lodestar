@@ -29,13 +29,37 @@ const MAGIC: &[u8; 4] = b"SXTX";
 ///   `childfoldercount:` 需要它们）。老档直接作废 → 重扫一次。
 const VERSION: u32 = 2;
 
-/// 把索引写到 `path`（原子替换）。
-pub fn save(entries: &[IndexEntry], roots: &[PathBuf], path: &Path) -> std::io::Result<()> {
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
+/// 把索引序列化成字节流 —— 落盘的 **CPU 部分**。
+///
+/// 【为什么要单独抽出来】落盘有两段成本：**序列化**（CPU）与
+///   **写盘**（I/O）。哪一段贵，决定了「能不能放在关键路径上」——
+///   所以要能分别量。
+pub fn serialize(entries: &[IndexEntry], roots: &[PathBuf]) -> Vec<u8> {
+    // 【为什么先算准大小】估小了会让 Vec **扩容时拷贝**整个缓冲区 ——
+    //   3MB 的档要拷两三次，实测多花约 1ms（序列化总耗时的一半）。
+    //   先扫一遍把大小算准 → 一次分配、零拷贝。
+    let mut cap = 64usize + roots.len() * 32;
+    for e in entries {
+        cap += 4
+            + e.name.len()
+            + 4
+            + e.path.len()
+            + 4
+            + e.dir.len()
+            + 4
+            + e.extension.len()
+            + 4
+            + e.folded_name.len()
+            + 4
+            + e.folded_path.len()
+            + 8
+            + 8
+            + 1
+            + 4
+            + 4;
     }
 
-    let mut buf: Vec<u8> = Vec::with_capacity(entries.len() * 96 + 64);
+    let mut buf: Vec<u8> = Vec::with_capacity(cap);
     buf.extend_from_slice(MAGIC);
     buf.extend_from_slice(&VERSION.to_le_bytes());
     buf.extend_from_slice(&(roots.len() as u32).to_le_bytes());
@@ -63,12 +87,40 @@ pub fn save(entries: &[IndexEntry], roots: &[PathBuf], path: &Path) -> std::io::
         buf.extend_from_slice(&e.child_folder_count.to_le_bytes());
     }
 
+    buf
+}
+
+/// 把索引写到 `path`（原子替换）。
+pub fn save(entries: &[IndexEntry], roots: &[PathBuf], path: &Path) -> std::io::Result<()> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+
+    let buf = serialize(entries, roots);
+    save_bytes(&buf, path, true)
+}
+
+/// 把**已经序列化好的**字节流写到 `path`（原子替换）。
+///
+/// 【为什么要单独抽出来】落盘有两段成本：
+///   **序列化**（CPU，约 1ms）与 **写盘**（I/O，约 12ms —— 新建 inode 的
+///   fsync 很贵）。第二段可以挪到后台线程去做 → 关键路径上只留第一段。
+///
+/// 【`sync` 参数】`true` = 落盘再 rename（断电也不会留下半个档）。
+///   `false` = 不 fsync —— 断电时这个档可能坏掉，
+///   但**读档失败会退回全量扫描**（见 [`load`]），所以只是慢，不会出错。
+pub fn save_bytes(buf: &[u8], path: &Path, sync: bool) -> std::io::Result<()> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
     // 临时文件 + 原子 rename
     let tmp = path.with_extension("tmp");
     {
         let mut f = std::fs::File::create(&tmp)?;
-        f.write_all(&buf)?;
-        f.sync_all()?; // 落盘再 rename —— 断电也不会留下半个档
+        f.write_all(buf)?;
+        if sync {
+            f.sync_all()?; // 落盘再 rename —— 断电也不会留下半个档
+        }
     }
     std::fs::rename(&tmp, path)?;
     Ok(())

@@ -26,6 +26,7 @@ pub mod engine;
 pub mod exclude;
 pub mod fold;
 pub mod mime;
+pub mod incremental;
 pub mod query;
 pub mod scan;
 pub mod store;
@@ -34,6 +35,7 @@ pub mod types;
 pub mod worker;
 
 pub use engine::Engine;
+pub use incremental::{ChangeSet, UpdateReport};
 pub use types::{
     EngineError, Entry, Highlight, IndexEntry, ListKind, SearchRequest, SearchResult, SortField,
     SortOrder,

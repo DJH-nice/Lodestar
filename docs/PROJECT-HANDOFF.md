@@ -83,7 +83,7 @@ lodestar/                          ← 新仓库（git 已初始化，1 次提�
 | 致谢与许可面板 | `CreditsPanel.vue` | ✅ |
 | 菜单栏托盘图标 / 全局快捷键唤起 / 开机自启 | `tray.rs` / `shortcut.rs` | ✅ |
 | 后台常驻 + 唤醒 + 隐藏时停轮询（后台 CPU 0.04%） | `lifecycle.rs` | ✅ |
-| 实时更新（FSEvents + 去抖 800ms + 最小间隔 5s） | `watcher.rs` | ✅ 但**是全量重扫**（M3 改） |
+| 实时更新（FSEvents + 去抖 200ms + 最小间隔 400ms） | `watcher.rs` + `search-core/src/incremental.rs` | ✅ **增量更新**（M3）|
 | 手动刷新 / 重建索引 / 在访达中定位 | `commands.rs` | ✅ |
 | **自研引擎**：并行扫描 / 索引落盘 / 查询语法 / 排序分页 / 高亮 | `search-core/` | ✅ 43 个用例 |
 | **设置迁移链**（fsearch → lodestar → lodestar） | `settings.rs` | ✅ |
@@ -149,7 +149,7 @@ lodestar/                          ← 新仓库（git 已初始化，1 次提�
 
 | 问题 | 证据 | 影响 |
 |---|---|---|
-| **实时更新是全量重扫** | `watcher.rs` 只有 `rescan` 一条路 | **弱于 Linux 上游**（上游走 inotify 增量）→ M3 |
+| ~~实时更新是全量重扫~~ | **M3 已解决** → `search-core/src/incremental.rs` | 已**不弱于** Linux 上游（实测：改 1 个文件 0.05ms，全量重扫要 209ms）|
 | 索引档是「整读整解析」 | `store.rs` | 8K 条目 ~1.1MB，够用；mmap 列存是后续优化项 |
 | 并行只到「根目录级」 | `scan.rs` | 单根目录内部仍是串行；工作窃取是优化项 |
 
@@ -177,6 +177,10 @@ lodestar/                          ← 新仓库（git 已初始化，1 次提�
 | 指标 | 上游基线 | 优化前 | **Lodestar 现在** | 对比上游 |
 |---|---|---|---|---|
 | 冷启动：读索引档 | —（上游不落盘） | 2.6ms | **2.7ms** | 每次省 300ms |
+| **实时更新：改 1 个文件** | 300ms+（上游 inotify 增量） | **0.01~0.05ms** | 比全量重扫快 3 个数量级 |
+| **实时更新：改 100 个文件** | 300ms+ × N | **0.5~2.7ms**（**一次**更新） | 不随文件数线性涨 |
+| **实时更新：端到端可见** | — | **407ms** | 含 FSEvents 投递与去抖 |
+| 索引落盘（3MB） | — | 序列化 1.8ms + 写盘 13.3ms | **不能**进关键路径 |
 | **热缓存：全量扫描** | 74.6ms | 62.8ms | **21.1ms**（快 66%） | **3.5× 快** |
 | 冷缓存：全量扫描 | 300–450ms | 322.9ms | 112.1ms（磁盘已热） | 持平 |
 | 字段查询 `ext:pdf` | ~1.08ms | 0.063ms | **0.052ms** | **20× 快** |
@@ -240,14 +244,52 @@ lodestar/                          ← 新仓库（git 已初始化，1 次提�
 护栏 `syntax_tables.rs` 会拿**真引擎**去问表里的每一项。
 每加一个语法，速查卡与手册要同步。
 
-**M3 — 增量更新**：`watcher.rs` 收到 FSEvents → 记脏目录 → **只重扫脏目录** →
-diff 后写回索引档。目标 <5ms，取代现在的全量重扫。
+**M3 — 增量更新**：✅ **已完成**（分支 `feat/m3-incremental-index`）。
+`watcher.rs` 收到 FSEvents → 记**脏路径** → 引擎**只碰真的变了的那几个路径**
+（新增 / 删除 / 改 size·mtime / 目录整棵换掉）→ 后台线程写回索引档。
+实测：改 1 个文件 **0.01~0.05ms**、100 个文件 **0.5~2.7ms**（一次更新）、端到端 **407ms**。
+
+> 【为什么不是「记脏目录 → 只重扫脏目录」】
+> FSEvents 给的是**每个文件**的事件（实测）——
+> 所以单个文件的变化可以**精确到那一条**，根本不用重扫任何目录。
+> 只有**目录**本身变了（新建 / 改名 / 连内容一起创建）才整棵换掉。
+>
+> 【落地时踩到的三个坑，合并/改动前必读】
+> ① **增量更新不能被记成「一趟全量扫描」** —— watcher 的「覆盖」闸靠
+>    `last_scan_completed_at` 判断，混用会让之后的文件变化被**跳过** →
+>    索引悄悄过期。→ 全量走 `run_scan_blocking`，增量走 `run_incremental_blocking`。
+> ② **FSEvents 会丢事件** → notify 给 `Flag::Rescan` 事件 → 收到必须**全量重扫**兜底。
+> ③ **索引落盘 13.3ms**（写盘那一段，fsync 一个人占 12ms）→
+>    不能进关键路径 → `worker.rs` 里有个**后台落盘线程**。
 
 **M4 — 收口**：
 - 补 UX 缺口 8 项（⌘K 命令面板从 `prototype/index.html` 搬）
 - 重写 `docs/USER-GUIDE.md` 里的引擎描述（现在还写着「引擎来自 FSearch」）
 - 打包验证：`.app` ≤12M、`otool -L` 无外部 dylib
 - 加 CI（GitHub Actions：cargo test + vitest + 打包自检）
+
+**与 M2 合并时的三步（已实测验证）**
+> 背景：M2 给 `IndexEntry` 加了 `child_file_count` / `child_folder_count`
+> 两个字段（`childfilecount:` / `childfoldercount:` 用）。
+> M3 的增量更新只维护了 `child_count` → 合并后那两个计数会**漂移**。
+>
+> **① 解决 2 处冲突**（实测：`git merge-tree` 干跑的结果）
+>   - `search-core/src/lib.rs`：两行都留（`pub mod incremental;` + `pub mod mime;`）
+>   - `search-core/src/engine.rs`：留 M3 的 `apply_changes` 那一块
+>   （`scan.rs` 与 `store.rs` **自动合并**，不用管）
+>
+> **② 让增量更新维护那两个新计数**（`search-core/src/incremental.rs`，约 8 行）
+>   - `ChildDelta` 加 `files` / `folders` 两个字段
+>   - `bump()` 多收一个 `is_folder` 参数
+>   - 应用增量时多写两行：
+>     `e.child_file_count = ...; e.child_folder_count = ...;`
+>
+> **③ 把护栏的快照也扩到那两个字段**
+>   （`search-core/tests/incremental.rs` 的 `Snapshot` 类型 + 取值处，2 行）
+>   → **不扩的话漂移不会被抓到** —— 实测：扩之前 19 条全绿，
+>     扩之后 **8 条变红**（`child_folder_count` 对不上）✓
+>
+> 三步做完，合并后的 `cargo test -p search-core` **19 条全绿**（已实测）。
 
 **另有两件小事**：
 - `CreditsPanel.vue` 里还写着上游 FSearch 与 GPL 的说明 → 要重写
