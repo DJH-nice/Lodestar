@@ -23,7 +23,7 @@ fn fixture(tag: &str) -> PathBuf {
     static SEQ: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
     let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
     let dir = std::env::temp_dir().join(format!(
-        "sextant-incremental-{tag}-{}-{seq}",
+        "lodestar-incremental-{tag}-{}-{seq}",
         std::process::id()
     ));
     let _ = std::fs::remove_dir_all(&dir);

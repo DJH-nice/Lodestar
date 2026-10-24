@@ -461,7 +461,7 @@ mod tests {
     #[test]
     fn a_symlink_to_a_directory_counts_as_a_file() {
         // 与扫描器一致：链接按「文件」索引（不跟随）
-        let dir = std::env::temp_dir().join(format!("sextant-inc-link-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("lodestar-inc-link-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(dir.join("real")).unwrap();
         std::fs::write(dir.join("real/inside.txt"), "x").unwrap();

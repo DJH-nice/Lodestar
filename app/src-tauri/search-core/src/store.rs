@@ -198,7 +198,7 @@ pub fn serialize_root(root: &Path, entries: &[IndexEntry]) -> Vec<u8> {
     //       = 16 + 根路径长度。
     //   拿固定的 64 蒙的话，根路径**超过 48 字节**就会蒙穿 → 多一次 Vec 扩容
     //   （整 buf memcpy，量级 0.1~1ms，每次 save 一次）。
-    //   条目部分继续用 `entries_bytes`（v2/v3 共用一份真相）。
+    //   条目部分继续用 `entries_bytes`（与 `write_entry` 同一份字段表）。
     let root_str = root.to_string_lossy();
     let cap = 16 + root_str.len() + entries_bytes(entries);
     let mut buf: Vec<u8> = Vec::with_capacity(cap);

@@ -277,15 +277,28 @@ impl Searcher {
                                 });
                             }
                             Job::DetachRoot { root, reply } => {
-                                let count = engine.detach_root(&root);
-                                current_query = None; // 视图已被替换
-                                // 摘掉的根**不该**再写档 → 从待写名单里去掉；
-                                // 也把落盘槽里**已经排着**的那份丢掉（否则会落一份陈旧档）。
-                                dirty_roots.remove(&root);
-                                if let Some(dir) = engine.store_dir() {
-                                    persist_slot.discard(&store::root_archive_path(&dir, &root));
+                                // 【为什么要先问一句「它在吗」】
+                                //   引擎比的是**索引空间写法** —— 拼写不同（或者压根没挂过）
+                                //   → 摘根**静默无效** → 条目留着 = **幽灵条目**
+                                //   （用户最不能接受的那种：盘都拔了还搜得到它的文件）。
+                                //   → 上层必须能分辨「没摘掉」→ 回 Err（与 attach 的拒绝语义对称）。
+                                //   → **查不到就不去摘**：让引擎去摘一个没挂过的路径，
+                                //   它会按路径前缀把**别的根**的条目一并删掉（误伤）。
+                                let known = engine.roots().iter().any(|r| r == &root);
+                                if known {
+                                    let count = engine.detach_root(&root);
+                                    current_query = None; // 视图已被替换
+                                    // 摘掉的根**不该**再写档 → 从待写名单里去掉；
+                                    // 也把落盘槽里**已经排着**的那份丢掉（否则会落一份陈旧档）。
+                                    dirty_roots.remove(&root);
+                                    if let Some(dir) = engine.store_dir() {
+                                        persist_slot.discard(&store::root_archive_path(&dir, &root));
+                                    }
+                                    let _ = reply.send(Ok(count));
+                                } else {
+                                    // 没挂过（或拼写与 attach 时不同）→ 什么都没摘掉
+                                    let _ = reply.send(Err(EngineError::InvalidArg));
                                 }
-                                let _ = reply.send(Ok(count));
                             }
                             Job::Shutdown => break,
                         }
@@ -309,12 +322,17 @@ impl Searcher {
                             .filter(|r| live.contains(*r))
                             .cloned()
                             .collect();
-                        dirty_roots.retain(|r| live.contains(r));
                         // 【只序列化「要」的那几个根】—— 没被挑中的根，
                         //   它磁盘上的档**本来就是对的** ✓（不提交 ≠ 删掉）。
                         for (path, bytes) in engine.serialize_roots_for_store(&wanted) {
                             persist_slot.submit(path, bytes);
                         }
+                        // 【写过的就不再欠账】—— ⚠️ 不摘掉的话，它会**每 2 秒**被重写一次
+                        //   （无限循环：序列化还发生在**搜索线程**上 → 搜索被堵）。
+                        //   死根（被摘掉的）同样不欠账 → 脏集合清空。
+                        dirty_roots.clear();
+                        // 【为什么要看 wanted】这一拍**什么都没写**（脏的根都死了）→
+                        //   闸门不必重起算：脏集合已清空 → 不会有下一轮。
                         if !wanted.is_empty() {
                             last_persist_at = Instant::now();
                         }
@@ -498,6 +516,53 @@ impl Drop for Searcher {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 摘根时丢掉的那个快照，**真的不会再被写出去**（要求 ④）。
+    ///
+    /// 【为什么要有这条】`PersistSlot` 是「每根覆盖最新字节流」——
+    ///   摘根**之前**提交的那份快照还在排队 → 摘完根它仍会落盘 →
+    ///   把那个根的档重写成**摘根前**的内容（陈旧档）。
+    ///   → 摘根要把那份快照丢掉。
+    ///
+    /// 【为什么用白盒】这个状态在**落盘线程**手里 —— 想在端到端里稳定地
+    ///   观测到「提交了但还没写」那个窗口，得跟落盘线程赛跑（会 flaky）。
+    ///   → 直接测落盘槽本身：提交 → 丢掉 → 槽里空了 ✓。
+    #[test]
+    fn a_discarded_snapshot_is_not_written_anymore() {
+        let slot = PersistSlot {
+            jobs: Mutex::new(HashMap::new()),
+            stopped: AtomicBool::new(false),
+            cv: Condvar::new(),
+        };
+        let path = PathBuf::from("/Volumes/U盘/archive.bin");
+        slot.submit(path.clone(), vec![1, 2, 3]);
+        assert_eq!(slot.jobs.lock().unwrap().len(), 1, "提交后槽里有一份");
+
+        slot.discard(&path);
+        assert!(
+            slot.jobs.lock().unwrap().is_empty(),
+            "丢掉之后槽里不该还留着它（否则会落一份陈旧档）"
+        );
+    }
+
+    /// 丢掉**别的**根的快照，不该影响这一个。
+    #[test]
+    fn discarding_one_root_keeps_the_others() {
+        let slot = PersistSlot {
+            jobs: Mutex::new(HashMap::new()),
+            stopped: AtomicBool::new(false),
+            cv: Condvar::new(),
+        };
+        let a = PathBuf::from("/a.bin");
+        let b = PathBuf::from("/b.bin");
+        slot.submit(a.clone(), vec![1]);
+        slot.submit(b.clone(), vec![2]);
+
+        slot.discard(&a);
+        let jobs = slot.jobs.lock().unwrap();
+        assert_eq!(jobs.len(), 1);
+        assert!(jobs.contains_key(&b), "别的根的快照不该被丢掉");
+    }
 
     /// 变化路径 → 它所属的根（**索引空间**写法）。
     ///
