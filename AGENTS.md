@@ -36,7 +36,7 @@ lodestar/
 │   │   │   └── worker.rs         串行搜索线程
 │   │   └── tests/              5 个护栏集成测试
 │   ├── shared/                 syntax-tables.json / cheatsheet.json
-│   └── scripts/                bundle-app.sh（打包唯一入口）等 10 个脚本
+│   └── scripts/                bundle-app.sh（打包唯一入口）等 9 个脚本
 ├── docs/
 │   ├── USER-GUIDE.md           用户手册（应用内「帮助 → 完整手册」渲染它）
 │   ├── PROJECT-HANDOFF.md      项目交接文档（背景与决策）
