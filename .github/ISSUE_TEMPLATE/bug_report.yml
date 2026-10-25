@@ -1,0 +1,75 @@
+name: Bug 反馈
+description: 报告一个 Lodestar 的问题
+title: "[Bug] "
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        谢谢反馈！先自己排查一下通常能更快解决：
+
+        - 是不是**开了「文件变化时自动更新索引」**？关掉再试一次
+        - 是不是**索引目录被换过**？设置里可以「应用并重建索引」
+        - 重新启动一次 Lodestar 试试（它会读索引档，不用重扫）
+
+  - type: input
+    id: version
+    attributes:
+      label: Lodestar 版本
+      description: 「关于」里能看到的版本号
+      placeholder: v0.1.0
+    validations:
+      required: true
+
+  - type: dropdown
+    id: os
+    attributes:
+      label: macOS 版本
+      options:
+        - macOS 15
+        - macOS 14
+        - macOS 13
+        - 其他
+    validations:
+      required: true
+
+  - type: input
+    id: arch
+    attributes:
+      label: 芯片
+      placeholder: Apple Silicon (M1/M2/M3/M4)
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected
+    attributes:
+      label: 期望的结果
+    validations:
+      required: true
+
+  - type: textarea
+    id: actual
+    attributes:
+      label: 实际的结果
+      description: 报错了就把错误信息整个贴上来
+    validations:
+      required: true
+
+  - type: textarea
+    id: repro
+    attributes:
+      label: 复现步骤
+      description: 一步一步写，别人才能复现
+      placeholder: |
+        1. 打开 Lodestar
+        2. 搜索 xxx
+        3. 出现 yyy
+    validations:
+      required: true
+
+  - type: textarea
+    id: extras
+    attributes:
+      label: 补充信息
+      description: 截图、搜索用的完整查询、外接盘型号等（选填）

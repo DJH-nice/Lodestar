@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: 使用问题 / 求助
+    url: https://gitee.com/dongjiahao0119/Lodestar/issues/new?labels=question
+    about: 只是想问怎么用、或者不确定是不是 bug 的，先在这里提
+  - name: Gitee 镜像仓库
+    url: https://gitee.com/dongjiahao0119/Lodestar
+    about: 同步用 Gitee 的看这里（两个平台的 issue 是分开的）

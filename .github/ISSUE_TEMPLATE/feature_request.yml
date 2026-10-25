@@ -1,0 +1,32 @@
+name: 功能建议
+description: 提一个想要的功能
+title: "[Feature] "
+labels: ["enhancement"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        描述**场景**比描述功能更重要 ——
+        有了场景，别人才能判断这个功能值不值得做。
+
+  - type: textarea
+    id: scenario
+    attributes:
+      label: 你在什么场景下需要它
+      description: 现在你是怎么解决的？这一步很关键
+      placeholder: 我经常要把某个盘上的文件……现在只能手动去访达里翻
+    validations:
+      required: true
+
+  - type: textarea
+    id: proposal
+    attributes:
+      label: 你期望怎么做
+    validations:
+      required: true
+
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: 现有的替代做法
+      description: 有没有别的工具能做到？它好在哪、差在哪
