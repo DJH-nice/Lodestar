@@ -211,6 +211,36 @@ except Exception as e:
     print('  ✗ 上传失败:', e)" 2>/dev/null || echo "  ✗ 上传失败（响应不是 JSON）"
 fi
 
+# ── 5. Issue 标签（尽力而为，失败不影响发布）──────────────
+# 【为什么要有】Issue 模板里引用了 bug / enhancement / question 三个标签，
+#   标签不存在时模板会**静默忽略**那个标签 → issue 进来就是一堆「无标签」。
+#   这里补建；已存在会返回 422，忽略即可。
+echo
+echo "=== Issue 标签 ==="
+make_label() {
+  local api="$1" owner="$2" repo="$3" token="$4" auth_header="$5" name="$6" color="$7" desc="$8"
+  if [ -n "$auth_header" ]; then
+    curl -sS -o /dev/null -X POST "$api/repos/$owner/$repo/labels" \
+      -H "$auth_header $token" -H "Content-Type: application/json" \
+      -d "{\"name\":\"$name\",\"color\":\"$color\",\"description\":\"$desc\"}" || true
+  else
+    curl -sS -o /dev/null -X POST "$api/repos/$owner/$repo/labels" \
+      --data-urlencode "access_token=$token" \
+      --data-urlencode "name=$name" \
+      --data-urlencode "color=$color" \
+      --data-urlencode "description=$desc" || true
+  fi
+}
+
+for spec in "bug:d73a4a:Something is not working" \
+            "enhancement:a2eeef:Feature request" \
+            "question:cc317c:Usage question"; do
+  name="${spec%%:*}"; rest="${spec#*:}"; color="${rest%%:*}"; desc="${rest#*:}"
+  make_label "$GH_API" "$GH_OWNER" "$GH_REPO" "$GH_TOKEN" "Authorization: Bearer" "$name" "$color" "$desc"
+  make_label "$GT_API" "$GT_OWNER" "$GT_REPO" "$GT_TOKEN" "" "$name" "$color" "$desc"
+done
+echo "  ✓ bug / enhancement / question（已存在则跳过）"
+
 unset GH_TOKEN GT_TOKEN
 echo
 echo "完成。核对："
