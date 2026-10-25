@@ -167,6 +167,22 @@ try: print(json.load(sys.stdin).get('id',''))
 except Exception: print('')" 2>/dev/null || true)
 if [ -z "$GH_ID" ]; then
   echo "✗ GitHub release 创建失败：$GH_RESP" >&2
+  # 【为什么这里再查一次】
+  #   403 "Resource not accessible by personal access token" 是最常见的失败原因
+  #   —— fine-grained token 少勾了权限、或没把本仓库选进 Repository access。
+  #   直接把 token 实际拿到的权限打出来，用户不用猜。
+  echo "  这枚 token 在本仓库的实际权限：" >&2
+  curl -sS -H "Authorization: Bearer $GH_TOKEN" "$GH_API/repos/$GH_OWNER/$GH_REPO" 2>/dev/null \
+    | python3 -c "import json,sys
+try:
+    d=json.load(sys.stdin)
+    p=d.get('permissions',{})
+    print('    push(写仓库)=%s  pull(读仓库)=%s  issues(管Issue)=%s' % (p.get('push'), p.get('pull'), p.get('issues')))
+    print('    → 需要 push=True 且 issues=True')
+    print('    → token 设置页：Repository access 选 Only select repositories 并勾上 Lodestar；')
+    print('      Permissions 里勾 Contents: Read and write + Issues: Read and write')
+except Exception as e:
+    print('    (读不到权限信息)', e)" >&2
 else
   echo "  release 已创建 (id=$GH_ID)"
   GH_UP=$(curl -sS -X POST "$GH_UPLOAD/repos/$GH_OWNER/$GH_REPO/releases/$GH_ID/assets?name=Lodestar.dmg" \
@@ -187,6 +203,7 @@ echo "=== Gitee ==="
 GT_RESP=$(curl -sS -X POST "$GT_API/repos/$GT_OWNER/$GT_REPO/releases" \
   --data-urlencode "access_token=$GT_TOKEN" \
   --data-urlencode "tag_name=$TAG" \
+  --data-urlencode "target_commitish=master" \
   --data-urlencode "name=Lodestar $TAG" \
   --data-urlencode "body=$NOTES" \
   --data-urlencode "prerelease=false")
@@ -219,17 +236,24 @@ echo
 echo "=== Issue 标签 ==="
 make_label() {
   local api="$1" owner="$2" repo="$3" token="$4" auth_header="$5" name="$6" color="$7" desc="$8"
+  local out
   if [ -n "$auth_header" ]; then
-    curl -sS -o /dev/null -X POST "$api/repos/$owner/$repo/labels" \
+    out=$(curl -sS -X POST "$api/repos/$owner/$repo/labels" \
       -H "$auth_header $token" -H "Content-Type: application/json" \
-      -d "{\"name\":\"$name\",\"color\":\"$color\",\"description\":\"$desc\"}" || true
+      -d "{\"name\":\"$name\",\"color\":\"$color\",\"description\":\"$desc\"}" 2>&1 || true)
   else
-    curl -sS -o /dev/null -X POST "$api/repos/$owner/$repo/labels" \
+    out=$(curl -sS -X POST "$api/repos/$owner/$repo/labels" \
       --data-urlencode "access_token=$token" \
       --data-urlencode "name=$name" \
       --data-urlencode "color=$color" \
-      --data-urlencode "description=$desc" || true
+      --data-urlencode "description=$desc" 2>&1 || true)
   fi
+  # 【为什么不再静默吞掉】已存在会返回 422（正常，重跑无害）；
+  #   但 403（token 缺 Issues 权限）也是「非 422」→ 得让人看见。
+  case "$out" in
+    *422*|*'"id"'*) : ;;
+    *) echo "    (标签 $name 没建成：${out:0:140})" ;;
+  esac
 }
 
 for spec in "bug:d73a4a:Something is not working" \
