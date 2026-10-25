@@ -108,7 +108,7 @@ mod tests {
     #[test]
     fn hidden_path_is_excluded() {
         assert!(path_is_excluded(Path::new(
-            "/Users/someone/.minimax/v2/sessions/a/messages.jsonl"
+            "/Users/someone/.cache/app/sessions/a/messages.jsonl"
         )));
     }
 

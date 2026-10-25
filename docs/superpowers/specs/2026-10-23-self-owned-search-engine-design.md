@@ -274,7 +274,7 @@ Rust 侧改动集中在 `search-core` + `commands.rs` 的 `search`/`rescan`/`rei
 | **M3 增量** | FSEvents → 脏目录 → 增量更新 | 文件变更到索引可见 ≤ 1s；增量耗时 < 5ms；无全量重扫 |
 | **M4 收口** | 移除 `shim/` 与 `src/`；重写 README / 致谢 / 手册 / AGENTS.md | `.app` ≤ 12M；无 ICU/GLib 依赖（`otool -L` 验证）；无 GPL 材料 |
 
-**M4 的删除动作要走 `mavis-trash <绝对路径>`**（不 `rm -rf`）。
+**M4 的删除动作要走 可恢复的删除工具（作者本机另有专用工具）**（不 `rm -rf`）。
 
 ### 与「性能不能弱」的对照（验收时逐条量）
 

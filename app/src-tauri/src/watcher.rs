@@ -910,10 +910,10 @@ pub fn apply_watch_list<T: WatchTarget>(
 ///   能达到**每秒几百条** → 几百 × 12.5µs ≈ 每秒几毫秒 CPU。
 ///   机器上别的程序越忙，后台常驻的 CPU 就越高。
 ///
-/// 【怎么快起来】第一次发现「`~/.minimax` 整个被排除」之后，
+/// 【怎么快起来】第一次发现「`~/.cache` 整个被排除」之后，
 ///   落在它下面的所有事件都**一次字符串比较**就跳过 —— 零 `stat`。
 ///   缓存条目会**很少**（浅层的祖先覆盖面最大）：
-///   `~/.minimax` 一个条目就罩住它下面所有会话日志。
+///   `~/.cache` 一个条目就罩住它下面所有会话日志。
 ///
 /// 【为什么不会漏索引】缓存里**只存确实被排除的目录**
 ///   （问过引擎、引擎说「排除」才存进来）
@@ -926,7 +926,7 @@ pub struct ExcludedDirCache {
 ///
 /// 【为什么要有上限】排除目录理论上可以很多（每个项目一个 `target/`）。
 ///   线性查找的代价是 O(条目数)，条目太多就白省了 —— 64 个足够罩住
-///   绝大多数真实场景（`~/Library`、`~/.minimax`、几个 `target/`）。
+///   绝大多数真实场景（`~/Library`、`~/.cache`、几个 `target/`）。
 ///
 /// 【为什么清空而不是「淘汰最旧的」】清空最简单，且**不影响正确性**
 ///   （只是命中率下降，下一次又会重新记上）。
@@ -992,8 +992,8 @@ fn indexable_paths(ev: &notify::Event, cache: &ExcludedDirCache) -> Vec<PathBuf>
 /// **最上层的**那个被排除的祖先（自己也算祖先）。
 ///
 /// 【为什么要「最上层」】缓存的收益全在**覆盖面**：
-///   缓存 `~/.minimax`（深 1）能罩住它下面**所有**子目录的事件；
-///   缓存 `~/.minimax/v2/sessions/<某个 id>`（深 4）只罩住那一小片。
+///   缓存 `~/.cache`（深 1）能罩住它下面**所有**子目录的事件；
+///   缓存 `~/.cache/v2/sessions/<某个 id>`（深 4）只罩住那一小片。
 ///   → 从**根往下**找第一个命中的 —— 那个就是覆盖面最大的。
 ///
 /// 【为什么从根往下找】`Path::ancestors()` 是「自己 → 根」，
@@ -1081,7 +1081,7 @@ pub fn spawn_watcher<R: Runtime>(app: &AppHandle<R>) {
                 //     · `~/Library/...`（引擎排除了，但 watcher 照样看得见）
                 //       典型触发者：**Lodestar 自己的 webview 数据**
                 //       （~/Library/WebKit/com.fsearch.macos/…）、Edge、百度网盘…
-                //     · `~/.minimax/...`（agent 的会话日志，一直在写）
+                //     · `~/.cache/...`（agent 的会话日志，一直在写）
                 //   这些路径**一个字节都不会进索引**，
                 //   却每次都换来一次**全量重扫**（$HOME 量级 1.7~2.4 秒），
                 //   而搜索与重扫共用**同一个 worker 线程**（严格串行）
@@ -1880,7 +1880,7 @@ mod tests {
             "/Users/someone/app/node_modules/pkg/index.js",
             "/Users/someone/app/src-tauri/target/debug/deps/libfoo.dylib",
             "/Users/someone/Library/WebKit/com.sextant.macos/x.db",
-            "/Users/someone/.minimax/v2/sessions/a/messages.jsonl",
+            "/Users/someone/.cache/app/sessions/a/messages.jsonl",
         ] {
             assert!(
                 indexable_paths(&mk(excluded), &cache).is_empty(),

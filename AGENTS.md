@@ -47,7 +47,10 @@ lodestar/
 
 ## 硬约束（违反即任务失败）
 
-1. **删文件必须用 `mavis-trash <绝对路径>`** —— `rm -rf`、glob 删除会被安全网关拦。
+1. **删文件优先用「可恢复」的删除**（macOS：移到回收站，如 `trash <路径>`）。
+   不可逆的 `rm -rf` / glob 删除要格外小心。
+   > 作者本机的 agent 运行时另有专用工具（`mavis-trash <绝对路径>`）——
+   > **在别的机器上没有这个工具**，用系统自带的可恢复删除即可。
 2. **未经明确同意不得 `brew install`。**
 3. **打包只能用 `bash app/scripts/bundle-app.sh`** —— 它带 `tauri/custom-protocol`
    feature 重编 + 一整套自检。**看到 `✓ 前端已嵌进二进制` 才算成功。**

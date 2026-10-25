@@ -18,7 +18,7 @@
 
 1. **上游 `src/` 一个字节都不许改。** 提交前必跑 `bash shim/check-upstream-pure.sh`。
 2. **FFI 契约的唯一真相是 `shim/fsearch_shim.h`。** 本计划**不碰** FFI、不碰 `fsearch-core` 的 `src/`（只加一个 `examples/` 探针）。
-3. **删文件必须用 `mavis-trash <绝对路径>`** —— `rm -f`、glob 删除会被安全网关拦。
+3. **删文件优先用可恢复的删除工具** —— `rm -f`、glob 删除会被安全网关拦。
 4. **未经明确同意不得 `brew install`。**
 5. **Rust 只拷贝 C 字符串，释放只走 `fs_result_free`**，绝不调 libc `free`。
 6. **Rust 侧搜索线程必须串行** —— 引擎 view 有状态。

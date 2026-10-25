@@ -446,7 +446,7 @@ lodestar/                          ← 新仓库（git 已初始化，1 次提�
 
 ### 10.1 通用红线
 
-1. **删文件必须 `mavis-trash <绝对路径>`** —— `rm -f`、glob 删除、`meson setup --wipe` 会被安全网关拦。
+1. **删文件优先用可恢复的删除工具** —— `rm -f`、glob 删除、`meson setup --wipe` 会被安全网关拦。
 2. **未经明确同意不得 `brew install`**。
 3. **改 `identifier` = 换设置目录，必须配迁移**：`settings::migrate_legacy_store()`
    （`app/src-tauri/src/settings.rs`），跑在 `setup()` 第一件事，幂等、只拷不删。
