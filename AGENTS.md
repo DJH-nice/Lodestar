@@ -141,6 +141,28 @@ lodestar/
 （基线提交 vs 当前分支，轮流各测一轮）—— 单次测量在这台机器上噪声能到 4 倍。
 详见 `docs/PROJECT-HANDOFF.md` 的「2026-10-25 性能复测」。
 
+**2026-10-25 另两项实测 —— 别再重复排查这两件事**：
+
+| 指标 | 实测 | 说明 |
+|---|---|---|
+| **唤起到窗口上屏** | **342~373ms**（中位 359） | **Rust 侧只占 2ms**（ensure 66µs + show 903µs + focus 883µs）→ 348ms 全在系统侧：窗口服务器合成 + **WKWebView 恢复渲染**（窗口隐藏时 WebKit 停止绘制）。与**窗口面积无关**（600×400 与 1040×700 一样）、与 **`set_focus` 无关**（跳过 focus 后 352.9ms vs 默认 353.0ms） |
+| **运行时内存** | **≈95MB**（四进程 footprint 之和） | 主进程 30MB（**引擎+索引只占 3.2MB**）/ WebKit GPU 21MB / 渲染 40~45MB / 网络 5.9MB。窗口显隐不影响，反复开关面板也不累积（连开 5 次稳定在 92~94MB） |
+
+**唤起延迟在 WKWebView 架构下无解** —— 曾试过「别 orderOut，把窗口挪到屏幕外」
+（窗口仍 visible → WebKit 继续渲染 → 实测只要 **5~12ms**，快 30 倍），
+但 **AppKit 会钳制窗口位置**（标题栏必须留一部分在屏幕上）：
+`set_position((-20000,-20000))` 返回 `Ok(())` 而**位置根本没变**。
+绕钳制的三条路都不通：私有符号 `CGSSetWindowOrigin` 在 macOS 15 已不存在、
+AX 移动要辅助功能权限、挪出去 + `alpha=0` 会挡屏幕边缘 40px（Dock 放左边时会被挡）。
+**要 10ms 级别的唤起，只能换掉 WebView**（= 重写整个前端）。
+
+**内存同理**：约 70MB 是 WKWebView 底座，改配置改不动 ——
+试过关掉窗口透明 + 窗口级毛玻璃，反而多占 5~10MB（已回退）。
+
+**量内存用 `footprint -p <pid>`**，不要用 `ps -o rss` 求和（会把 WebKit 共享页重复计）。
+WebKit 的三个 XPC 进程**不是主进程的子进程**（ppid=1），
+`pgrep -P` 认不出来，得**按启动时刻**认。
+
 **⚠️ 这张表以前有个错数字**：优化前写的「热缓存全量扫描 16~25ms，自研用 4 线程并行」是**错的** ——
 并行**从来没生效过**（扫描器按「根目录之间」并行，而默认索引根就是 `$HOME` 这一个 → 线程数被压成 1）。
 真实值是 62.8ms。现在改成「顶层子树分区 + 原子游标」才真的并行起来（21.1ms）。
@@ -184,6 +206,25 @@ lodestar/
 
 ## 正在做的工作
 
+**外接卷索引已完成并合入 master**（2026-10-25，合并提交 `611cf67`，
+分支 `feat/external-volume-index` 共 32 个提交）——
+插上 U 盘自动进索引、拔掉即移除、插回复用旧索引。
+**真机验收 8/9 通过**（#1 #2 #3 #4 #5 #6 #8 #9，在用户真实外接盘
+`/Volumes/软件` 上跑的，97,460 项），逐条证据见
+[`docs/superpowers/plans/2026-10-24-external-volume-indexing.md`](docs/superpowers/plans/2026-10-24-external-volume-indexing.md)
+的「真机验收清单」表。
+
+**改外接卷相关代码前必知的三个坑**：
+
+- **卷枚举用 `getfsstat` 的 macOS 3 参数形式** —— `getmntinfo` 在 macOS 上**必崩**。
+  判据是内核的 **`MNT_LOCAL` 位**（网络盘 smbfs/nfs 没有这个位），
+  比按类型字符串匹配可靠。
+- **索引档按根分文件**（`store.rs` v3，每根一个 `.bin`）——
+  插拔卷**不会**把家目录的档作废。
+- **卷的扫描绝不在搜索 worker 上做** —— `search-core/src/worker.rs` 是
+  单线程串行的（视图有状态），卷扫描会堵住搜索；
+  只有 `$HOME` 的全量重扫才留在 worker 上（21 ms）。
+
 **M3 已完成并合回 master**（2026-10-24，提交 `dd651eb`）——
 实时更新从「全量重扫」改成「脏路径 → 就地改索引」。
 剩下的是 **M4（收口）**，清单见 [`docs/PROJECT-HANDOFF.md`](docs/PROJECT-HANDOFF.md)：
@@ -192,13 +233,12 @@ lodestar/
 - ~~致谢面板还写着上游 FSearch 与 GPL 的说明~~ → **已完成**（现在写的是
   「引擎完全自研，早期版本用的上游 C 引擎已整体替换」，第三方清单另附）。
 - ~~`app/README.md` 里还有旧的上游构建步骤~~ → **已完成**（现在全是 Tauri/Vue 的）。
-- 打包验证、CI（cargo test + vitest + 打包自检）。
+- **README 重写** → **已完成**（按旧骨架重写 + 4 张真机截图重拍 +
+  性能数字逐项实测取证 —— 详见下面的「性能基线」）。
+- 打包验证 → **已完成**（合并后 `cargo test` 249 + `vitest` 278 全绿，
+  `bundle-app.sh` 自检全过）。**CI 没做**（仓库无远端）。
 
 **M2 的「补齐查询语法」已完成** —— 见下面的「语法表 = 实现」。
-
-⚠️ **外接卷索引**（插上 U 盘就能搜到里面的文件）的设计已定稿：
-[`docs/superpowers/specs/2026-10-24-external-volume-indexing-design.md`](docs/superpowers/specs/2026-10-24-external-volume-indexing-design.md)
-—— 实施计划见 `docs/superpowers/plans/2026-10-24-external-volume-indexing.md`。
 
 ## 语法表 = 实现（2026-10-24 起）
 
