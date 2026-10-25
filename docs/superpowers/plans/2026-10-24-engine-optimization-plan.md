@@ -1,6 +1,6 @@
 # 搜索引擎性能优化方案
 
-> 生成时间：2026-10-24 · 分支 `master` · 工作区 `/Users/dongjiahao/Projects/lodestar`
+> 生成时间：2026-10-24 · 分支 `master` · 工作区 `~/Projects/lodestar`
 > 关联设计：[`../specs/2026-10-23-self-owned-search-engine-design.md`](../specs/2026-10-23-self-owned-search-engine-design.md)
 > 本文**只有方案，没有代码改动**。所有数字都是实测（探针见 §6）。
 
@@ -14,7 +14,7 @@
 
 1. **上游已经不在链路上了。** Lodestar 用的是自研 Rust 引擎
    （`app/src-tauri/search-core/`），上游 FSearch 的 C 代码**一行都没进来**。
-   旧仓库 `/Users/dongjiahao/Downloads/fsearch-0.3.2` 只是**只读行为对照**。
+   旧仓库 `~/Downloads/fsearch-0.3.2` 只是**只读行为对照**。
 2. **就算在，也不许改。** 旧仓库的硬约束：`src/` 必须与原始 tarball **逐字节一致**
    （`bash shim/check-upstream-pure.sh` 会拦），平台差异只能靠编译参数 / 垫片头吸收。
 3. **改了也白改。** M4 的既定动作就是删掉 `src/` + `shim/` → 现在改上游 =
@@ -413,7 +413,7 @@ O(n·m)，且**每个字符都跑一遍完整的 NFD 流程**（92% 的折叠开
 | 真实扫描器火焰图 | `/tmp/scanprobe2/` | `sample` 抓 30 轮真实扫描 | `cd /tmp/scanprobe2 && cargo build --release && ./target/release/scanprobe2 30 &` 然后 `sample <pid> 6` |
 
 > `queryprobe` / `scanprobe2` 通过 **path 依赖**引用 `search-core`：
-> `search-core = { path = "/Users/dongjiahao/Projects/lodestar/app/src-tauri/search-core" }`
+> `search-core = { path = "~/Projects/lodestar/app/src-tauri/search-core" }`
 > → **不改它一行**，只调它的公开 API。
 
 ---

@@ -1,6 +1,6 @@
 # 外接卷索引设计（插上 U 盘就能搜到里面的文件）
 
-> 生成时间：2026-10-24 · 分支 `master` · 工作区 `/Users/dongjiahao/Projects/lodestar`
+> 生成时间：2026-10-24 · 分支 `master` · 工作区 `~/Projects/lodestar`
 > 决策来源：用户明确要求「Lodestar 目前只能扫描本机磁盘，插入硬盘就无法扫描了」
 > 配套实施计划：待本设计确认后另出 `plans/2026-10-24-external-volume-indexing.md`
 >

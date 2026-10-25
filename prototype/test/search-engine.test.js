@@ -41,8 +41,8 @@ const c = loadCore();
 const R = c.runSearch;
 
 console.log('\n【A】路径分词 —— 绝对路径不得被误判成正则');
-t('A1 "/Users/dongjiahao/java" 不应产生正则 token', () => {
-  eq(c.parseQuery('/Users/dongjiahao/java').filter(x => x.type === 're').length, 0, '正则 token 数:');
+t('A1 "~/java" 不应产生正则 token', () => {
+  eq(c.parseQuery('~/java').filter(x => x.type === 're').length, 0, '正则 token 数:');
 });
 t('A2 "/Volumes/Work/Code" 不应产生正则 token', () => {
   eq(c.parseQuery('/Volumes/Work/Code').filter(x => x.type === 're').length, 0);
@@ -55,8 +55,8 @@ t('A4 真正的正则仍应被识别为正则', () => {
   eq(toks.filter(x => x.type === 're').length, 1, '应识别 1 个正则:');
   eq(toks[0].val, '^log.*\\.txt$');
 });
-t('A5 "/Users/dongjiahao/" 应判为路径而非正则', () => {
-  const toks = c.parseQuery('/Users/dongjiahao/');
+t('A5 "~/" 应判为路径而非正则', () => {
+  const toks = c.parseQuery('~/');
   eq(toks.filter(x => x.type === 're').length, 0);
   truthy(toks.some(x => x.type === 'path'), '应含 path token');
 });

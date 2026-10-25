@@ -1,6 +1,6 @@
 # Lodestar —— 项目交接文档（新会话必读）
 
-> 生成时间：2026-10-23 · 分支 `master` · 工作区 `/Users/dongjiahao/Projects/lodestar`
+> 生成时间：2026-10-23 · 分支 `master` · 工作区 `~/Projects/lodestar`
 > 配套设计：[`docs/superpowers/specs/2026-10-23-self-owned-search-engine-design.md`](superpowers/specs/2026-10-23-self-owned-search-engine-design.md)
 > 目标读者：**新会话的 AI agent / 接手的人**。读完这一份就能接着干。
 
@@ -25,7 +25,7 @@
 （引擎是上游的 C 代码，GPL-2.0-or-later）。现在**自研引擎已落地并替换掉上游**：
 
 - 仓库里**一行上游代码都没有** → GPL 义务消失
-- 旧仓库留在 `/Users/dongjiahao/Downloads/fsearch-0.3.2`，仅作上游行为对照
+- 旧仓库留在 `~/Downloads/fsearch-0.3.2`，仅作上游行为对照
 
 ---
 
@@ -472,7 +472,7 @@ lodestar/                          ← 新仓库（git 已初始化，1 次提�
 
 ### 10.2 本项目特有
 
-- **上游 `src/` 已经不在仓库里了** —— 旧仓库 `/Users/dongjiahao/Downloads/fsearch-0.3.2`
+- **上游 `src/` 已经不在仓库里了** —— 旧仓库 `~/Downloads/fsearch-0.3.2`
   是**只读参考**，不要往里写东西。
 - **GPL 义务已经消失** —— 但**不要**因此以为可以抄上游的代码：
   上游的 query parser 是 GPL 代码，**能力对齐可以，代码不能抄**。

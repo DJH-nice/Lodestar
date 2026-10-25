@@ -32,7 +32,7 @@ app/
 │   ├── icons/                  tauri icon 生成的成品（32/128/128@2x/icns）
 │   └── tauri.conf.json         窗口/托盘/图标/打包配置
 ├── shared/                     syntax-tables.json · cheatsheet.json（单一真相）
-└── scripts/                    bundle-app.sh 等 12 个脚本
+└── scripts/                    bundle-app.sh 等 10 个脚本
 ```
 
 ---

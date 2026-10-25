@@ -1915,7 +1915,7 @@ git commit -m "feat(ui): 状态栏显示外接卷 + 卷变化自动重搜
 | 9 | U 盘上有同名文件 | 结果里能按路径区分 | 盘上放一个与本机同名的文件 → 结果里两条路径都在 | ✅ 搜 `PlistEdit` → **两条**：`/Volumes/软件/PlistEdit Pro.app` 与 `/Volumes/验收U盘/PlistEdit Pro.app`，各自标注自己的位置 |
 
 > **#9 的一个坑**：本机的 `/Applications/Docker.app` 搜不到 ——
-> **索引范围是 `$HOME`（`/Users/dongjiahao`），`/Applications` 在根目录下，不在范围内**。
+> **索引范围是 `$HOME`（`~`），`/Applications` 在根目录下，不在范围内**。
 > 验同名文件要用 `$HOME` 里的文件（本机用的是 `~/Applications/PlistEdit Pro.app`）。
 
 > **测试环境的三个卷**：

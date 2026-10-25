@@ -87,7 +87,7 @@ open app/src-tauri/target/release/bundle/macos/FSearch.app
 |---|---|---|---|
 | **A11** | 设置 → 打开「开机时自动在后台驻留」→ **注销 → 重新登录** | 登录后 FSearch **自动在后台驻留**：菜单栏有图标，**但不弹窗口**。<br>按 `⌥⇧K` 能唤起 | ☐ |
 | **A11b** | 托盘图标**看不看得到**（跟 A1 是一回事） | ⚠️ **编号提醒**：清单 v1 里「菜单栏图标出现」是 **A1**，**A11 是开机自启**。<br>本机 A1/A13 不合格 = 托盘图标不渲染（已知环境问题），**不是**开机自启的问题 —— 开机自启这条还没单独验（要注销重登） | ☐ |
-| **A16** | 手动两条启动路径各试一次：<br>① 直接双击 `.app`（不带参数）<br>② 用**绝对路径**跑（⚠️ 相对路径会因为 cwd 不对而报 `no such file or directory`）：<br>`/Users/dongjiahao/Downloads/fsearch-0.3.2/app/src-tauri/target/release/bundle/macos/FSearch.app/Contents/MacOS/fsearch-app --hidden` | ① **出窗口**<br>② **不出窗口**，但进程在（`pgrep -x fsearch-app` 有结果） | ☐ |
+| **A16** | 手动两条启动路径各试一次：<br>① 直接双击 `.app`（不带参数）<br>② 用**绝对路径**跑（⚠️ 相对路径会因为 cwd 不对而报 `no such file or directory`）：<br>`~/Downloads/fsearch-0.3.2/app/src-tauri/target/release/bundle/macos/FSearch.app/Contents/MacOS/fsearch-app --hidden` | ① **出窗口**<br>② **不出窗口**，但进程在（`pgrep -x fsearch-app` 有结果） | ☐ |
 | **A17** | 手删 `~/Library/LaunchAgents/FSearch.plist` → 重新打开设置面板 | 「开机时自动在后台驻留」开关**翻成「关」** —— 显示的是**系统真值**，不是设置文件里记的值 | ☐ |
 
 > 当前状态：`launchAtLogin: true`，`~/Library/LaunchAgents/FSearch.plist` 已存在（541 字节）。

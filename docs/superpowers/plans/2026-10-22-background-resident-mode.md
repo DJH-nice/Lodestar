@@ -2396,7 +2396,7 @@ FSearch 可以在后台常驻 —— 关掉窗口它不会退出，随时能叫�
 //!
 //! 用法：
 //! ```bash
-//! cd app/src-tauri && cargo run -p fsearch-core --example mem_probe -- /Users/dongjiahao
+//! cd app/src-tauri && cargo run -p fsearch-core --example mem_probe -- ~
 //! # 另一个终端：
 //! footprint -p <pid>
 //! ```

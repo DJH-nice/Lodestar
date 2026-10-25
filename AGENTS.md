@@ -14,7 +14,7 @@
 > **历史**：这个项目最早是「上游 FSearch 0.3.2 的 macOS 版」（GPL-2.0-or-later，
 > 引擎是上游的 C 代码）。2026-10-23 起**自研引擎替换掉了上游**，
 > 仓库里现在**一行上游代码都没有**，GPL 义务随之消失。
-> 旧仓库留在 `/Users/dongjiahao/Downloads/fsearch-0.3.2`，仅作上游行为对照。
+> 旧仓库留在 `~/Downloads/fsearch-0.3.2`，仅作上游行为对照。
 
 ## 目录结构
 
@@ -36,7 +36,7 @@ lodestar/
 │   │   │   └── worker.rs         串行搜索线程
 │   │   └── tests/              5 个护栏集成测试
 │   ├── shared/                 syntax-tables.json / cheatsheet.json
-│   └── scripts/                bundle-app.sh（打包唯一入口）等 12 个脚本
+│   └── scripts/                bundle-app.sh（打包唯一入口）等 10 个脚本
 ├── docs/
 │   ├── USER-GUIDE.md           用户手册（应用内「帮助 → 完整手册」渲染它）
 │   ├── PROJECT-HANDOFF.md      项目交接文档（背景与决策）
