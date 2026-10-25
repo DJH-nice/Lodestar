@@ -189,8 +189,9 @@ lodestar/
 剩下的是 **M4（收口）**，清单见 [`docs/PROJECT-HANDOFF.md`](docs/PROJECT-HANDOFF.md)：
 
 - UX 缺口：⌘K 命令面板、浅色主题、QuickLook、`~` 展开、MiB/GiB、可配置排除规则。
-- 致谢面板还写着上游 FSearch 与 GPL 的说明 → 要重写（引擎已自研，GPL 义务已消失）。
-- `app/README.md` 里还有旧的上游构建步骤 → 要重写。
+- ~~致谢面板还写着上游 FSearch 与 GPL 的说明~~ → **已完成**（现在写的是
+  「引擎完全自研，早期版本用的上游 C 引擎已整体替换」，第三方清单另附）。
+- ~~`app/README.md` 里还有旧的上游构建步骤~~ → **已完成**（现在全是 Tauri/Vue 的）。
 - 打包验证、CI（cargo test + vitest + 打包自检）。
 
 **M2 的「补齐查询语法」已完成** —— 见下面的「语法表 = 实现」。

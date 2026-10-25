@@ -979,6 +979,10 @@ async function onExportBookmarks() {
   panelError.value = null;
   try {
     const path = await saveFileDialog({
+      // 【为什么文件名还叫 fsearch-】
+      //   这是**早期版本**留下的名字。改了的话，老用户存的书签文件
+      //   就成了孤儿（app 找不到 → 书签「丢了」）—— 那比名字难看糟得多。
+      //   → 文件名保持不变，只在这里说明一下。
       defaultPath: "fsearch-bookmarks.json",
       filters: [{ name: "JSON", extensions: ["json"] }],
     });

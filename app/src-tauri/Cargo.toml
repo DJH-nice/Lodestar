@@ -30,7 +30,7 @@ tauri = { version = "2", features = ["macos-private-api", "tray-icon", "image-pn
 tauri-plugin-opener = "2"
 tauri-plugin-store = "2"
 tauri-plugin-dialog = "2"
-# 【全局快捷键】—— 在任何 app 里按 ⌥⌘Space 就能唤起 FSearch。
+# 【全局快捷键】—— 在任何 app 里按 ⌥⌘Space 就能唤起 Lodestar。
 # 插件的 Rust 侧 API（`app.global_shortcut()`）不需要前端 capability ——
 # 注册逻辑全在 Rust 侧（见 src/shortcut.rs）。
 tauri-plugin-global-shortcut = "2"

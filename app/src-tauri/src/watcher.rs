@@ -1150,7 +1150,7 @@ pub fn spawn_watcher<R: Runtime>(app: &AppHandle<R>) {
             let t_watched = Arc::clone(&watched);
             let t_count = Arc::clone(&auto_rescans);
             let spawned = std::thread::Builder::new()
-                .name("fsearch-watch".to_string())
+                .name("lodestar-watch".to_string())
                 .spawn(move || {
                     reconcile_loop(handle, watcher, t_signals, t_watched, t_count)
                 });

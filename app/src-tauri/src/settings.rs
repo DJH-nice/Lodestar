@@ -492,6 +492,19 @@ pub fn rebuild_engine<R: Runtime>(
     paths: &[String],
 ) -> Result<u32, String> {
     let mut resolved = effective_paths(paths);
+    // 【请求的目录必须存在】—— 打错字、或选的目录已经被删了 → **明确报错**。
+    //
+    //   ⚠️ 这一步必须在【加卷之前】做：
+    //   否则「一个不存在的目录」会被挂载着的卷**救活** →
+    //   reindex 静默成功、索引到的却是那个卷 —— 用户以为换成了新目录，
+    //   实际搜的是 U 盘。
+    //   （2026-10-25 性能复测时在真机上撞到：机器上挂着一个 DMG，
+    //     「reindex 到一个不存在的目录」居然返回了 Ok。）
+    for p in &resolved {
+        if !Path::new(p).is_dir() {
+            return Err(format!("索引目录不存在或不是目录：{p}"));
+        }
+    }
     // 【已挂载的卷要一起带上】换索引目录不该把 U 盘踢出索引 ——
     //   卷是**运行期**挂上来的（不在用户的设置里）→ 重建引擎时忘了带上
     //   → 新引擎里根本没有它 → 它的条目全没了（用户：换完目录 U 盘就搜不到了）。
@@ -1135,7 +1148,16 @@ mod tests {
 
         // ④ IndexState 也不该被启动线程覆盖（状态栏要报 reindex 那组）
         let snap = index_state.snapshot();
-        assert_eq!(snap.paths, vec![reindexed_str.clone()], "状态不该被启动线程覆盖");
+        // 【为什么不用 `assert_eq!(snap.paths, vec![...])`】
+        //   引擎索引的目录**除了用户选的**，还有**当前挂载着的外接卷**
+        //   （`rebuild_engine` 会把它们一起带上）→ 路径表的长度取决于机器状态。
+        //   → 断言「包含用户选的那个」+「不含别人的那个」，与机器状态无关 ✓
+        assert!(
+            snap.paths.contains(&reindexed_str),
+            "状态里应有 {:?} 这组路径，实际: {:?}",
+            reindexed_str,
+            snap.paths
+        );
         assert_eq!(snap.indexed, indexed, "条目数不该被启动线程覆盖");
         assert!(!snap.scanning, "不该还停在 scanning");
     }
@@ -1237,7 +1259,14 @@ mod tests {
              清了它，前端就会在引擎装好之前提前重搜一次（跑在旧引擎上）"
         );
         // 状态里的 paths/indexed 也不该被启动线程改动
-        assert_eq!(snap.paths, vec![reindexed_str.clone()], "状态不该被启动线程覆盖");
+        // 【为什么不用 `assert_eq!(snap.paths, vec![...])`】
+        //   路径表里还可能有**当前挂载着的外接卷**（rebuild_engine 会带上它们）
+        //   → 长度取决于机器状态 → 只断言「包含该包含的那条」
+        assert!(
+            snap.paths.contains(&reindexed_str),
+            "状态里应有 reindex 那组路径，实际: {:?}",
+            snap.paths
+        );
 
         // ⑥ 别人的扫描自己收尾 → 才清（这才是「有主权」的含义）
         assert!(index_state.end_scan(other_token), "当前令牌应该能结束这一趟");
@@ -1300,7 +1329,16 @@ mod tests {
             "放弃时必须放回**自己**的 scanning（否则卡在 true：状态栏永远「正在扫描…」）"
         );
         // 状态里的 paths/indexed 仍是**别人**那份
-        assert_eq!(snap.paths, vec![other_str.clone()], "状态不该被启动线程覆盖");
+        // 【为什么不用 `assert_eq!(snap.paths, vec![...])`】
+        //   引擎索引的目录**除了用户选的**，还有**当前挂载着的外接卷**
+        //   （`rebuild_engine` 会把它们一起带上）→ 路径表的长度取决于机器状态。
+        //   → 断言「包含用户选的那个」+「不含别人的那个」，与机器状态无关 ✓
+        assert!(
+            snap.paths.contains(&other_str),
+            "状态里应有 {:?} 这组路径，实际: {:?}",
+            other_str,
+            snap.paths
+        );
         assert_eq!(snap.indexed, other_indexed, "条目数不该被启动线程覆盖");
     }
 
@@ -1325,7 +1363,16 @@ mod tests {
         assert!(installed, "槽位是空的 → 启动线程应该装上");
         let snap = index_state.snapshot();
         assert!(!snap.scanning, "装完了 scanning 该归 false");
-        assert_eq!(snap.paths, vec![dir_str.clone()], "状态里的路径应与引擎一致");
+        // 【为什么不用 `assert_eq!(snap.paths, vec![...])`】
+        //   引擎索引的目录**除了用户选的**，还有**当前挂载着的外接卷**
+        //   （`rebuild_engine` 会把它们一起带上）→ 路径表的长度取决于机器状态。
+        //   → 断言「包含用户选的那个」+「不含别人的那个」，与机器状态无关 ✓
+        assert!(
+            snap.paths.contains(&dir_str),
+            "状态里应有 {:?} 这组路径，实际: {:?}",
+            dir_str,
+            snap.paths
+        );
         assert_eq!(snap.indexed, indexed, "状态里的条目数应与引擎一致");
     }
 

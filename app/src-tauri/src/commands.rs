@@ -1063,7 +1063,9 @@ mod tests {
 
         // ④ 状态仍然是【新引擎】那份
         let snap = index_state.snapshot();
-        assert_eq!(snap.paths, vec![b.clone()], "路径不该被旧结果覆盖");
+        // 【为什么不用 `assert_eq!`】路径表里还可能有挂载着的外接卷 → 长度取决于机器状态
+        assert!(snap.paths.contains(&b), "新引擎的路径应在状态里: {:?}", snap.paths);
+        assert!(!snap.paths.contains(&a), "旧引擎的路径不该还在: {:?}", snap.paths);
         assert_eq!(snap.indexed, indexed_b, "条目数不该被旧结果覆盖");
         assert!(!snap.scanning, "scanning 不该卡在 true");
     }
