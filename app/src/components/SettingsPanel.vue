@@ -434,7 +434,7 @@ async function apply() {
         <section class="set-block">
           <h3>索引目录</h3>
           <p class="set-hint">
-            留空 = 索引整个用户家目录（实测 8119 项 / 约 0.3 秒）。
+            留空 = 索引整个用户家目录（约 9000 项 / 约 0.3 秒）。
             换了目录会重新扫描一次。
           </p>
           <ul class="dir-list">
