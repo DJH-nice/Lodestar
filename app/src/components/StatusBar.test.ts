@@ -100,3 +100,131 @@ describe("StatusBar 的查询警告", () => {
     app.unmount();
   });
 });
+
+/**
+ * 外接卷的状态 —— 状态栏必须让用户看见「盘上的文件进索引了没有」。
+ *
+ *  【为什么要有这个测试】插上 U 盘后的首扫可能要几十秒，
+ *  界面上一个字都不显示的话，用户会以为功能坏了（而且是**静默**地坏）。
+ */
+describe("StatusBar 的外接卷状态", () => {
+  it("状态栏会显示外接卷的状态", () => {
+    const { app, host } = mountStatusBar({
+      scanning: false,
+      indexed: 120,
+      paths: ["/Users/me"],
+      error: null,
+      visible: true,
+      volumes: [
+        { path: "/Volumes/U盘", label: "U盘", phase: { state: "Ready" }, indexed: 42 },
+        {
+          path: "/Volumes/移动硬盘",
+          label: "移动硬盘",
+          phase: { state: "Indexing" },
+          indexed: 0,
+        },
+      ],
+    });
+    expect(host.textContent).toContain("U盘");
+    expect(host.textContent).toContain("42");
+    expect(host.textContent).toContain("正在索引");
+    app.unmount();
+  });
+
+  it("没有插盘时不显示卷那一行", () => {
+    const { app, host } = mountStatusBar({
+      scanning: false,
+      indexed: 120,
+      paths: ["/Users/me"],
+      error: null,
+    });
+    expect(host.querySelector(".sb-volume")).toBeNull();
+    app.unmount();
+  });
+
+  it("索引失败的卷要写明「索引失败」（不能只显示个卷名）", () => {
+    const { app, host } = mountStatusBar({
+      scanning: false,
+      indexed: 120,
+      paths: ["/Users/me"],
+      error: null,
+      volumes: [
+        {
+          path: "/Volumes/坏盘",
+          label: "坏盘",
+          phase: { state: "Failed", detail: "读不出来" },
+          indexed: 0,
+        },
+      ],
+    });
+    expect(host.textContent).toContain("坏盘");
+    expect(host.textContent).toContain("索引失败");
+    app.unmount();
+  });
+
+  it("索引失败的卷要把**原因**显示出来（不能只写「索引失败」）", () => {
+    // 【为什么】Rust 侧已经把原因传过来了（`detail`）→ 以前前端把它扔了 →
+    //   用户只看到「坏盘 · 索引失败」，完全不知道为什么。
+    //   这与项目自己的约定相悖（`.sb-error` 那条注释写着
+    //   「索引出错的原因必须显示出来」）。
+    const { app, host } = mountStatusBar({
+      scanning: false,
+      indexed: 120,
+      paths: ["/Users/me"],
+      error: null,
+      volumes: [
+        {
+          path: "/Volumes/坏盘",
+          label: "坏盘",
+          phase: { state: "Failed", detail: "读不出来" },
+          indexed: 0,
+        },
+      ],
+    });
+    expect(host.textContent).toContain("读不出来");
+    app.unmount();
+  });
+
+  it("索引失败的卷悬停时也要看到原因（不只是路径）", () => {
+    const { app, host } = mountStatusBar({
+      scanning: false,
+      indexed: 120,
+      paths: ["/Users/me"],
+      error: null,
+      volumes: [
+        {
+          path: "/Volumes/坏盘",
+          label: "坏盘",
+          phase: { state: "Failed", detail: "读不出来" },
+          indexed: 0,
+        },
+      ],
+    });
+    const el = host.querySelector(".sb-volume");
+    const title = el?.getAttribute("title") ?? "";
+    expect(title).toContain("读不出来");
+    app.unmount();
+  });
+
+  it("就绪的卷显示的是**这个卷自己**的条目数", () => {
+    // `volumes[].indexed` 的语义 = **这个卷自己**的条目数
+    // （不是整个索引的总数 —— 那个数在 `status.indexed` 里）。
+    const { app, host } = mountStatusBar({
+      scanning: false,
+      indexed: 8_150,
+      paths: ["/Users/me"],
+      error: null,
+      volumes: [
+        {
+          path: "/Volumes/U盘",
+          label: "U盘",
+          phase: { state: "Ready" },
+          indexed: 150,
+        },
+      ],
+    });
+    expect(host.textContent).toContain("U盘 · 150 项");
+    expect(host.textContent).not.toContain("8,150 项");
+    app.unmount();
+  });
+});

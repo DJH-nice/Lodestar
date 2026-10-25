@@ -801,3 +801,54 @@ describe("App.vue 的「刷新」按钮：进行中反馈", () => {
     app.unmount();
   });
 });
+
+/**
+ * 「外接卷变化」事件 —— 插上 / 拔掉 U 盘后结果表必须自动刷新。
+ *
+ *  【为什么不能靠轮询撞】
+ *   前端原来只靠「scanning 从 true 翻到 false」触发重搜，
+ *   而卷的附加 / 分离**不会**让 scanning 翻转 → 撞不出来 →
+ *   结果表里留着已经拔掉的盘的条目（用户最不能接受的那种：盘都拔了还搜得到）。
+ *
+ *  【事件名必须与 Rust 侧一致】
+ *   Rust 侧发的是 `"index-volumes-changed"`（`volumes::VOLUMES_CHANGED_EVENT`）。
+ *   名字对不上 → 事件发了但没人听 → 结果表永远不刷新（而且不报错）。
+ */
+describe("App.vue 的「外接卷变化」事件", () => {
+  it("收到 index-volumes-changed → 结果表重搜一次 + 状态栏显示卷", async () => {
+    const { app, host } = mountApp();
+    await flush();
+
+    // 挂载时结果表会搜一次（空查询）
+    const before = searchCalls.length;
+    expect(before).toBeGreaterThan(0);
+
+    const handler = eventHandlers["index-volumes-changed"];
+    expect(handler, "App.vue 必须监听 index-volumes-changed 事件").toBeTypeOf("function");
+
+    // 模拟后端发事件：U 盘挂上了，扫出了 42 项
+    handler!({
+      payload: {
+        scanning: false,
+        indexed: 142,
+        paths: ["/tmp", "/Volumes/U盘"],
+        error: null,
+        visible: true,
+        volumes: [
+          { path: "/Volumes/U盘", label: "U盘", phase: { state: "Ready" }, indexed: 42 },
+        ],
+      },
+    });
+    await flush();
+
+    expect(
+      searchCalls.length,
+      "卷变化之后必须重搜一次（否则结果表里还是旧结果）",
+    ).toBeGreaterThan(before);
+
+    // 状态栏也要跟着显示这个卷
+    expect(host.textContent).toContain("U盘");
+
+    app.unmount();
+  });
+});

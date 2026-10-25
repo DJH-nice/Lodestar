@@ -30,6 +30,14 @@ pub struct IndexStatus {
     ///   占位值取 `true` 是刻意的：**猜「不可见」会让状态栏停止更新**
     ///   （用户看得见的故障）；猜「可见」只是多跑一点轮询（性能问题，不是故障）。
     pub visible: bool,
+    /// 当前插着的**外接卷**及各自的状态。
+    ///
+    /// 【为什么是可选的】和 `visible` 一样：**填不出来的调用点一律给空列表** ——
+    ///   缺省 = 「没有卷」= 状态栏不显示卷那一行（不是故障）。
+    /// 【谁负责填】拿着 AppHandle 的调用点（`index_status` / `rescan` / `reindex` /
+    ///   `watcher::auto_rescan` / `volumes::notify_frontend`）——
+    ///   `IndexState` 自己不知道卷的事（那是 `VolumeState` 的职责）。
+    pub volumes: Vec<crate::volumes::VolumeStatus>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -302,6 +310,8 @@ pub async fn rescan<R: tauri::Runtime>(app: tauri::AppHandle<R>) -> Result<Index
     //   前端拿这个返回值更新状态栏，占位值会让状态栏里的「可见性」对不上真相。
     let mut st = app.state::<IndexState>().snapshot();
     st.visible = crate::lifecycle::window_visible(&app);
+    // 【卷的状态也要是真值】—— snapshot() 给的是空列表（它不知道卷的事）。
+    st.volumes = crate::volumes::volume_statuses(&app);
     Ok(st)
 }
 
@@ -362,6 +372,8 @@ pub fn index_status<R: tauri::Runtime>(
     //   所以这里必须是**窗口服务器的真相**，不能是我们自己的标志
     //   （`⌘H` 收走窗口时我们的标志不知道，窗口却真的看不见了）。
     s.visible = crate::lifecycle::window_visible(&app);
+    // 【卷的状态也要是真值】—— snapshot() 给的是空列表（它不知道卷的事）。
+    s.volumes = crate::volumes::volume_statuses(&app);
     s
 }
 
@@ -511,6 +523,8 @@ pub async fn reindex<R: tauri::Runtime>(
     // 【窗口可见性也要是真值】—— 同 `rescan`：snapshot() 给的是占位值 `true`。
     let mut st = state.snapshot();
     st.visible = crate::lifecycle::window_visible(&app);
+    // 【卷的状态也要是真值】—— 同 `rescan`：snapshot() 给的是空列表。
+    st.volumes = crate::volumes::volume_statuses(&app);
     Ok(st)
 }
 
@@ -1049,7 +1063,9 @@ mod tests {
 
         // ④ 状态仍然是【新引擎】那份
         let snap = index_state.snapshot();
-        assert_eq!(snap.paths, vec![b.clone()], "路径不该被旧结果覆盖");
+        // 【为什么不用 `assert_eq!`】路径表里还可能有挂载着的外接卷 → 长度取决于机器状态
+        assert!(snap.paths.contains(&b), "新引擎的路径应在状态里: {:?}", snap.paths);
+        assert!(!snap.paths.contains(&a), "旧引擎的路径不该还在: {:?}", snap.paths);
         assert_eq!(snap.indexed, indexed_b, "条目数不该被旧结果覆盖");
         assert!(!snap.scanning, "scanning 不该卡在 true");
     }

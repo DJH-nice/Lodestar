@@ -88,4 +88,88 @@ describe("sameIndexStatus", () => {
     delete (a as { visible?: boolean }).visible;
     expect(sameIndexStatus(a, st({ visible: false }))).toBe(false);
   });
+
+  /* ---- 外接卷 ----
+     【为什么 volumes 也要比】
+       卷的状态变化（插上 → 正在索引 → 扫完 → 就绪）**不会**让
+       `scanning` / `indexed` / `paths` 变 → 只比那几个字段的话，
+       状态栏会停在「没有卷」上（用户插了盘却看不见任何提示）。 */
+
+  it("volumes 变了（阶段 / 条数 / 卷增减）→ 判「不同」", () => {
+    const ready = st({
+      volumes: [
+        { path: "/Volumes/U盘", label: "U盘", phase: { state: "Ready" }, indexed: 42 },
+      ],
+    });
+    const indexing = st({
+      volumes: [
+        { path: "/Volumes/U盘", label: "U盘", phase: { state: "Indexing" }, indexed: 0 },
+      ],
+    });
+    const otherCount = st({
+      volumes: [
+        { path: "/Volumes/U盘", label: "U盘", phase: { state: "Ready" }, indexed: 43 },
+      ],
+    });
+    const more = st({
+      volumes: [
+        { path: "/Volumes/U盘", label: "U盘", phase: { state: "Ready" }, indexed: 42 },
+        { path: "/Volumes/硬盘", label: "硬盘", phase: { state: "Ready" }, indexed: 7 },
+      ],
+    });
+    expect(sameIndexStatus(ready, indexing)).toBe(false);
+    expect(sameIndexStatus(ready, otherCount)).toBe(false);
+    expect(sameIndexStatus(ready, more)).toBe(false);
+  });
+
+  it("失败原因变了 → 判「不同」", () => {
+    const a = st({
+      volumes: [
+        { path: "/Volumes/坏盘", label: "坏盘", phase: { state: "Failed", detail: "读不出来" }, indexed: 0 },
+      ],
+    });
+    const b = st({
+      volumes: [
+        { path: "/Volumes/坏盘", label: "坏盘", phase: { state: "Failed", detail: "权限不足" }, indexed: 0 },
+      ],
+    });
+    expect(sameIndexStatus(a, b)).toBe(false);
+  });
+
+  it("volumes 内容一样 → 判「相同」（不能白重渲染）", () => {
+    const a = st({
+      volumes: [
+        { path: "/Volumes/U盘", label: "U盘", phase: { state: "Ready" }, indexed: 42 },
+      ],
+    });
+    const b = st({
+      volumes: [
+        { path: "/Volumes/U盘", label: "U盘", phase: { state: "Ready" }, indexed: 42 },
+      ],
+    });
+    expect(sameIndexStatus(a, b)).toBe(true);
+  });
+
+  it("volumes 缺失时按「没有卷」算 —— 两边都缺 → 判「相同」", () => {
+    const a = st();
+    const b = st();
+    delete (a as { volumes?: unknown }).volumes;
+    delete (b as { volumes?: unknown }).volumes;
+    expect(sameIndexStatus(a, b)).toBe(true);
+  });
+
+  it("一个缺 volumes、一个有 volumes → 判「不同」", () => {
+    const a = st();
+    delete (a as { volumes?: unknown }).volumes;
+    expect(
+      sameIndexStatus(
+        a,
+        st({
+          volumes: [
+            { path: "/Volumes/U盘", label: "U盘", phase: { state: "Ready" }, indexed: 42 },
+          ],
+        }),
+      ),
+    ).toBe(false);
+  });
 });

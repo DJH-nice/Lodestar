@@ -402,7 +402,22 @@ pub fn effective_index_paths(settings: &Settings) -> Vec<PathBuf> {
         .collect()
 }
 
-/// 建引擎（**不碰全局状态**）—— 返回 (Searcher, indexed)。
+/// 索引档（store）目录 —— **唯一真相**。
+///
+/// 【为什么要抽出来】
+///   两个地方要用**同一个**目录：
+///   - 建引擎时**写**档（[`build_engine`]）
+///   - 卷附加时**读**档（`volumes::scan_volume` —— 插回来的盘要秒开）
+///   两处各写一遍 `app_config_dir().join("index")` → 改了一处忘了另一处 →
+///   卷永远命不中旧档 → 每次插上都要全量重扫（几十万文件 → 几十秒）。
+pub fn index_store_dir<R: Runtime>(app: &AppHandle<R>) -> Option<PathBuf> {
+    app.path()
+        .app_config_dir()
+        .ok()
+        .map(|dir| dir.join("index"))
+}
+
+/// 建引擎（**不碰全局状态**）—— 返回 (Searcher, indexed, 引擎实际的根)。
 ///
 /// 【参数是【已解析】的路径】空 → `$HOME` 的回退由调用方做
 /// （[`effective_paths`]）—— 这样「引擎索引哪些目录」与
@@ -421,16 +436,27 @@ pub fn effective_index_paths(settings: &Settings) -> Vec<PathBuf> {
 fn build_engine<R: Runtime>(
     app: &AppHandle<R>,
     resolved: &[String],
-) -> Result<(search_core::Searcher, u32), String> {
+) -> Result<(search_core::Searcher, u32, Vec<String>), String> {
     let refs: Vec<&Path> = resolved.iter().map(|p| Path::new(p)).collect();
-    let store_path = app
-        .path()
-        .app_config_dir()
-        .ok()
-        .map(|dir| dir.join("index.bin"));
+    // 索引档现在是「**每根一个文件**」的目录（见 search-core/src/store.rs 的 v3 格式）。
+    // ⚠️ 不能叫 index.bin —— 磁盘上那个 3.4MB 的旧 v2 档还占着这个名字，
+    // 建目录会失败 → 档永远写不进去 → 每次冷启动都静默地全量重扫。
+    let store_dir = index_store_dir(app);
     let (engine, indexed) =
-        search_core::Engine::new_with_store(&refs, store_path).map_err(|e| e.to_string())?;
-    Ok((search_core::Searcher::new(engine), indexed))
+        search_core::Engine::new_with_store(&refs, store_dir).map_err(|e| e.to_string())?;
+    // 【为什么报「引擎实际的根」，而不是请求的那份】
+    //   引擎会**静默丢弃嵌套根**（$HOME 与 $HOME/Documents → 只留前者）——
+    //   请求的路径表与引擎实际根**不一致** →
+    //     - 多一路**冗余**的 FSEvents 监听（`watcher.rs` 的 `desired_watch_dirs`
+    //       读的就是状态里的这一份）；
+    //     - 状态栏显示的目录数也不对。
+    //   → 状态里报**引擎实际**的那份（唯一真相）。
+    let roots: Vec<String> = engine
+        .roots()
+        .iter()
+        .map(|p| p.to_string_lossy().into_owned())
+        .collect();
+    Ok((search_core::Searcher::new(engine), indexed, roots))
 }
 
 /// 重建引擎并替换掉全局句柄。**阻塞** —— 必须在后台线程跑。
@@ -465,8 +491,34 @@ pub fn rebuild_engine<R: Runtime>(
     app: &AppHandle<R>,
     paths: &[String],
 ) -> Result<u32, String> {
-    let resolved = effective_paths(paths);
-    let (searcher, indexed) = build_engine(app, &resolved)?;
+    let mut resolved = effective_paths(paths);
+    // 【请求的目录必须存在】—— 打错字、或选的目录已经被删了 → **明确报错**。
+    //
+    //   ⚠️ 这一步必须在【加卷之前】做：
+    //   否则「一个不存在的目录」会被挂载着的卷**救活** →
+    //   reindex 静默成功、索引到的却是那个卷 —— 用户以为换成了新目录，
+    //   实际搜的是 U 盘。
+    //   （2026-10-25 性能复测时在真机上撞到：机器上挂着一个 DMG，
+    //     「reindex 到一个不存在的目录」居然返回了 Ok。）
+    for p in &resolved {
+        if !Path::new(p).is_dir() {
+            return Err(format!("索引目录不存在或不是目录：{p}"));
+        }
+    }
+    // 【已挂载的卷要一起带上】换索引目录不该把 U 盘踢出索引 ——
+    //   卷是**运行期**挂上来的（不在用户的设置里）→ 重建引擎时忘了带上
+    //   → 新引擎里根本没有它 → 它的条目全没了（用户：换完目录 U 盘就搜不到了）。
+    // 【枚举失败就不要乱改根列表】拿不到清单时保持原样 ——
+    //   宁可少索引一个卷，也不能把用户正在用的根踢掉。
+    if let Ok(list) = crate::volumes::mounted_local_volumes() {
+        for v in list {
+            let s = v.to_string_lossy().into_owned();
+            if !resolved.contains(&s) {
+                resolved.push(s);
+            }
+        }
+    }
+    let (searcher, indexed, actual_roots) = build_engine(app, &resolved)?;
     let new_searcher = std::sync::Arc::new(searcher);
     let state = app.state::<std::sync::Mutex<Option<std::sync::Arc<search_core::Searcher>>>>();
     // 【索引状态也要从 app 拿】—— 它跟引擎句柄一样是全局的一份
@@ -475,10 +527,10 @@ pub fn rebuild_engine<R: Runtime>(
     // 旧 Arc 在这里被 drop（join 旧 worker 线程 + fs_engine_free）
     *guard = Some(new_searcher);
     // 【同一把锁内提交状态】—— 装引擎 → 递增代次 → 提交，一步到位。
-    // paths 用的是**已解析**的那一份（和引擎索引的目录一致）。
+    // paths 用的是**引擎实际**的那一份（引擎会丢弃嵌套根 → 请求的那份可能更多）。
     // 【不动 scanning】—— scanning 归**持令牌的那一方**管：
     //   reindex 命令自己 begin() 拿到令牌，收尾时自己 end_scan(token)。
-    index_state.commit_new_engine(resolved, indexed);
+    index_state.commit_new_engine(actual_roots, indexed);
     Ok(indexed)
 }
 
@@ -569,7 +621,7 @@ pub fn rebuild_engine_if_absent<R: Runtime>(
         if let Some(hook) = take_build_hook() {
             hook();
         }
-        let (searcher, indexed) = build_engine(app, &resolved)?;
+        let (searcher, indexed, actual_roots) = build_engine(app, &resolved)?;
 
         // ③ 同一把锁：再判空 → 装上 + 提交状态
     let state = app.state::<std::sync::Mutex<Option<std::sync::Arc<search_core::Searcher>>>>();
@@ -583,10 +635,10 @@ pub fn rebuild_engine_if_absent<R: Runtime>(
     }
     *guard = Some(std::sync::Arc::new(searcher));
     // 【同一把锁内提交状态】—— 判空 → 装引擎 → 提交状态，一步到位。
-    // paths 用的是**已解析**的那一份（和引擎索引的目录一致）。
+    // paths 用的是**引擎实际**的那一份（引擎会丢弃嵌套根 → 请求的那份可能更多）。
     // 【递增引擎代次】—— 换引擎了 → 代次 +1（M1，见 `index_state.rs`）。
     // 【不动 scanning】—— 收尾归 run_scan_blocking。
-    index_state.commit_new_engine(resolved, indexed);
+    index_state.commit_new_engine(actual_roots, indexed);
     // ④ 续：自己的扫描结束（scanning 由 run_scan_blocking 管的令牌持有者负责）
     // 【放在槽位锁释放之后】—— end_scan 拿的是 IndexState 自己的锁，
     //   与槽位锁不是同一把 → 不会死锁（锁序：槽位锁 → IndexState 锁）。
@@ -1096,7 +1148,16 @@ mod tests {
 
         // ④ IndexState 也不该被启动线程覆盖（状态栏要报 reindex 那组）
         let snap = index_state.snapshot();
-        assert_eq!(snap.paths, vec![reindexed_str.clone()], "状态不该被启动线程覆盖");
+        // 【为什么不用 `assert_eq!(snap.paths, vec![...])`】
+        //   引擎索引的目录**除了用户选的**，还有**当前挂载着的外接卷**
+        //   （`rebuild_engine` 会把它们一起带上）→ 路径表的长度取决于机器状态。
+        //   → 断言「包含用户选的那个」+「不含别人的那个」，与机器状态无关 ✓
+        assert!(
+            snap.paths.contains(&reindexed_str),
+            "状态里应有 {:?} 这组路径，实际: {:?}",
+            reindexed_str,
+            snap.paths
+        );
         assert_eq!(snap.indexed, indexed, "条目数不该被启动线程覆盖");
         assert!(!snap.scanning, "不该还停在 scanning");
     }
@@ -1198,7 +1259,14 @@ mod tests {
              清了它，前端就会在引擎装好之前提前重搜一次（跑在旧引擎上）"
         );
         // 状态里的 paths/indexed 也不该被启动线程改动
-        assert_eq!(snap.paths, vec![reindexed_str.clone()], "状态不该被启动线程覆盖");
+        // 【为什么不用 `assert_eq!(snap.paths, vec![...])`】
+        //   路径表里还可能有**当前挂载着的外接卷**（rebuild_engine 会带上它们）
+        //   → 长度取决于机器状态 → 只断言「包含该包含的那条」
+        assert!(
+            snap.paths.contains(&reindexed_str),
+            "状态里应有 reindex 那组路径，实际: {:?}",
+            snap.paths
+        );
 
         // ⑥ 别人的扫描自己收尾 → 才清（这才是「有主权」的含义）
         assert!(index_state.end_scan(other_token), "当前令牌应该能结束这一趟");
@@ -1261,7 +1329,16 @@ mod tests {
             "放弃时必须放回**自己**的 scanning（否则卡在 true：状态栏永远「正在扫描…」）"
         );
         // 状态里的 paths/indexed 仍是**别人**那份
-        assert_eq!(snap.paths, vec![other_str.clone()], "状态不该被启动线程覆盖");
+        // 【为什么不用 `assert_eq!(snap.paths, vec![...])`】
+        //   引擎索引的目录**除了用户选的**，还有**当前挂载着的外接卷**
+        //   （`rebuild_engine` 会把它们一起带上）→ 路径表的长度取决于机器状态。
+        //   → 断言「包含用户选的那个」+「不含别人的那个」，与机器状态无关 ✓
+        assert!(
+            snap.paths.contains(&other_str),
+            "状态里应有 {:?} 这组路径，实际: {:?}",
+            other_str,
+            snap.paths
+        );
         assert_eq!(snap.indexed, other_indexed, "条目数不该被启动线程覆盖");
     }
 
@@ -1286,7 +1363,16 @@ mod tests {
         assert!(installed, "槽位是空的 → 启动线程应该装上");
         let snap = index_state.snapshot();
         assert!(!snap.scanning, "装完了 scanning 该归 false");
-        assert_eq!(snap.paths, vec![dir_str.clone()], "状态里的路径应与引擎一致");
+        // 【为什么不用 `assert_eq!(snap.paths, vec![...])`】
+        //   引擎索引的目录**除了用户选的**，还有**当前挂载着的外接卷**
+        //   （`rebuild_engine` 会把它们一起带上）→ 路径表的长度取决于机器状态。
+        //   → 断言「包含用户选的那个」+「不含别人的那个」，与机器状态无关 ✓
+        assert!(
+            snap.paths.contains(&dir_str),
+            "状态里应有 {:?} 这组路径，实际: {:?}",
+            dir_str,
+            snap.paths
+        );
         assert_eq!(snap.indexed, indexed, "状态里的条目数应与引擎一致");
     }
 

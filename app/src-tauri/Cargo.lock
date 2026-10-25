@@ -2113,6 +2113,7 @@ dependencies = [
 name = "lodestar-app"
 version = "0.1.0"
 dependencies = [
+ "libc",
  "notify",
  "search-core",
  "serde",

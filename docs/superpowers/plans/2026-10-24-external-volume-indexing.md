@@ -4,9 +4,9 @@
 
 **Goal:** 让 Lodestar 在插入外接盘（U 盘 / 移动硬盘）后自动把盘上的文件纳入索引，拔盘后立刻从索引里移除，重新插入时复用旧索引并后台刷新。
 
-**Architecture:** 把「索引根目录」从建引擎时定死的常量变成**运行时可增删**的一等公民 —— 引擎新增 `attach_root` / `detach_root`，索引档改成**每个根一个文件**（插拔卷不再作废 $HOME 的档），新增 `src/volumes.rs` 用 `getmntinfo` 每秒枚举 `/Volumes` 下的本地外接卷并驱动附加/分离。
+**Architecture:** 把「索引根目录」从建引擎时定死的常量变成**运行时可增删**的一等公民 —— 引擎新增 `attach_root` / `detach_root`，索引档改成**每个根一个文件**（插拔卷不再作废 $HOME 的档），新增 `src/volumes.rs` 用 `getfsstat` 每秒枚举 `/Volumes` 下的本地外接卷并驱动附加/分离。
 
-**Tech Stack:** Rust 1.90 · `libc`（`getmntinfo`，已在 lock 文件里，不新增下载）· Tauri v2 · Vue 3 + TypeScript · `cargo test` / `vitest`
+**Tech Stack:** Rust 1.90 · `libc`（`getfsstat`，已在 lock 文件里，不新增下载）· Tauri v2 · Vue 3 + TypeScript · `cargo test` / `vitest`
 
 **配套设计文档：** [`docs/superpowers/specs/2026-10-24-external-volume-indexing-design.md`](../specs/2026-10-24-external-volume-indexing-design.md)
 
@@ -21,7 +21,7 @@
 | C1 | **删文件必须用 `mavis-trash <绝对路径>`** —— `rm -rf` / glob 删除会被安全网关拦 |
 | C2 | **未经明确同意不得 `brew install`** |
 | C3 | **Rust 侧搜索线程必须串行**（`search-core/src/worker.rs` 单线程 + 单 mpsc 通道）—— 视图有状态，排队是**正确性**要求 |
-| C4 | **扫描绝不在搜索 worker 上做** —— worker 只做「整份替换」这种微秒级操作。30 万文件的盘扫一次要几十秒，堵在 worker 上 = 几十秒搜不动 |
+| C4 | **卷的扫描绝不在搜索 worker 上做** —— worker 只做「整份替换」这种微秒级操作。30 万文件的盘扫一次要几十秒，堵在 worker 上 = 几十秒搜不动。（$HOME 的**全量重扫**例外：M2 已把它优化到 21.1ms，留在 worker 上不值得再挪 —— 见开头「与设计文档的偏差」第 ④ 条） |
 | C5 | **路径归属判定必须用 `Path::starts_with`（组件级）** —— 字符串前缀会让 `/a/bc` 被 `/a/b` 命中 → 漏索引 |
 | C6 | **CSS 颜色只能用 `:root` 里已有的令牌**（`--fg-3` / `--warn` / `--success` / `--accent` …）；`z-index` 走 `--z-*` 那一族 |
 | C7 | **打包只能用 `bash app/scripts/bundle-app.sh`** —— 自检里看到 `✓ 前端已嵌进二进制` 才算成功 |
@@ -155,7 +155,61 @@ Expected: 编译错误 —— `cannot find function save_root in this scope`（�
 
 - [ ] **Step 3: 实现**
 
-在 `app/src-tauri/search-core/src/store.rs` 里，**保留**现有的 `serialize` / `save` / `load`（Task 2 才会切过去），**新增**下面这些：
+在 `app/src-tauri/search-core/src/store.rs` 里，**保留**现有的 `serialize` / `save` / `load`（Task 2 才会切过去），**新增**下面这些。
+
+⚠️ **不要把条目读写逻辑抄两遍** —— v2 的 `serialize` 与新的 `serialize_root`
+都要写同样的字段。**先抽出两个共享 helper**，两套格式各自调用它们：
+
+```rust
+/// 写一条条目（v2 / v3 两种格式的**条目部分完全一样**）。
+fn write_entry(buf: &mut Vec<u8>, e: &IndexEntry) {
+    write_str(buf, &e.name);
+    write_str(buf, &e.path);
+    write_str(buf, &e.dir);
+    write_str(buf, &e.extension);
+    write_str(buf, &e.folded_name);
+    write_str(buf, &e.folded_path);
+    buf.extend_from_slice(&e.size.to_le_bytes());
+    buf.extend_from_slice(&e.mtime.to_le_bytes());
+    let mut flags = 0u8;
+    if e.is_folder {
+        flags |= 1;
+    }
+    buf.push(flags);
+    buf.extend_from_slice(&e.depth.to_le_bytes());
+    buf.extend_from_slice(&e.child_count.to_le_bytes());
+    buf.extend_from_slice(&e.child_file_count.to_le_bytes());
+    buf.extend_from_slice(&e.child_folder_count.to_le_bytes());
+}
+
+/// 读一条条目（`write_entry` 的逆操作）。
+fn read_entry(r: &mut Reader<'_>) -> Option<IndexEntry> {
+    let name = r.string()?;
+    let path = r.string()?;
+    let dir = r.string()?;
+    let extension = r.string()?;
+    let folded_name = r.string()?;
+    let folded_path = r.string()?;
+    let size = r.i64()?;
+    let mtime = r.i64()?;
+    let flags = r.u8()?;
+    let depth = r.u32()?;
+    let child_count = r.u32()?;
+    let child_file_count = r.u32()?;
+    let child_folder_count = r.u32()?;
+    Some(IndexEntry {
+        name, path, dir, extension, folded_name, folded_path,
+        size, mtime,
+        is_folder: flags & 1 != 0,
+        depth, child_count, child_file_count, child_folder_count,
+    })
+}
+```
+
+然后 `serialize`（v2）与 `serialize_root`（v3）各自只写自己的**头**，
+条目部分都调 `write_entry`；`parse`（v2）与 `parse_root`（v3）同理用 `read_entry`。
+
+**新增这些**：
 
 ```rust
 /// 格式版本。
@@ -213,23 +267,7 @@ pub fn serialize_root(root: &Path, entries: &[IndexEntry]) -> Vec<u8> {
     write_str(&mut buf, &root.to_string_lossy());
     buf.extend_from_slice(&(entries.len() as u32).to_le_bytes());
     for e in entries {
-        write_str(&mut buf, &e.name);
-        write_str(&mut buf, &e.path);
-        write_str(&mut buf, &e.dir);
-        write_str(&mut buf, &e.extension);
-        write_str(&mut buf, &e.folded_name);
-        write_str(&mut buf, &e.folded_path);
-        buf.extend_from_slice(&e.size.to_le_bytes());
-        buf.extend_from_slice(&e.mtime.to_le_bytes());
-        let mut flags = 0u8;
-        if e.is_folder {
-            flags |= 1;
-        }
-        buf.push(flags);
-        buf.extend_from_slice(&e.depth.to_le_bytes());
-        buf.extend_from_slice(&e.child_count.to_le_bytes());
-        buf.extend_from_slice(&e.child_file_count.to_le_bytes());
-        buf.extend_from_slice(&e.child_folder_count.to_le_bytes());
+        write_entry(&mut buf, e);
     }
     buf
 }
@@ -271,25 +309,7 @@ fn parse_root(buf: &[u8]) -> Option<(String, Vec<IndexEntry>)> {
     let count = r.u32()? as usize;
     let mut entries = Vec::with_capacity(count);
     for _ in 0..count {
-        let name = r.string()?;
-        let path = r.string()?;
-        let dir = r.string()?;
-        let extension = r.string()?;
-        let folded_name = r.string()?;
-        let folded_path = r.string()?;
-        let size = r.i64()?;
-        let mtime = r.i64()?;
-        let flags = r.u8()?;
-        let depth = r.u32()?;
-        let child_count = r.u32()?;
-        let child_file_count = r.u32()?;
-        let child_folder_count = r.u32()?;
-        entries.push(IndexEntry {
-            name, path, dir, extension, folded_name, folded_path,
-            size, mtime,
-            is_folder: flags & 1 != 0,
-            depth, child_count, child_file_count, child_folder_count,
-        });
+        entries.push(read_entry(&mut r)?);
     }
     Some((root, entries))
 }
@@ -924,6 +944,29 @@ worker 的落盘触发那段改成：
                     }
 ```
 
+#### ⚠️ 追加要求（Task 2 的评审带出来的）：**只重写变了的根**
+
+上面那段把**所有**根的档都重写一遍 → 插着一个 10 万文件的 U 盘时，
+每次落盘周期要重写 \$HOME 的 3.4MB **加上** U 盘那份十几 MB ——
+而 \$HOME 那份**根本没变**。
+
+**要改成**：只提交**变了**的根。
+
+- 「哪些根变了」从哪来？`ChangeSet.paths`（`search-core/src/incremental.rs`：`pub paths: Vec<PathBuf>`）
+  → 把变化路径映射回它所属的根。
+- 映射用 `Engine::root_pairs()`（索引空间根 ↔ 真实路径根）—— FSEvents 报的是**真实路径**，
+  索引里的路径是按索引空间拼的，两边要靠它对上。
+- **落盘槽本身不用改**：它是「每根一份最新快照」的覆盖语义 ——
+  **没提交的根，它磁盘上的档本来就是对的** ✓（不提交 ≠ 删掉）。
+
+⚠️ 找不到归属根的变化路径（根被摘掉了、或路径在所有根之外）→ 保守处理：
+**那个根也要重写**（宁可多写，不能写错）。
+
+> 【为什么这条值得单独做】落盘是**每 2 秒**一次的后台动作。
+> 插着 U 盘时，每次都重写十几 MB → 光 I/O 就吃掉几个百分点 CPU。
+> 「每根一个档」的**读侧**隔离（插拔卷不再作废 \$HOME 的档）在 Task 1 就做到了；
+> **写侧**隔离在这里补齐 —— 两边合起来才是「插拔卷不牵连 \$HOME」。
+
 - [ ] **Step 5: 删掉 v2 那套 store 函数**
 
 `app/src-tauri/search-core/src/store.rs` 里，`serialize` / `save` / `load` / `parse`（v2 的）
@@ -972,7 +1015,7 @@ git commit -m "feat(worker): 支持附加/分离根目录 + 落盘改成 per 根
 - Produces:
   ```rust
   // src/volumes.rs
-  pub fn mounted_local_volumes() -> Vec<PathBuf>;
+  pub fn mounted_local_volumes() -> Result<Vec<PathBuf>, String>;   // ★ 失败要能分辨
   pub fn filter_local_volumes(mounts: &[(PathBuf, u32)]) -> Vec<PathBuf>;   // 纯函数，可测
   ```
   （Task 5 用它们）
@@ -982,7 +1025,7 @@ git commit -m "feat(worker): 支持附加/分离根目录 + 落盘改成 per 根
 `app/src-tauri/Cargo.toml` 的 `[dependencies]` 里加一行：
 
 ```toml
-# 【为什么加它】枚举挂载点要用 `getmntinfo`（macOS 的标准系统调用）。
+# 【为什么加它】枚举挂载点要用 `getfsstat`（macOS 的标准系统调用）。
 # `libc` 已经在 lock 文件里（search-core 用了）→ **不新增下载**。
 libc = "0.2"
 ```
@@ -994,11 +1037,17 @@ libc = "0.2"
 ```rust
 //! 外接卷的枚举与监控 —— **插上 U 盘就能搜到里面的文件**。
 //!
-//! 【为什么用 `getmntinfo` 而不是别的】
-//!   macOS 的外接盘挂在 `/Volumes/<卷名>`。系统调用 `getmntinfo` 能一次列出
+//! 【为什么用 `getfsstat` 而不是别的】
+//!   macOS 的外接盘挂在 `/Volumes/<卷名>`。系统调用 `getfsstat` 能一次列出
 //!   **所有**挂载点 + 它们的标志位 —— 一次调用、零依赖、不需要回调。
 //!   （`NSFileManager` 要 objc 绑定；`Disk Arbitration` 是回调式的，
 //!   要挂 RunLoop —— 对「每秒轮询」这个形态都不划算。）
+//!
+//!   ⚠️ **为什么不是 `getmntinfo`** —— 那是 **FreeBSD 语义**，在 macOS 上**必崩**：
+//!   ① 第一次调用传 NULL 问个数 → 直接 **SIGSEGV**（实测复现）；
+//!   ② 它把结果写进**库自己的静态对象**（不是我们的缓冲区）→ 不是线程安全的。
+//!   `getfsstat` 是**两段式、缓冲区归调用方**：第一次问个数、第二次填我们自己的
+//!   `Vec` → 下面那段 unsafe 的安全理由**字面成立**。
 
 use std::path::{Path, PathBuf};
 
@@ -1015,19 +1064,37 @@ const MNT_LOCAL: u32 = libc::MNT_LOCAL as u32;
 ///   1. `MNT_LOCAL` —— 本地磁盘（排除 smbfs / nfs / afpfs / webdav）
 ///   2. 挂载点是 `/Volumes` 的**直接子目录**（排除 `/` 与 `/System/Volumes/*`）
 ///   3. 不是 `/Volumes/Macintosh HD` 那个指向 `/` 的符号链接
-pub fn mounted_local_volumes() -> Vec<PathBuf> {
-    // 【getmntinfo 的两段式调用】第一次只问「有多少个」，
-    // 第二次才把内容填进我们给的数组里。
+pub fn mounted_local_volumes() -> Result<Vec<PathBuf>, String> {
+    // 【getfsstat 的两段式调用】第一次只问「有多少个」，
+    // 第二次才把内容填进我们给的数组里（缓冲区是**我们自己的** Vec → 线程安全）。
     unsafe {
-        let count = libc::getmntinfo(std::ptr::null_mut(), libc::MNT_NOWAIT);
+        // ⚠️ **macOS 的签名是 3 参数**：`getfsstat(buf, bufsize, flags)`
+        //   —— 第二个参数是**字节数**（不是元素个数，也不是 `&mut size`）。
+        //   （BSD/Linux 那边才是 `getfsstat64(buf, &mut bufsize)` 那个 2 参数形式 ——
+        //   在 macOS 上照抄会编译不过，或者更糟：传错语义。）
+        let count = libc::getfsstat(std::ptr::null_mut(), 0, libc::MNT_NOWAIT);
         if count <= 0 {
-            return Vec::new();
+            // 【为什么失败要能分辨】调用方（监控线程）靠这个函数的**集合变化**
+            //   判断卷出现/消失。空列表 = 「没有卷」；而系统调用失败**也是**空列表
+            //   → 会被误判成「所有卷都被拔了」→ 触发不必要的拆索引，
+            //     下一秒又挂回来 → **U 盘被全量重扫一遍**（十几秒）。
+            //   → 失败走 Err，让调用方**这一轮什么都不做**。
+            return Err(format!(
+                "getfsstat 问个数失败（errno={:?}）",
+                std::io::Error::last_os_error()
+            ));
         }
         let mut buf = vec![std::mem::zeroed::<libc::statfs>(); count as usize];
-        let count = libc::getmntinfo(buf.as_mut_ptr() as *mut *mut libc::statfs, libc::MNT_NOWAIT);
-        if count <= 0 {
-            return Vec::new();
+        let bytes = std::mem::size_of::<libc::statfs>() * count as usize;
+        let filled = libc::getfsstat(buf.as_mut_ptr(), bytes as libc::c_int, libc::MNT_NOWAIT);
+        if filled < 0 {
+            return Err(format!(
+                "getfsstat 取内容失败（errno={:?}）",
+                std::io::Error::last_os_error()
+            ));
         }
+        // 内核返回的是**它实际拷贝进来的个数**（缓冲区装不下就只拷前几个）
+        let count = filled.min(count) as usize;
         let mounts: Vec<(PathBuf, u32)> = buf[..count as usize]
             .iter()
             .map(|s| {
@@ -1040,7 +1107,7 @@ pub fn mounted_local_volumes() -> Vec<PathBuf> {
                 )
             })
             .collect();
-        filter_local_volumes(&mounts)
+        Ok(filter_local_volumes(&mounts))
     }
 }
 
@@ -1150,7 +1217,7 @@ Expected: 6 条全绿。
 
 ```bash
 git add app/src-tauri/src/volumes.rs app/src-tauri/src/lib.rs app/src-tauri/Cargo.toml app/src-tauri/Cargo.lock
-git commit -m "feat(volumes): 用 getmntinfo 枚举本地外接卷
+git commit -m "feat(volumes): 用 getfsstat 枚举本地外接卷
 
 - 判据三条：MNT_LOCAL（排除网络盘）+ /Volumes 的直接子目录 + 不是符号链接
 - 纯函数 filter_local_volumes 拆出来 → 6 条单测覆盖各种挂载表
@@ -1328,7 +1395,14 @@ pub fn spawn_volume_monitor<R: Runtime>(app: AppHandle<R>) {
             let mut known: HashSet<PathBuf> = HashSet::new();
             loop {
                 std::thread::sleep(POLL_INTERVAL);
-                let now: HashSet<PathBuf> = mounted_local_volumes().into_iter().collect();
+                // 【枚举失败 ≠ 没有卷】失败时**这一轮什么都不做**（别把瞬时错误
+                //   当成「所有卷都被拔了」→ 触发不必要的拆索引 + 重新全量扫）。
+                // ⚠️ 失败日志 `mounted_local_volumes()` 内部**已经打过一条**了
+                //   （带 errno）→ 这里不要再打一遍（否则日志里同一件事两行）。
+                let Ok(list) = mounted_local_volumes() else {
+                    continue;
+                };
+                let now: HashSet<PathBuf> = list.into_iter().collect();
                 let (appeared, disappeared) = diff_volumes(&known, &now);
                 for v in disappeared {
                     detach_volume(&app, &v);
@@ -1387,7 +1461,11 @@ fn attach_volume<R: Runtime>(app: &AppHandle<R>, volume: &Path) {
                     let Some(searcher) = current_searcher(&app) else { return };
                     // 【拔盘竞态】扫的这几十秒里用户可能把盘拔了 →
                     //   复查一次，没挂载就丢弃结果（不把死盘的条目塞进索引）。
-                    if !mounted_local_volumes().contains(&volume) {
+                    // 【枚举失败时保守处理】拿不到清单就当「还在」（不丢弃结果）
+                    let still_there = mounted_local_volumes()
+                        .map(|list| list.contains(&volume))
+                        .unwrap_or(true);
+                    if !still_there {
                         crate::logging::log_line(&format!("[volumes] {} 扫描期间被拔掉，丢弃", volume.display()));
                         app.state::<VolumeState>().remove(&volume);
                         return;
@@ -1509,10 +1587,14 @@ pub fn rebuild_engine<R: Runtime>(
 ) -> Result<u32, String> {
     let mut resolved = effective_paths(paths);
     // 【已挂载的卷要一起带上】换索引目录不该把 U 盘踢出索引
-    for v in crate::volumes::mounted_local_volumes() {
-        let s = v.to_string_lossy().into_owned();
-        if !resolved.contains(&s) {
-            resolved.push(s);
+    // 【枚举失败就不要乱改根列表】拿不到清单时保持原样（宁可少索引一个卷，
+    //   也不能把用户正在用的根踢掉）
+    if let Ok(list) = crate::volumes::mounted_local_volumes() {
+        for v in list {
+            let s = v.to_string_lossy().into_owned();
+            if !resolved.contains(&s) {
+                resolved.push(s);
+            }
         }
     }
     ...
@@ -1820,17 +1902,26 @@ git commit -m "feat(ui): 状态栏显示外接卷 + 卷变化自动重搜
 
 **这些必须插着真 U 盘跑**，不能只在模拟环境里过。
 
-| # | 场景 | 期望 | 怎么验 |
-|---|---|---|---|
-| 1 | 插入 U 盘（第一次） | 3 秒内状态栏出现「U盘 · 正在索引…」；扫完后搜得到盘上的文件 | 真插盘 + `log stream`/应用日志 |
-| 2 | 拔掉 U 盘 | 2 秒内该卷的条目从结果里消失（**不留幽灵**） | 插着时搜一个盘上的独有文件名，拔掉后同一个查询应 0 命中 |
-| 3 | 重新插入 | 1 秒内可搜到（旧索引复用）→ 随后后台刷新完成 | 日志里应出现「命中旧索引档，秒开」 |
-| 4 | 插拔各一次 | **$HOME 没有发生全量重扫** | 日志里数「全量扫描」的次数，与不插盘时对比 |
-| 5 | 插着 U 盘搜本机文件 | 延迟与不插时一致（不被卷的扫描拖累） | 搜 `readme` 记 `elapsed_ms` |
-| 6 | 冷启动（U 盘已插） | 启动读档 ≤15ms | `open` 一下看日志 |
-| 7 | 挂一个网络盘 | **不自动索引** | `mount_smbfs` 一个 → 状态栏不该出现它 |
-| 8 | 拔盘状态下重启应用 | 正常启动、能搜本机文件，**不出现 "invalid argument"** | 拔盘 → 重启 → 看日志 |
-| 9 | U 盘上有同名文件 | 结果里能按路径区分 | 盘上放一个与本机同名的文件 → 结果里两条路径都在 |
+| # | 场景 | 期望 | 怎么验 | 实测结果（2026-10-25 真机） |
+|---|---|---|---|---|
+| 1 | 插入 U 盘（第一次） | 3 秒内状态栏出现「U盘 · 正在索引…」；扫完后搜得到盘上的文件 | 真插盘 + `log stream`/应用日志 | ✅ **同一毫秒**：`hdiutil` 挂「验收U盘」于 `15:57:55.3` → `[volumes] /Volumes/验收U盘 首次索引完成（7 项）` 于 `15:57:55.3`；状态栏「验收U盘 · 7 项」 |
+| 2 | 拔掉 U 盘 | 2 秒内该卷的条目从结果里消失（**不留幽灵**） | 插着时搜一个盘上的独有文件名，拔掉后同一个查询应 0 命中 | ✅ **1 秒**（两次独立验证：`detach` 于 `16:00:15.3` → `已摘掉 /Volumes/验收U盘` 于 `16:00:16.3`；真盘于 `16:11` 拔除 → `已摘掉 /Volumes/软件（剩 8602 项）`）；搜盘上独有文件 → **0 项**；状态栏的卷同时消失；**所有索引档保留** |
+| 3 | 重新插入 | 1 秒内可搜到（旧索引复用）→ 随后后台刷新完成 | 日志里应出现「命中旧索引档，秒开」 | ✅ 真盘于 `15:53:05.3` 挂载 → `命中旧索引档，秒开` → `后台刷新完成（97460 → 97460 项）`（**97460 项没重扫**）；搜 `CLion.app` 立刻 1 项，位置 `/Volumes/软件` |
+| 4 | 插拔各一次 | **$HOME 没有发生全量重扫** | 日志里数「全量扫描」的次数，与不插盘时对比 | ✅ 插拔全程日志里**无任何扫描/全量重扫记录**；家目录的档独立保留（3.1 MB），卷的档另存（真盘 45 MB） |
+| 5 | 插着 U 盘搜本机文件 | 延迟与不插时一致（不被卷的扫描拖累） | 搜 `readme` 记 `elapsed_ms` | ✅ **排队始终 ≈0 ms**（扫描没堵住搜索通道 —— 这才是核心判据）；引擎耗时：插盘侧（106,060 项）0 / 中位 **4** / 最大 16 ms，拔盘侧（8,602 项）0 / 中位 **0** / 最大 1 ms。多出的几毫秒是**索引基数变大**（排序分页要在大 12 倍的集合上做），不是扫描抢 CPU |
+| 6 | 冷启动（U 盘已插） | 启动读档 ≤15ms | `open` 一下看日志 | ✅ 启动 → `索引就绪` **336 ms**（含进程启动 + Tauri 初始化 + 读 3 个档），**全程无扫描** → 走的是读档不是全量扫描；引擎层读档 A/B 实测 **3.8 ms** |
+| 7 | 挂一个网络盘 | **不自动索引** | `mount_smbfs` 一个 → 状态栏不该出现它 | 🟡 **判据已在真机挂载表上验证，但这一格没补上（用户决定放弃）**：`MNT_LOCAL`（内核标志，网络盘没有这个位）在真机 `getfsstat` 上确认有效 —— 13 条挂载里 12 条本地都带该位，`autofs` 的 `/System/Volumes/Data/home` **没有**。但「**/Volumes 下的 smbfs 挂载点**」这个组合仍**未实测**（这台机器没有可挂的网络盘；用 Docker 造 SMB 共享需要 `sudo` 在 `/Volumes` 下建点，用户放弃了） |
+| 8 | 拔盘状态下重启应用 | 正常启动、能搜本机文件，**不出现 "invalid argument"** | 拔盘 → 重启 → 看日志 | ✅ 拔盘状态重启：`索引就绪：8993 项`、**无 `invalid argument` / panic / 失败**；监听目录正确地不含该卷 |
+| 9 | U 盘上有同名文件 | 结果里能按路径区分 | 盘上放一个与本机同名的文件 → 结果里两条路径都在 | ✅ 搜 `PlistEdit` → **两条**：`/Volumes/软件/PlistEdit Pro.app` 与 `/Volumes/验收U盘/PlistEdit Pro.app`，各自标注自己的位置 |
+
+> **#9 的一个坑**：本机的 `/Applications/Docker.app` 搜不到 ——
+> **索引范围是 `$HOME`（`/Users/dongjiahao`），`/Applications` 在根目录下，不在范围内**。
+> 验同名文件要用 `$HOME` 里的文件（本机用的是 `~/Applications/PlistEdit Pro.app`）。
+
+> **测试环境的三个卷**：
+> - `/Volumes/软件` = 用户真实外接盘（apfs, local, disk6s2），**97,460 项** → 顺带验了「大盘也能秒开」
+> - `/Volumes/验收U盘` = `hdiutil` 造的 20 MB 磁盘映像（走「首次索引」路径，因为没有旧档）
+> - `/Volumes/Lodestar` = 项目自己的 DMG（15 项）
 
 **打包验证**（Task 6 之后）：
 
@@ -1853,3 +1944,56 @@ git revert --no-commit 8463dd7..HEAD   # 回退从改名之后的所有
 
 **没跑通之前不要动 `settings.rs` 的 `LEGACY_CONFIG_DIR_NAMES`** ——
 那是设置目录迁移链（`com.sextant.macos` → `com.lodestar.macos`），动它会让用户的书签/快捷键读不到。
+
+---
+
+## 实施后残留项（2026-10-25 收尾时记录）
+
+> 最终整分支评审 + 修复波重审之后剩下的。**全部是 Minor，不阻塞合并**。
+> 留着是为了「后来者知道这些坑已经被想到了」，不是待办清单。
+
+### 评审与重审新提的 7 条 Minor
+
+1. **失败重试会周期性地全量重扫那个盘**（`volumes.rs`）：30s 节流是对的（比「下一秒」好），
+   但代价没写明 —— 对没有旧档的卷，每 30s 一次全盘扫描（30 万文件的盘 ≈ 30s 扫 / 30s 周期
+   ≈ 长期占一个核的一半）。失败持续就一直烧。→ 可加「同一卷失败 N 次后停止重试」。
+2. **引擎层的「只摘挂过的根」是「包含」不是「相等」**：摘一个已挂根的**父目录**
+   （摘 `/Users` 而挂着 `/Users/me`）仍会删条目，与注释里的不变式有出入。
+   应用内不可达（worker 侧精确匹配 + 重叠检查挡着），但 `pub` API 的枪只拆了一半。
+3. **刷新窗口把 watcher 提前拉进来了**：秒开那一次就更新 `IndexState.paths` →
+   FSEvents 在刷新完成前 ~30s 就在监听这个卷 → 这段窗口里的增量更新会被 Final 附加
+   **整体覆盖** → 「扫描扫过之后、Final 附加之前」新建的文件会不在索引里，
+   直到它下次再被改动。→ 可在 Final 附加完成后再更新 paths。
+4. **`pending` 没有看门狗**：附加线程若在回传前死掉（扫描/附加路径 panic），
+   该卷永远留在 `pending` → 再也不会被附加，状态栏永远停在「正在索引…」。
+5. **对账的「引擎根」在拿不到状态时退化成空集**：`IndexState` 未注册时 →
+   所有已知卷都被判成「不在引擎里」→ 逐秒重新附加。当前不可达（注册顺序保证），
+   但兜底方向是「全都没了」而不是「不对账」。
+6. **M-5 让命中排除规则名字的卷彻底消失且无提示**：不枚举 → 不索引 → 状态栏连一行都没有。
+   （补充：**评审原判断的前提被实测推翻** —— `scan::scan` 不会剪掉根本身，
+   名为 `Library` 的卷本来会被正常索引；真正的问题是 watcher 侧 `path_is_excluded`
+   **查祖先** → 该卷下的变化全被忽略 → 索引静默变陈旧。）
+7. 设计文档 §1.2 约束表里的**代码行号引用已过期**（`validate_paths` 从 `engine.rs:403`
+   移到了 `engine.rs:716`）。
+
+### 仍然未验证的：M5 真机验收 9 条
+
+> **2026-10-25 更新**：已在真机（用户的真实外接盘 `/Volumes/软件`，97,460 项）
+> 上跑完 **8/9 条**（#1 #2 #3 #4 #5 #6 #8 #9 全部 ✅，证据见上表）。
+> 只剩 **#7**：判据（`MNT_LOCAL` 位）已在真机挂载表上验证成立，
+> 但「/Volumes 下的 smbfs 挂载点」这一格**没补上** ——
+> 这台机器没有可挂的网络盘（用 Docker 造 SMB 共享需要 `sudo` 才能在 `/Volumes` 下建点），
+> **用户决定放弃这一格**。
+>
+> → **合并前应知的残留风险**：`/Volumes` 下挂一个 smbfs 卷时，
+> 它的 `f_flags` 里没有 `MNT_LOCAL` → 会被判据 1 挡掉（不索引）。
+> 判据本身是内核给的权威标志，但这条组合**没有端到端跑过**。
+> 哪天要支持网络盘，这里是第一个要补测的地方。
+>
+> 之前只验到「用 `hdiutil` 挂磁盘映像」这一层；**真 U 盘的插拔、拔盘竞态、插回复用**
+> 已经在真实硬件上跑过了。清单见设计文档 §6。
+
+### 设计文档已回填（M-6）
+
+设计文档与实现的 6 处漂移已回填（`Result` 语义、`replace_roots`/`ReplaceRoots` 未实现、
+启动路径不带卷、watcher 整节作废、M5 #3 的实现状态）。

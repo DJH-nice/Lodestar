@@ -1,0 +1,602 @@
+//! 引擎的「根目录可增删」—— 外接卷索引的地基。
+//!
+//! 【为什么要有这个能力】
+//!   插上 U 盘 → 把它加进索引；拔掉 → 把它从索引里摘掉。
+//!   而**不能**用「重建整个引擎」实现：
+//!   重建要重扫所有根（新盘首扫 30 秒 → 整个索引空窗 30 秒）。
+
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU32, Ordering};
+
+use search_core::types::{ListKind, SearchRequest, SortField, SortOrder};
+use search_core::Engine;
+
+/// 临时目录/档目录的名字要带的序号。
+///
+/// 【为什么不能只用 pid】同一个测试二进制**并发**跑两次（比如两个 cargo 进程）
+///   会拿到同一个 pid → 临时目录撞车 → 互相删对方的目录 → 测试结果随机。
+static SEQ: AtomicU32 = AtomicU32::new(0);
+
+fn next_seq() -> u32 {
+    SEQ.fetch_add(1, Ordering::SeqCst)
+}
+
+/// 造一个根目录。
+///
+/// 【为什么 `with_beta` 是个开关】
+///   这些测试要能分清「命中的是**哪个根**的文件」。
+///   两个根里放**同名**文件的话，「U 盘上的文件要能搜到」数出来是 2 而不是 1，
+///   「拔盘后不该还搜得到」也数不出 0（另一个根的同名文件还在）——
+///   断言就测不出它想测的东西。
+///   → 只有 U 盘那个根带 `beta.log` → 「beta」这个查询**唯一地**指向它。
+fn fixture(tag: &str, with_beta: bool) -> PathBuf {
+    let seq = next_seq();
+    let dir = std::env::temp_dir().join(format!(
+        "lodestar-roots-{tag}-{}-{seq}",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(dir.join("sub")).unwrap();
+    std::fs::write(dir.join("alpha.txt"), "hello").unwrap();
+    if with_beta {
+        std::fs::write(dir.join("sub/beta.log"), "x").unwrap();
+    }
+    dir
+}
+
+fn request(query: &str) -> SearchRequest {
+    SearchRequest {
+        query: query.to_string(),
+        sort: SortField::Name,
+        order: SortOrder::Asc,
+        kind: ListKind::All,
+        page: 0,
+        page_size: 50,
+    }
+}
+
+#[test]
+fn attaching_a_root_makes_its_files_searchable() {
+    let home = fixture("home", false);
+    let usb = fixture("usb", true);
+    let (engine, before) = Engine::new(&[home.as_path()]).unwrap();
+    let entries = search_core::scan::scan(&[usb.clone()]).unwrap();
+    let after = engine.attach_root(&usb, entries);
+    assert!(after > before, "附加后条目数应该变多（{before} → {after}）");
+    let res = engine.search(&request("beta")).unwrap();
+    assert_eq!(res.total_files, 1, "U 盘上的文件要能搜到");
+    assert!(
+        res.entries.iter().any(|e| e.path.ends_with("beta.log")),
+        "结果里要有 U 盘上的那个文件：{:?}",
+        res.entries.iter().map(|e| &e.path).collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn detaching_a_root_removes_its_files_immediately() {
+    let home = fixture("home", false);
+    let usb = fixture("usb", true);
+    let (engine, _) = Engine::new(&[home.as_path()]).unwrap();
+    let entries = search_core::scan::scan(&[usb.clone()]).unwrap();
+    engine.attach_root(&usb, entries);
+    assert_eq!(engine.search(&request("beta")).unwrap().total_files, 1);
+
+    let after = engine.detach_root(&usb);
+    let res = engine.search(&request("beta")).unwrap();
+    assert_eq!(res.total_files, 0, "拔盘后不该还搜得到（**不留幽灵条目**）");
+    assert!(after > 0, "本机的条目还在");
+}
+
+#[test]
+fn attaching_the_same_root_twice_replaces_instead_of_duplicating() {
+    let home = fixture("home", false);
+    let usb = fixture("usb", true);
+    let (engine, _) = Engine::new(&[home.as_path()]).unwrap();
+    let entries = search_core::scan::scan(&[usb.clone()]).unwrap();
+    let once = engine.attach_root(&usb, entries.clone());
+    let twice = engine.attach_root(&usb, entries);
+    assert_eq!(once, twice, "重复附加 = 替换，不是叠加");
+    assert_eq!(engine.search(&request("beta")).unwrap().total_files, 1, "不该出现两条");
+}
+
+#[test]
+fn detaching_an_unknown_root_changes_nothing() {
+    let home = fixture("home", false);
+    let (engine, before) = Engine::new(&[home.as_path()]).unwrap();
+    let after = engine.detach_root(Path::new("/Volumes/根本没插过"));
+    assert_eq!(before, after);
+}
+
+#[test]
+fn a_missing_root_is_skipped_but_the_others_survive() {
+    let home = fixture("home", false);
+    // 一个不存在的根（拔掉的卷正好撞在这个窗口里）
+    let (engine, n) = Engine::new(&[home.as_path(), Path::new("/nonexistent/lodestar-xyz")]).unwrap();
+    assert!(n > 0, "存在的那个根要留下");
+    assert_eq!(engine.search(&request("alpha")).unwrap().total_files, 1);
+}
+
+/// 两个根**互相嵌套**时（`$HOME` 与 `$HOME/Documents` —— 设置面板的文件夹
+/// 选择器允许这么配），内层那个根要被**忽略**。
+///
+/// 【为什么要有这条护栏】
+///   根一旦嵌套，会同时踩四个坑（详见 `engine.rs` 的 `drop_nested_roots`）：
+///   摘根会连带删别的根的条目、内层根的好档被**空档**覆盖、
+///   刷新前后同一个文件的 `depth` 会变、同一条路径在索引里出现两遍。
+#[test]
+fn a_root_nested_inside_another_root_is_ignored() {
+    let home = fixture("nested-home", true);
+    let inner = home.join("sub");
+
+    // 只用外层根建一次 → 基准条目数
+    let (_baseline, n_home) = Engine::new(&[home.as_path()]).unwrap();
+    // 两个根一起建 → 内层那个要被忽略
+    let (engine, n) = Engine::new(&[home.as_path(), inner.as_path()]).unwrap();
+    assert_eq!(
+        n, n_home,
+        "内层根要被忽略 —— 条目数不该比「只扫外层根」多"
+    );
+    // 内容不丢：那些文件仍在 $HOME 里 → 既不丢，也**不出现两条**
+    assert_eq!(
+        engine.search(&request("beta")).unwrap().total_files,
+        1,
+        "内层根的文件仍在 $HOME 里 —— 不该丢，也不该出现两条"
+    );
+}
+
+/// 第二次启动必须是**读档**，不是「又扫了一遍」。
+///
+/// 【为什么要这么判】
+///   只断言「条目数相等」的话，「读档」与「重扫」**分不开** ——
+///   重扫出来的东西一样多，测试照样绿（档读不出来时会静默退回扫描）。
+///   → 第一次落档后**往树里加一个文件**：重扫会多出一条，读档不会。
+///   → 条目数不变 = 读的是档 ✓
+#[test]
+fn the_second_start_reads_the_archive_instead_of_rescanning() {
+    let home = fixture("reload", true);
+    let store_dir = std::env::temp_dir().join(format!(
+        "lodestar-roots-reload-store-{}-{}",
+        std::process::id(),
+        next_seq()
+    ));
+    let _ = std::fs::remove_dir_all(&store_dir);
+
+    let (engine, first) =
+        Engine::new_with_store(&[home.as_path()], Some(store_dir.clone())).unwrap();
+    drop(engine);
+
+    // 树变了 → 「重扫」会多出一条，「读档」不会
+    std::fs::write(home.join("gamma.txt"), "new").unwrap();
+
+    let (_engine2, second) =
+        Engine::new_with_store(&[home.as_path()], Some(store_dir.clone())).unwrap();
+    assert_eq!(
+        first, second,
+        "第二次必须是读档（树已经变了，重扫会多出一条）"
+    );
+
+    let _ = std::fs::remove_dir_all(&store_dir);
+}
+
+/// 点一次「刷新」，索引必须与建引擎时**逐条相同**。
+///
+/// 【为什么要有这条护栏】
+///   建引擎是**逐根扫**（每个根各扫各的），刷新是**一次扫所有根** ——
+///   两条路径给出的**深度**必须一致，否则 `depth:` / `parents:` 这两个
+///   真实查询字段会在「刷新」之后变样（用户看到的是「同一个文件，刷新前后结果不同」）。
+///
+/// 【为什么用集合比，而不是逐条比】
+///   并行扫描之后**条目顺序是不确定的**（见 `scan.rs` 的说明）→ 只能比集合。
+#[test]
+fn a_rescan_produces_exactly_the_same_index_as_the_initial_scan() {
+    let home = fixture("rescan-home", true);
+    let usb = fixture("rescan-usb", true);
+    let (engine, _) = Engine::new(&[home.as_path(), usb.as_path()]).unwrap();
+
+    let snapshot = |engine: &Engine| -> Vec<(String, u32)> {
+        let mut v: Vec<(String, u32)> = engine
+            .all_entries()
+            .into_iter()
+            .map(|e| (e.path, e.depth))
+            .collect();
+        v.sort();
+        v
+    };
+
+    let before = snapshot(&engine);
+    engine.rescan().unwrap();
+    let after = snapshot(&engine);
+
+    assert_eq!(
+        before, after,
+        "刷新之后的索引必须与建引擎时逐条相同（尤其是 depth）"
+    );
+    // 深度是**相对各自的根**的（不是相对「所有根」）
+    let depth_of = |after: &Vec<(String, u32)>, name: &str| -> Option<u32> {
+        after
+            .iter()
+            .find(|(p, _)| p.ends_with(name) && p.starts_with(usb.to_string_lossy().as_ref()))
+            .map(|(_, d)| *d)
+    };
+    assert_eq!(
+        depth_of(&after, "alpha.txt"),
+        Some(1),
+        "U 盘根下的文件深度应该相对 U 盘那个根（1）"
+    );
+    assert_eq!(
+        depth_of(&after, "beta.log"),
+        Some(2),
+        "U 盘根下 sub/ 里的文件深度应该相对 U 盘那个根（2）"
+    );
+}
+
+/// 根被摘光之后，刷新要返回**空索引**，而不是报错。
+///
+/// 【为什么这是合法状态】用户把索引目录全删了 / 外接卷全拔了 → 索引就该是空的。
+///   `scan::scan(&[])` 报的是「参数非法」，不是这里的情况 → 不能把错误传给上层。
+#[test]
+fn a_rescan_with_no_roots_left_returns_an_empty_index() {
+    let home = fixture("empty", false);
+    let (engine, n) = Engine::new(&[home.as_path()]).unwrap();
+    assert!(n > 0);
+
+    engine.detach_root(&home);
+    let count = engine.rescan().unwrap();
+    assert_eq!(count, 0, "根被摘光后刷新 → 空索引，不是报错");
+    assert_eq!(
+        engine.search(&request("alpha")).unwrap().total_entries,
+        0,
+        "空索引里不该还有任何条目"
+    );
+}
+
+/// 同一个根**再附加一次**（带新的条目）= **替换**，不是叠加、也不是被拒绝。
+///
+/// 【为什么要有这条】外接卷重新扫描时要靠它把旧条目换成新的 ——
+///   「重复附加被当成重叠而拒绝」会让卷上的变化永远进不了索引。
+#[test]
+fn attaching_the_same_root_again_replaces_its_entries() {
+    let home = fixture("home", false);
+    let usb = fixture("usb", true);
+    let (engine, _) = Engine::new(&[home.as_path()]).unwrap();
+    let entries = search_core::scan::scan(&[usb.clone()]).unwrap();
+    let first = engine.attach_root(&usb, entries);
+
+    // 树变了 → 重新扫 → 再附加一次
+    std::fs::write(usb.join("gamma.txt"), "new").unwrap();
+    let fresh = search_core::scan::scan(&[usb.clone()]).unwrap();
+    let second = engine.attach_root(&usb, fresh);
+
+    assert_eq!(
+        second,
+        first + 1,
+        "第二次附加 = 替换（多一条新文件）；叠加会多两条，被拒绝则一条都不多"
+    );
+    assert_eq!(
+        engine.search(&request("gamma")).unwrap().total_files,
+        1,
+        "新文件应该能搜到 —— 说明旧条目确实被换掉了"
+    );
+}
+
+/// 附加一个**与已有根重叠**的根（`$HOME` 已有，再附加 `$HOME/Documents`）
+/// → 必须**拒绝**。
+///
+/// 【为什么】重叠会让同一条路径在索引里出现两次（搜索显示两遍）——
+///   而「根之间不许嵌套」这条不变式必须在**运行期附加**时也守住。
+#[test]
+fn attaching_a_root_nested_inside_an_existing_root_is_rejected() {
+    let home = fixture("attach-nested-home", true);
+    let inner = home.join("sub");
+    let (engine, before) = Engine::new(&[home.as_path()]).unwrap();
+    let entries = search_core::scan::scan(&[inner.clone()]).unwrap();
+    let after = engine.attach_root(&inner, entries);
+    assert_eq!(
+        before, after,
+        "与已有根重叠 → 不该附加（否则同一条路径会进索引两次）"
+    );
+    assert_eq!(
+        engine.search(&request("beta")).unwrap().total_files,
+        1,
+        "不该出现两条"
+    );
+}
+
+/// worker（`Searcher`）也能附加/分离根 —— 上层只能通过它操作引擎。
+///
+/// 【为什么要走 worker 而不是直接用 `Engine`】
+///   引擎**只被搜索线程独占**（`worker.rs` 的串行不变式）：
+///   上层要改索引，只能把请求**排队**给那个线程 —— 另起线程改引擎 = 竞态。
+#[test]
+fn the_searcher_can_attach_and_detach_a_root() {
+    use search_core::Searcher;
+    let home = fixture("w-home", false);
+    let usb = fixture("w-usb", true);
+    let (engine, _) = Engine::new(&[home.as_path()]).unwrap();
+    let searcher = Searcher::new(engine);
+    let entries = search_core::scan::scan(&[usb.clone()]).unwrap();
+    let n = searcher.attach_root(&usb, entries).expect("应该能附加");
+    assert!(n > 0);
+    let res = searcher.search(request("beta")).expect("应该能搜");
+    assert_eq!(res.total_files, 1);
+    searcher.detach_root(&usb).expect("应该能分离");
+    let res = searcher.search(request("beta")).expect("应该还能搜");
+    assert_eq!(res.total_files, 0, "拔盘后不该还搜得到");
+}
+
+/// 落盘要**只重写变了的根** —— $HOME 那份**没变**就不该被动，
+/// 而**自己变过**的根写过一次之后也不该被**反复**重写。
+///
+/// 【为什么要钉住】插着一个 10 万文件的 U 盘时，每次落盘周期全量重写
+///   要动十几 MB（$HOME 的 3.4MB **加上** U 盘那份）——
+///   而 $HOME 那份**根本没变** → 光 I/O 就吃掉几个百分点 CPU。
+///   「每根一个档」的**读侧**隔离（插拔卷不作废 $HOME 的档）在 Task 1 就做到了，
+///   **写侧**隔离在这里 —— 两边合起来才是「插拔卷不牵连 $HOME」。
+///
+/// 【怎么判「没被重写」】看**修改时刻**（mtime）——
+///   内容可能一模一样（重写同样的内容 → 字节相同），
+///   只有**真的重写**才会动 mtime。
+#[test]
+fn only_the_changed_root_is_rewritten_on_disk() {
+    use search_core::store;
+    let home = fixture("persist-home", false);
+    let usb = fixture("persist-usb", true);
+    let store_dir = std::env::temp_dir().join(format!(
+        "lodestar-roots-persist-store-{}-{}",
+        std::process::id(),
+        next_seq()
+    ));
+    let _ = std::fs::remove_dir_all(&store_dir);
+
+    let (engine, _) =
+        Engine::new_with_store(&[home.as_path()], Some(store_dir.clone())).unwrap();
+    let home_archive = store::root_archive_path(&store_dir, &home);
+    // 建引擎时已经把 $HOME 的档写好了
+    let home_mtime = std::fs::metadata(&home_archive).unwrap().modified().unwrap();
+
+    let searcher = search_core::Searcher::new(engine);
+    let entries = search_core::scan::scan(&[usb.clone()]).unwrap();
+    searcher.attach_root(&usb, entries).expect("应该能附加");
+
+    // 等落盘那一拍（worker 每 2 秒醒一次）
+    let usb_archive = store::root_archive_path(&store_dir, &usb);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+    while !usb_archive.exists() && std::time::Instant::now() < deadline {
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    assert!(usb_archive.exists(), "U 盘那份档应该被写出来");
+    let usb_mtime = std::fs::metadata(&usb_archive).unwrap().modified().unwrap();
+
+    // ① 从未变脏的根（$HOME）**没变** → 不该被重写（mtime 不动）
+    let home_mtime_after = std::fs::metadata(&home_archive).unwrap().modified().unwrap();
+    assert_eq!(
+        home_mtime, home_mtime_after,
+        "没变的根不该被重写（落盘要只写变了的根）"
+    );
+
+    // 内容也要对：U 盘那份里能看到 U 盘上的文件
+    let got = store::load_root(&store_dir, &usb).expect("U 盘那份档应该能读出来");
+    assert!(
+        got.iter().any(|e| e.path.ends_with("beta.log")),
+        "U 盘那份档里应该有它自己的条目"
+    );
+
+    // ② **写过一次**的根，下一拍之后**不该再被写** ——
+    //   写过的根必须从「欠账」名单里摘掉，否则它会**每 2 秒**被重写一次
+    //   （无限循环，而且序列化还发生在**搜索线程**上 → 搜索被堵）。
+    std::thread::sleep(std::time::Duration::from_millis(3_000));
+    let usb_mtime_after = std::fs::metadata(&usb_archive).unwrap().modified().unwrap();
+    assert_eq!(
+        usb_mtime, usb_mtime_after,
+        "写过的根不该被反复重写（欠账没清 → 每 2 秒重写一次）"
+    );
+    let home_mtime_after2 = std::fs::metadata(&home_archive).unwrap().modified().unwrap();
+    assert_eq!(
+        home_mtime, home_mtime_after2,
+        "没变的根仍然不该被重写"
+    );
+
+    drop(searcher);
+    let _ = std::fs::remove_dir_all(&store_dir);
+}
+
+/// 摘掉的根**不该**被写出档 —— 它已经不在索引里，没有档可写。
+///
+/// 【为什么要钉住】摘根之前它被标了脏 → 如果摘根没把它从「待写名单」里摘掉，
+///   下一拍就会给它**写出一份档** —— 一个**已经不在索引里**的根的档
+///   （陈旧档：插回来时会被当成「它现在的样子」用）。
+///
+/// 【怎么判「没写」】等过落盘那一拍（2s）+ 余量 → 档**不该出现**。
+#[test]
+fn a_detached_root_never_gets_an_archive_on_disk() {
+    use search_core::store;
+    let home = fixture("detach-home", false);
+    let usb = fixture("detach-usb", true);
+    let store_dir = std::env::temp_dir().join(format!(
+        "lodestar-roots-detach-store-{}-{}",
+        std::process::id(),
+        next_seq()
+    ));
+    let _ = std::fs::remove_dir_all(&store_dir);
+
+    let (engine, _) =
+        Engine::new_with_store(&[home.as_path()], Some(store_dir.clone())).unwrap();
+    let home_archive = store::root_archive_path(&store_dir, &home);
+    let home_bytes = std::fs::metadata(&home_archive).unwrap().len();
+
+    // 扫描放在建 Searcher **之前** —— 附加与分离要赶在落盘那一拍（2s）之前
+    let entries = search_core::scan::scan(&[usb.clone()]).unwrap();
+    let searcher = search_core::Searcher::new(engine);
+    searcher.attach_root(&usb, entries).expect("应该能附加");
+    searcher.detach_root(&usb).expect("应该能分离");
+
+    // 等过落盘那一拍 + 余量
+    std::thread::sleep(std::time::Duration::from_millis(3_500));
+
+    let usb_archive = store::root_archive_path(&store_dir, &usb);
+    assert!(
+        !usb_archive.exists(),
+        "摘掉的根不该被写出档（它已经不在索引里）"
+    );
+    assert_eq!(
+        std::fs::metadata(&home_archive).unwrap().len(),
+        home_bytes,
+        "$HOME 的档不该被动"
+    );
+
+    drop(searcher);
+    let _ = std::fs::remove_dir_all(&store_dir);
+}
+
+/// 摘掉一个根之后，它**之前写下的档仍在磁盘上** —— 插回来时要能复用。
+///
+/// 【为什么要钉住】`engine.rs` 的 `detach_root` 专门解释了这条不变式：
+///   「档不动是因为落盘只写『当前在索引里的根』→ 拔掉的卷那份文件原地不动 ✓」
+///   反过来就出事：若摘根时用**空档**覆盖掉它那份好档 → 下次冷启动它的索引
+///   被**永久抹掉**。
+#[test]
+fn a_detached_root_keeps_the_archive_it_already_wrote() {
+    use search_core::store;
+    let home = fixture("keep-home", false);
+    let usb = fixture("keep-usb", true);
+    let store_dir = std::env::temp_dir().join(format!(
+        "lodestar-roots-keep-store-{}-{}",
+        std::process::id(),
+        next_seq()
+    ));
+    let _ = std::fs::remove_dir_all(&store_dir);
+
+    let (engine, _) =
+        Engine::new_with_store(&[home.as_path()], Some(store_dir.clone())).unwrap();
+    let searcher = search_core::Searcher::new(engine);
+    let entries = search_core::scan::scan(&[usb.clone()]).unwrap();
+    searcher.attach_root(&usb, entries).expect("应该能附加");
+
+    // 等它把档写出来
+    let usb_archive = store::root_archive_path(&store_dir, &usb);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+    while !usb_archive.exists() && std::time::Instant::now() < deadline {
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    assert!(usb_archive.exists(), "U 盘那份档应该被写出来");
+
+    // 摘掉它
+    searcher.detach_root(&usb).expect("应该能分离");
+    assert_eq!(
+        searcher.search(request("beta")).unwrap().total_files,
+        0,
+        "摘掉之后不该还搜得到它的文件"
+    );
+
+    // 档**仍在**（插回来时要能复用）
+    assert!(
+        usb_archive.exists(),
+        "摘根**不删档** —— 插回来时要复用它那份好档"
+    );
+    let got = store::load_root(&store_dir, &usb).expect("那份档应该还能读出来");
+    assert!(
+        got.iter().any(|e| e.path.ends_with("beta.log")),
+        "留下来的档里应该有 U 盘自己的条目"
+    );
+
+    drop(searcher);
+    let _ = std::fs::remove_dir_all(&store_dir);
+}
+
+/// 挂一个**与已有根重叠**的根 → `Searcher::attach_root` 必须回 `Err`。
+///
+/// 【为什么要能分辨】引擎对重叠的附加是**静默拒绝**（返回当前条目数）——
+///   上层若拿到 `Ok` 就会以为「挂上了」→ 那个盘**根本没进索引**，
+///   用户却以为它在了。→ `Err` 才能让上层知道「没挂上」。
+#[test]
+fn the_searcher_rejects_attaching_a_nested_root() {
+    use search_core::EngineError;
+    let home = fixture("reject-home", true);
+    let inner = home.join("sub");
+    let (engine, _) = Engine::new(&[home.as_path()]).unwrap();
+    let searcher = search_core::Searcher::new(engine);
+
+    let entries = search_core::scan::scan(&[inner.clone()]).unwrap();
+    let res = searcher.attach_root(&inner, entries);
+    assert_eq!(
+        res.unwrap_err(),
+        EngineError::InvalidArg,
+        "与已有根重叠 → 必须回 Err（上层要能知道「没挂上」）"
+    );
+    // 内容不变：那些文件仍在 $HOME 里 → 既不丢，也不出现两条
+    assert_eq!(
+        searcher.search(request("beta")).unwrap().total_files,
+        1,
+        "被拒的附加不该改变索引"
+    );
+}
+
+/// 摘一个**从未挂过**的根 → 必须回 `Err`（不能是 `Ok`）。
+///
+/// 【为什么要能分辨】摘根对「拼写不对」的根是**静默无效**的 ——
+///   若回 `Ok`，上层会以为「盘拔了、索引清干净了」，其实条目还在 →
+///   **幽灵条目**（用户最不能接受的那种：盘都拔了还搜得到它的文件）。
+#[test]
+fn the_searcher_reports_that_an_unknown_root_was_not_detached() {
+    use search_core::EngineError;
+    let home = fixture("unknown-home", true);
+    let (engine, _) = Engine::new(&[home.as_path()]).unwrap();
+    let searcher = search_core::Searcher::new(engine);
+
+    let res = searcher.detach_root(Path::new("/Volumes/根本没插过"));
+    assert_eq!(
+        res.unwrap_err(),
+        EngineError::InvalidArg,
+        "没挂过的根摘不掉 → 必须回 Err（否则上层以为清干净了，其实条目还在）"
+    );
+    // 索引没被动
+    assert_eq!(
+        searcher.search(request("beta")).unwrap().total_files,
+        1,
+        "一次无效的摘根不该动索引"
+    );
+}
+
+/// 附加一个根之后，那个根里的路径**仍然能被增量更新**。
+///
+/// 【为什么要有这条护栏】
+///   M3 的增量更新靠 `by_path` O(1) 定位「这条路径在索引里的哪」。
+///   附加根时如果忘了登记 → 增量更新把它当成「新增的文件」
+///   → 索引里多出一条**旧的**（还查得到、但内容是旧的）→ **索引悄悄过期**
+///   （全程不报错）。
+#[test]
+fn an_attached_root_can_still_be_updated_incrementally() {
+    let home = fixture("home", false);
+    let usb = fixture("usb", true);
+    let (engine, _) = Engine::new(&[home.as_path()]).unwrap();
+    let entries = search_core::scan::scan(&[usb.clone()]).unwrap();
+    engine.attach_root(&usb, entries);
+
+    // 改 U 盘上的文件 → 应用一次增量更新
+    let file = usb.join("sub/beta.log");
+    std::fs::write(&file, "a much longer content now").unwrap();
+    let report = engine
+        .apply_changes(&search_core::ChangeSet { paths: vec![file.clone()] })
+        .unwrap();
+
+    // 【为什么必须断言「没退化」】退化成全量重扫的话，索引照样是对的 ——
+    //   那就抓不住「忘了登记 by_path」这个 bug 了（它表现为**多一条旧的**）。
+    assert!(
+        !report.fell_back,
+        "这该是一次真正的增量更新 —— 退化成全量重扫就抓不住 by_path 的问题了"
+    );
+    let matching: Vec<_> = engine
+        .all_entries()
+        .into_iter()
+        .filter(|e| e.path == file.to_string_lossy())
+        .collect();
+    assert_eq!(
+        matching.len(),
+        1,
+        "这条路径在索引里只能有一条（忘了登记 by_path → 会多出一条旧的）"
+    );
+    assert_eq!(
+        matching[0].size, 25,
+        "大小应该更新成新的字节数 —— 忘了登记 by_path 就会停在旧值"
+    );
+}

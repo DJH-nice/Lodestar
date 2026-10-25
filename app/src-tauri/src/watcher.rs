@@ -1150,7 +1150,7 @@ pub fn spawn_watcher<R: Runtime>(app: &AppHandle<R>) {
             let t_watched = Arc::clone(&watched);
             let t_count = Arc::clone(&auto_rescans);
             let spawned = std::thread::Builder::new()
-                .name("fsearch-watch".to_string())
+                .name("lodestar-watch".to_string())
                 .spawn(move || {
                     reconcile_loop(handle, watcher, t_signals, t_watched, t_count)
                 });
@@ -1358,6 +1358,9 @@ fn notify_frontend<R: Runtime>(app: &AppHandle<R>) {
     // 【窗口可见性也要是真值】—— 前端拿这个载荷决定要不要继续跑那个 800ms 轮询，
     //   所以不能留 `snapshot()` 给的占位值。
     snapshot.visible = crate::lifecycle::window_visible(&app);
+    // 【卷的状态也要是真值】—— snapshot() 给的是空列表（它不知道卷的事）。
+    //   前端拿这个载荷更新状态栏 → 空列表 = 「没有卷」= 卷那一行会消失。
+    snapshot.volumes = crate::volumes::volume_statuses(&app);
     if let Err(e) = app.emit(AUTO_REFRESH_EVENT, snapshot) {
         // 【更新本身是成功的】—— 只是事件发不出去（运行时已经停了）。
         eprintln!("[lodestar] 自动更新完成，但通知前端失败: {e}");
@@ -1757,7 +1760,7 @@ mod tests {
         //   而 `/private/var` 是**排除规则**里的一条（macOS 的系统临时区）。
         //   → 用它做测试目录的话，事件会被排除规则挡掉（测不到东西）。
         //   `/tmp` 的真实路径是 `/private/tmp`，**不在**排除前缀里 ✓
-        let dir = PathBuf::from("/tmp").join(format!("sextant-e2e-{}", std::process::id()));
+        let dir = PathBuf::from("/tmp").join(format!("lodestar-e2e-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let (engine, _) = search_core::Engine::new(&[dir.as_path()]).unwrap();

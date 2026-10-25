@@ -30,6 +30,10 @@ mod settings;
 mod shortcut;
 // （`tray` 同上 —— 见上面那段「为什么 `lifecycle` 与 `tray` 都是私有 `mod`」。）
 mod tray;
+// （`volumes` 同上 —— Task 5 把「枚举卷」与「监控卷」接上了，
+//   调用点现在都在 crate 内（`setup()` 起监控线程、`settings::rebuild_engine`
+//   带上已挂载的卷）→ 改回私有 `mod`，让 `dead_code` 护栏重新生效。）
+mod volumes;
 mod watcher;
 
 use std::sync::{Arc, Mutex};
@@ -102,15 +106,18 @@ pub const OPEN_SYNTAX_CHEATSHEET_EVENT: &str = "open-syntax-cheatsheet";
 
 /// 菜单项 id —— 「致谢与许可」。
 ///
-/// 【为什么有这一项】本软件分发了 FSearch 0.3.2 的引擎代码（GPL-3.0），
-///   GPL-3.0 §5(d) 要求「醒目标注你修改过它」并说明它按该许可发布。
-///   → 必须在**应用里**有一处能看见这句话的地方，
-///     不能只写在仓库 README 里（装到 /Applications 之后就没人看得到）。
+/// 【为什么有这一项】**第三方组件清单**要有一处能在**应用里**看见的地方，
+///   不能只写在仓库 README 里（装到 /Applications 之后就没人看得到）。
+///   清单本身在 `THIRD-PARTY-NOTICES.md`（构建时会被打进 app 包的 licenses/ 目录）。
+///
+/// 【为什么还要写「引擎出处」】
+///   引擎是**完全自研**的（早期版本用的是上游 FSearch 的 C 引擎，现已整体替换）——
+///   把这句话留在应用里，是为了让人一眼看出「现在这份代码不依赖任何第三方搜索引擎」。
 ///
 /// 【为什么不叫「关于」】macOS 的应用菜单里已经有系统的「关于 Lodestar」
 ///   （由 `Menu::default()` 提供，显示版本号与版权）。
 ///   再来一个同名的项会让人以为是同一个东西。
-///   → 叫「致谢与许可」，指向的是**法务信息**（引擎出处 + 许可证），
+///   → 叫「致谢与许可」，指向的是**法务信息**（第三方清单 + 许可证），
 ///     而不是「版本号 + 版权声明」。
 pub const OPEN_CREDITS_ID: &str = "open-credits";
 
@@ -348,6 +355,9 @@ pub fn run() {
         .manage(Mutex::new(Option::<Arc<Searcher>>::None))
         .manage(IndexState::new())
         .manage(Lifecycle::new())
+        // 【卷状态】—— 「哪些外接卷插着、扫到哪一步了」。
+        //   与 `IndexState` 分开放（见 `volumes::VolumeState` 的说明）。
+        .manage(volumes::VolumeState::default())
         .setup(|app| {
             // 【设置迁移 —— 必须是 setup 的第一件事】
             //   产品名从 FSearch 改成 Lodestar → `identifier` 跟着变 →
@@ -388,6 +398,13 @@ pub fn run() {
             //   「监听哪些目录」由 watcher 自己每 1 秒**对账**一次决定
             //   （读 IndexState::paths()，见 watcher.rs），换目录它自己会跟上。
             watcher::spawn_watcher(app.handle());
+            // 外接卷监控（插上 U 盘就把它加进索引）。
+            //
+            // 【为什么可以在这里起】它只依赖 `VolumeState` 与引擎槽位 ——
+            //   两者这时都已经 manage 好了。
+            // 【启动时引擎还没建好也没关系】监控线程第一轮会看到
+            //   「引擎还没装好」→ 这一轮不接手 → 下一秒再试（见 `volumes::attach_volume`）。
+            volumes::spawn_volume_monitor(app.handle().clone());
             // 【空闲看门狗】—— 每秒重新判定「你是不是不用我了」。
             // 必须在 Lifecycle 被 manage 之后启动（它要读那个状态）。
             lifecycle::spawn_idle_watchdog(app.handle().clone());

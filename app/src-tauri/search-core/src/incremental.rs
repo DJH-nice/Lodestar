@@ -432,7 +432,10 @@ fn classify(p: &Path) -> Kind {
 ///
 /// 【两根都试】先按真实路径试，再按原样路径试 ——
 ///   万一监听器报的就是原样路径，也不至于漏。
-fn map_to_index_space(roots: &[(PathBuf, PathBuf)], raw: &Path) -> Option<PathBuf> {
+///
+/// 【为什么它是 `pub`】worker 也要用**同一份**映射
+///   （「这条变化属于哪个根？」）—— 自己再写一遍就成了第二份真相。
+pub fn map_to_index_space(roots: &[(PathBuf, PathBuf)], raw: &Path) -> Option<PathBuf> {
     for (indexed, real) in roots {
         if let Ok(rel) = raw.strip_prefix(real) {
             return Some(indexed.join(rel));
@@ -458,7 +461,7 @@ mod tests {
     #[test]
     fn a_symlink_to_a_directory_counts_as_a_file() {
         // 与扫描器一致：链接按「文件」索引（不跟随）
-        let dir = std::env::temp_dir().join(format!("sextant-inc-link-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("lodestar-inc-link-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(dir.join("real")).unwrap();
         std::fs::write(dir.join("real/inside.txt"), "x").unwrap();

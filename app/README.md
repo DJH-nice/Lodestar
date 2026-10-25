@@ -62,7 +62,7 @@ pnpm dev        # → http://localhost:1420
 # 引擎单测（不依赖 Tauri，最快）
 cd app/src-tauri && cargo test -p search-core
 
-# 全部 Rust 测试（含 5 个护栏集成测试）
+# 全部 Rust 测试（含 31 个护栏集成测试）
 cd app/src-tauri && cargo test
 
 # 前端单测
@@ -76,9 +76,9 @@ cd app && pnpm vitest run src/lib/paging.test.ts
 
 | 套件 | 数量 | 说明 |
 |---|---|---|
-| `search-core` | 43 | 引擎：扫描 / 存储 / 查询 / 排序分页 / **速查卡护栏** |
-| Rust 护栏（`src-tauri/tests/`） | 20 项检查 | 菜单 / 语法表 / 手册 / watcher 契约 / z-index |
-| Vitest | 264 | 前端组件与工具模块 |
+| `search-core` | 127 | 引擎：扫描 / 存储 / 查询 / 排序分页 / 增量更新 / **速查卡护栏** |
+| Rust 护栏（`src-tauri/tests/`） | 31 项检查 | 菜单 / 语法表 / 手册 / watcher 契约 / **外接卷契约** / z-index |
+| Vitest | 278 | 前端组件与工具模块 |
 
 **护栏是「静默失效」的护栏** —— 它们盯的不是「代码写了没有」，
 而是「改了会不会悄悄坏掉」。改这几个地方时**必须**跑：
