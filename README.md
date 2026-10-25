@@ -14,9 +14,9 @@
 
 <div align="center">
 
-**GitHub** · https://github.com/YOUR_ACCOUNT/lodestar
+**GitHub** · https://github.com/DJH-nice/Lodestar
 　|　
-**Gitee（国内镜像）** · https://gitee.com/YOUR_ACCOUNT/lodestar
+**Gitee（国内镜像）** · https://gitee.com/dongjiahao0119/Lodestar
 
 </div>
 
@@ -135,8 +135,8 @@ macOS 把 U 盘、移动硬盘挂在 `/Volumes/<卷名>`。Lodestar 会**自动�
 
 | 平台 | 下载 |
 |---|---|
-| **GitHub** | [Releases](https://github.com/YOUR_ACCOUNT/lodestar/releases) |
-| **Gitee**（国内访问快） | [Releases](https://gitee.com/YOUR_ACCOUNT/lodestar/releases) |
+| **GitHub** | [Releases](https://github.com/DJH-nice/Lodestar/releases) |
+| **Gitee**（国内访问快） | [Releases](https://gitee.com/dongjiahao0119/Lodestar/releases) |
 
 >  **Release 附件需要仓库维护者手动上传**（GitHub / Gitee 都不会自动带上仓库里的构建产物）——
 > 步骤见文末折叠的「维护者：发布流程」。
@@ -153,9 +153,9 @@ macOS 把 U 盘、移动硬盘挂在 `/Volumes/<卷名>`。Lodestar 会**自动�
 ```bash
 # 从终端下载不会触发 Gatekeeper 的隔离标记
 # GitHub
-curl -LO https://github.com/YOUR_ACCOUNT/lodestar/releases/download/v0.1.0/Lodestar.dmg
+curl -LO https://github.com/DJH-nice/Lodestar/releases/download/v0.1.0/Lodestar.dmg
 # Gitee（国内更快）
-# curl -LO https://gitee.com/YOUR_ACCOUNT/lodestar/releases/download/v0.1.0/Lodestar.dmg
+# curl -LO https://gitee.com/dongjiahao0119/Lodestar/releases/download/v0.1.0/Lodestar.dmg
 
 hdiutil attach Lodestar.dmg
 cp -R /Volumes/Lodestar/Lodestar.app /Applications/
