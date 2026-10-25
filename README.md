@@ -509,22 +509,26 @@ bash app/scripts/bundle-app.sh
 | `Lodestar.dmg` | 约 **4.4 MB** |
 | `Lodestar.app` | 约 **5.9 MB** |
 
-### 2. 打标签并推送
+### 2. 发布（打标签 + 建 Release + 传附件）
 
 ```bash
-git tag -a v0.1.0 -m "v0.1.0"
-git push origin v0.1.0        # 需要先给仓库加远端
+bash app/scripts/publish-release.sh --tag v0.1.0
 ```
 
-### 3. 传附件
+脚本会依次问你两个 token（**交互式输入，不写文件、不进 shell 历史**）：
+
+| 平台 | token 从哪拿 | 权限 |
+|---|---|---|
+| GitHub | https://github.com/settings/tokens/new | 勾 `repo` |
+| Gitee | https://gitee.com/profile/personal_access_tokens | 勾 `projects` |
+
+它会做完全部事情：打 tag → 推到两个平台 → 建 Release（正文自动带上功能清单和 SHA256）
+→ 上传 `Lodestar.dmg` → 打印两个平台的 Release 链接。
+
+先看看它要干什么（**不产生任何副作用**）：
 
 ```bash
-# GitHub
-gh release create v0.1.0 \
-  app/src-tauri/target/release/bundle/macos/Lodestar.dmg \
-  --title "v0.1.0" --notes "见 CHANGELOG"
-
-# Gitee（用它的 API 或网页上传）
+bash app/scripts/publish-release.sh --dry-run
 ```
 
 > **不要**把 `Lodestar.app` 直接塞进仓库 —— 它会被 `.gitignore` 挡住，
