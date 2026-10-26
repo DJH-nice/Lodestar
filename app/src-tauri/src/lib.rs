@@ -404,7 +404,17 @@ pub fn run() {
             //   两者这时都已经 manage 好了。
             // 【启动时引擎还没建好也没关系】监控线程第一轮会看到
             //   「引擎还没装好」→ 这一轮不接手 → 下一秒再试（见 `volumes::attach_volume`）。
-            volumes::spawn_volume_monitor(app.handle().clone());
+            //
+            // 【测试环境要关掉它】
+            //   集成测试用的是 mock runtime，**setup 照样会跑** →
+            //   这个线程也会起 → 它会把当前挂载的外接卷附加进索引，
+            //   并在后台不停刷新（卷上文件一变，条目数就变）。
+            //   → 「rescan 后条目数 == 引擎条目数」那条断言会跟后台刷新赛跑，
+            //     断言就变成 flaky（实测：外接盘上文件一变就差 1）。
+            //   → 测试用 `LODESTAR_NO_VOLUME_MONITOR=1` 关掉它（见 commands.rs 的 build_app）。
+            if std::env::var("LODESTAR_NO_VOLUME_MONITOR").is_err() {
+                volumes::spawn_volume_monitor(app.handle().clone());
+            }
             // 【空闲看门狗】—— 每秒重新判定「你是不是不用我了」。
             // 必须在 Lifecycle 被 manage 之后启动（它要读那个状态）。
             lifecycle::spawn_idle_watchdog(app.handle().clone());

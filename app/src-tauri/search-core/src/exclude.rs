@@ -16,7 +16,18 @@ use std::path::Path;
 /// 末级名命中就排除的目录名（**精确匹配**，不是前缀）。
 ///
 /// ⚠️ `MyLibrary` / `targets` 这类**不会**命中 —— 必须是末级名恰好相等。
-const EXCLUDED_NAMES: &[&str] = &["Library", "Applications", "target", "node_modules"];
+///
+/// 【为什么 `Applications` 不在这里】
+///   它是**系统**的应用目录（`/Applications`），但那个目录在**根**下 ——
+///
+///   而默认索引根是 `$HOME`，**`/Applications` 压根不在扫描范围里**。
+///   → 把 `Applications` 写进「目录名黑名单」的唯一实际效果是
+///     **误伤 `~/Applications`**（用户自己装的用户级 app）——
+///     实测这台机器上它有 185 个文件（含 PlistEdit Pro.app），
+///     现在**一个都搜不到**。
+///   → 改放到 [`EXCLUDED_PREFIXES`] 里按**根层路径**排：
+///     索引根设成 `/` 时仍然排掉 `/Applications`，而 `~/Applications` 恢复正常。
+const EXCLUDED_NAMES: &[&str] = &["Library", "target", "node_modules"];
 
 /// 整路径前缀命中就排除（macOS 的系统区域）。
 ///
@@ -27,6 +38,9 @@ const EXCLUDED_PREFIXES: &[&str] = &[
     "/private/var",
     "/cores",
     "/.Spotlight-V100",
+    // 【系统应用目录】只排**根层**这一个路径 ——
+    //   `~/Applications`（用户级 app）不受影响。
+    "/Applications",
 ];
 
 /// 这个**目录**要不要剪枝（扫描时用）。
@@ -103,6 +117,22 @@ mod tests {
             "/Users/someone/Library/WebKit/com.lodestar.macos/x.db"
         )));
         assert!(path_is_excluded(Path::new("/Users/someone/Library")));
+    }
+
+    #[test]
+    fn user_level_applications_is_indexed_but_system_one_is_not() {
+        // 【这条是修出来的】`Applications` 原本在「目录名黑名单」里 ——
+        //   而默认索引根是 `$HOME`，`/Applications` 压根不在扫描范围里，
+        //   → 那条规则唯一的效果是**误伤 `~/Applications`**（用户级 app）。
+        //
+        //   现在改成按**根层路径前缀**排：`/Applications` 仍然排掉，
+        //   `~/Applications` 恢复正常。
+        assert!(!path_is_excluded(Path::new(
+            "/Users/someone/Applications/PlistEdit Pro.app/Contents/MacOS/PlistEdit Pro"
+        )));
+        assert!(path_is_excluded(Path::new(
+            "/Applications/Safari.app/Contents/MacOS/Safari"
+        )));
     }
 
     #[test]

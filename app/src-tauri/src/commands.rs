@@ -886,6 +886,19 @@ mod tests {
     }
 
     fn build_app() -> tauri::App<tauri::test::MockRuntime> {
+        // 【关掉卷监控】mock runtime 的 setup 照样会跑 →
+        //   卷监控线程也会起 → 它把当前挂着的 U 盘附加进索引并后台刷新
+        //   → 「rescan 后条目数 == 引擎条目数」那条断言会 flaky。
+        //   （这条断言是外接卷特性合入后才暴露的 —— 之前没有后台线程在改索引。）
+        //
+        // 【为什么用环境变量而不是别的开关】Rust 的 `cfg(test)` 在**集成测试**里
+        //   **不生效**（集成测试链接的是没带 cfg(test) 的 lib）→ 用不了。
+        //   环境变量是进程级的，测试之间共享，正好符合「整个测试进程都不起监控」。
+        // 【安全性】Rust 2024 起 `set_var` 是 unsafe —— 但这里改的是**本进程**的环境，
+        //   而测试进程没有别的线程读它（读它的 setup 在建 app 之前就跑完了）。
+        unsafe {
+            std::env::set_var("LODESTAR_NO_VOLUME_MONITOR", "1");
+        }
         tauri::test::mock_builder()
             // 【引擎句柄 + 索引状态必须 manage】
             //   `rebuild_engine` 要从 app 里取这两样，mock app 没 manage 的话
