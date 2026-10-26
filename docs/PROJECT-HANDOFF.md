@@ -303,7 +303,11 @@ lodestar/                          ← 新仓库（git 已初始化，1 次提�
 >
 > **验 #9 的坑**：本机的 `/Applications/Docker.app` 搜不到 ——
 > **索引范围是 `$HOME`，`/Applications` 在根目录下，不在范围内**。
-> 要用 `$HOME` 里的文件（本机用的是 `~/Applications/PlistEdit Pro.app`）才验得出「同名两条路径」。
+> 要用 `$HOME` 里的文件才验得出「同名两条路径」，**但要避开被排除的目录名**
+> （`Library` / `Applications` / `target` / `node_modules`）和**隐藏目录**（`.` 开头）。
+> ⚠️ `~/Applications/PlistEdit Pro.app` **不行** —— 目录名命中 `Applications`，整棵被排除。
+> 实测那次用的是**两个外接卷上的同名文件**（`/Volumes/软件` 与 `/Volumes/验收U盘`）——
+> 结论照样成立（同名按路径区分），只是造文件的选址不同。
 
 ### 2026-10-25 唤起延迟拆解（350 ms 花在哪）
 

@@ -1916,7 +1916,10 @@ git commit -m "feat(ui): 状态栏显示外接卷 + 卷变化自动重搜
 
 > **#9 的一个坑**：本机的 `/Applications/Docker.app` 搜不到 ——
 > **索引范围是 `$HOME`（`~`），`/Applications` 在根目录下，不在范围内**。
-> 验同名文件要用 `$HOME` 里的文件（本机用的是 `~/Applications/PlistEdit Pro.app`）。
+> 验同名文件要用 `$HOME` 里的文件，**但要避开被排除的目录名**
+> （`Library` / `Applications` / `target` / `node_modules`）和**隐藏目录**（`.` 开头）。
+> ⚠️ `~/Applications/PlistEdit Pro.app` **不行** —— 目录名命中 `Applications`，整棵被排除。
+> 实测那次用的是**两个外接卷上的同名文件**（`/Volumes/软件` 与 `/Volumes/验收U盘`）。
 
 > **测试环境的三个卷**：
 > - `/Volumes/软件` = 用户真实外接盘（apfs, local, disk6s2），**97,460 项** → 顺带验了「大盘也能秒开」
